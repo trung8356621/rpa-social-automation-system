@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
+import puppeteer from 'puppeteer';
 
 const BROWSER_DEFINITIONS = [
   {
@@ -149,6 +151,45 @@ class BrowserProfileService {
     };
   }
 
+  async openAppBrowserProfile(profile) {
+    const userDataDir = profile?.import_path;
+    if (!userDataDir || !fs.existsSync(userDataDir)) {
+      throw new Error('Không tìm thấy thư mục profile trong app');
+    }
+
+    const settings = this.dbService.getSettings();
+    const viewportWidth = Number(settings['browser.viewportWidth']) || 1280;
+    const viewportHeight = Number(settings['browser.viewportHeight']) || 720;
+
+    const browser = await puppeteer.launch({
+      headless: false,
+      userDataDir,
+      defaultViewport: { width: viewportWidth, height: viewportHeight },
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        `--window-size=${viewportWidth},${viewportHeight}`,
+      ],
+    }).catch((error) => {
+      throw new Error(`Không mở được browser: ${error.message}`);
+    });
+
+    try {
+      const page = await browser.newPage();
+      await page.goto('about:blank', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+    } catch {
+      // Browser van mo, bo qua loi dieu huong
+    }
+
+    return {
+      success: true,
+      userDataDir,
+      pid: browser.process()?.pid || null,
+    };
+  }
+
   importBrowserProfile(profileId) {
     const profile = this.dbService.getBrowserProfileById(profileId);
     if (!profile) {
@@ -198,7 +239,12 @@ class BrowserProfileService {
       }
     }
 
+    if (copied.length === 0) {
+      throw new Error(`Khong copy duoc du lieu nao tu ${profile.display_name}`);
+    }
+
     const importedAt = new Date().toISOString();
+    const updatedProfile = this.dbService.markBrowserProfileImported(profileId, importRoot, importedAt);
     this.dbService.saveSettings({
       'browser.importProfileId': profileId,
       'browser.importUserDataDir': importRoot,
@@ -207,16 +253,146 @@ class BrowserProfileService {
 
     return {
       success: true,
-      profile,
+      profile: updatedProfile,
       importRoot,
       importProfileDir,
       copied,
       skipped,
       importedAt,
-      message: copied.length
-        ? `Da import ${copied.length} nhom du lieu tu ${profile.display_name}`
-        : `Khong copy duoc du lieu nao tu ${profile.display_name}`,
+      message: `Da import ${copied.length} nhom du lieu tu ${profile.display_name}`,
     };
+  }
+
+  removeImportedBrowserData(profileId) {
+    const profile = this.dbService.getBrowserProfileById(profileId);
+    if (!profile) {
+      throw new Error('Khong tim thay browser profile');
+    }
+
+    if (profile.import_path && fs.existsSync(profile.import_path)) {
+      fs.rmSync(profile.import_path, { recursive: true, force: true });
+    }
+
+    this.dbService.clearBrowserProfileImport(profileId);
+
+    const settings = this.dbService.getSettings();
+    if (settings['browser.importProfileId'] === profileId) {
+      this.dbService.saveSettings({
+        'browser.importProfileId': null,
+        'browser.importUserDataDir': null,
+        'browser.importedAt': null,
+      });
+    }
+
+    return {
+      success: true,
+      profileId,
+      message: 'Da xoa data import khoi app',
+    };
+  }
+
+  setActiveImportProfile(profileId) {
+    const profile = this.dbService.getBrowserProfileById(profileId);
+    if (!profile?.import_path) {
+      throw new Error('Profile chua duoc import vao app');
+    }
+
+    this.dbService.saveSettings({
+      'browser.importProfileId': profileId,
+      'browser.importUserDataDir': profile.import_path,
+      'browser.importedAt': profile.imported_at || new Date().toISOString(),
+    });
+
+    return {
+      success: true,
+      profile,
+      importRoot: profile.import_path,
+    };
+  }
+
+  listAppRecordingProfiles() {
+    const settings = this.dbService.getSettings();
+    const browserDataRoot = settings['browser.userDataDir'] || path.join(this.appDataPath, 'browser-data');
+    const profilesDir = path.join(browserDataRoot, 'profiles');
+
+    if (!fs.existsSync(profilesDir)) return [];
+
+    return fs
+      .readdirSync(profilesDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => ({
+        id: entry.name,
+        display_name: `Profile ghi — ${entry.name.slice(0, 8)}…`,
+        import_path: path.join(profilesDir, entry.name),
+        imported_at: null,
+        source: 'record',
+      }));
+  }
+
+  listAppBrowserProfiles() {
+    return this.dbService.getImportedBrowserProfiles();
+  }
+
+  createBlankAppProfile(displayName = '') {
+    const profileId = crypto.randomUUID();
+    const settings = this.dbService.getSettings();
+    const browserDataRoot = settings['browser.userDataDir'] || path.join(this.appDataPath, 'browser-data');
+    const importRoot = path.join(browserDataRoot, 'imports', profileId);
+    const defaultDir = path.join(importRoot, 'Default');
+
+    fs.mkdirSync(defaultDir, { recursive: true });
+
+    const shortId = profileId.slice(0, 8);
+    const finalName = displayName.trim() || `Profile trống ${shortId}`;
+
+    this.dbService.saveBrowserProfile({
+      id: profileId,
+      browser_key: 'app',
+      browser_name: 'RPA Browser',
+      profile_name: finalName,
+      executable_path: 'internal://rpa',
+      user_data_dir: importRoot,
+      profile_dir_name: 'Default',
+      display_name: finalName,
+      source: 'app',
+      status: 'active',
+    });
+
+    const profile = this.dbService.markBrowserProfileImported(profileId, importRoot);
+
+    return {
+      success: true,
+      profile,
+      importRoot,
+      message: `Đã tạo ${finalName}`,
+    };
+  }
+
+  deleteAppRecordingProfile(folderId) {
+    if (!folderId) {
+      throw new Error('Thieu id profile ghi');
+    }
+
+    const settings = this.dbService.getSettings();
+    const browserDataRoot = settings['browser.userDataDir'] || path.join(this.appDataPath, 'browser-data');
+    const profileDir = path.join(browserDataRoot, 'profiles', folderId);
+
+    if (fs.existsSync(profileDir)) {
+      fs.rmSync(profileDir, { recursive: true, force: true });
+    }
+
+    return {
+      success: true,
+      folderId,
+      message: 'Da xoa profile ghi',
+    };
+  }
+
+  deleteAppProfile(profile) {
+    if (profile?.source === 'record') {
+      return this.deleteAppRecordingProfile(profile.id);
+    }
+    return this.removeImportedBrowserData(profile.id);
   }
 
   findExecutable(browser, roots) {

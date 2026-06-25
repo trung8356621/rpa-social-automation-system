@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useDispatch, useSelector } from 'react-redux';
 import {
   AlertCircle,
@@ -8,6 +8,7 @@ import {
   FolderOpen,
   Globe,
   Loader2,
+  Monitor,
   Plus,
   RefreshCw,
   Save,
@@ -41,25 +42,54 @@ export default function BrowserProfilesPage() {
   const { items, loading, scanning, opening, saving, deleting, lastScan, error } = useSelector(
     (state) => state.browserProfiles,
   );
+  const [activeTab, setActiveTab] = useState('machine');
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ ...emptyForm });
-  const [importProfileId, setImportProfileId] = useState('');
-  const [importPath, setImportPath] = useState('');
+  const [activeImportProfileId, setActiveImportProfileId] = useState('');
+  const [activeImportPath, setActiveImportPath] = useState('');
+  const [recordingProfiles, setRecordingProfiles] = useState([]);
+  const [importingId, setImportingId] = useState('');
+  const [removingId, setRemovingId] = useState('');
+  const [creatingBlank, setCreatingBlank] = useState(false);
+
+  const machineProfiles = useMemo(
+    () => items.filter((profile) => !profile.imported_at),
+    [items],
+  );
+  const importedProfiles = useMemo(
+    () => items.filter((profile) => profile.imported_at),
+    [items],
+  );
+
+  const loadSettings = () => {
+    window.electronAPI.getSettings()
+      .then((settings) => {
+        setActiveImportProfileId(settings['browser.importProfileId'] || '');
+        setActiveImportPath(settings['browser.importUserDataDir'] || '');
+      })
+      .catch(() => {});
+  };
+
+  const loadRecordingProfiles = () => {
+    window.electronAPI.listAppRecordingProfiles?.()
+      .then((profiles) => setRecordingProfiles(Array.isArray(profiles) ? profiles : []))
+      .catch(() => setRecordingProfiles([]));
+  };
 
   useEffect(() => {
     dispatch(fetchBrowserProfiles());
-    window.electronAPI.getSettings()
-      .then((settings) => {
-        setImportProfileId(settings['browser.importProfileId'] || '');
-        setImportPath(settings['browser.importUserDataDir'] || '');
-      })
-      .catch(() => {});
+    loadSettings();
+    loadRecordingProfiles();
   }, [dispatch]);
 
   const handleScan = async () => {
     const result = await dispatch(scanBrowserProfiles());
     if (result.meta.requestStatus === 'fulfilled') {
-      dispatch(showToast({ type: result.payload.foundCount ? 'success' : 'info', message: result.payload.message }));
+      dispatch(showToast({
+        type: result.payload.foundCount ? 'success' : 'info',
+        message: result.payload.message,
+      }));
+      dispatch(fetchBrowserProfiles());
     } else {
       dispatch(showToast({ type: 'error', message: result.payload || 'Quét browser thất bại' }));
     }
@@ -75,13 +105,84 @@ export default function BrowserProfilesPage() {
   };
 
   const handleImport = async (profile) => {
+    setImportingId(profile.id);
     try {
       const result = await window.electronAPI.importBrowserProfile(profile.id);
-      setImportProfileId(profile.id);
-      setImportPath(result.importRoot || '');
-      dispatch(showToast({ type: 'success', message: result.message || `Đã import data từ ${profile.display_name}` }));
+      setActiveImportProfileId(profile.id);
+      setActiveImportPath(result.importRoot || '');
+      await dispatch(fetchBrowserProfiles());
+      dispatch(showToast({
+        type: 'success',
+        message: result.message || `Đã import data từ ${profile.display_name}`,
+      }));
+      setActiveTab('app');
     } catch (err) {
       dispatch(showToast({ type: 'error', message: err.message || 'Import browser profile thất bại' }));
+    } finally {
+      setImportingId('');
+    }
+  };
+
+  const handleSetActiveImport = async (profileId) => {
+    try {
+      const result = await window.electronAPI.setActiveImportProfile(profileId);
+      setActiveImportProfileId(profileId);
+      setActiveImportPath(result.importRoot || '');
+      dispatch(showToast({ type: 'success', message: 'Đã chọn profile này khi Record' }));
+    } catch (err) {
+      dispatch(showToast({ type: 'error', message: err.message || 'Không chọn được profile' }));
+    }
+  };
+
+  const handleCreateBlankProfile = async () => {
+    const displayName = window.prompt('Tên profile trống (để trống sẽ tự đặt tên):', '');
+    if (displayName === null) return;
+
+    setCreatingBlank(true);
+    try {
+      const result = await window.electronAPI.createBlankBrowserProfile(displayName);
+      await dispatch(fetchBrowserProfiles());
+      dispatch(showToast({ type: 'success', message: result.message || 'Đã tạo profile trống' }));
+      setActiveTab('app');
+    } catch (err) {
+      dispatch(showToast({ type: 'error', message: err.message || 'Tạo profile trống thất bại' }));
+    } finally {
+      setCreatingBlank(false);
+    }
+  };
+
+  const handleDeleteAppProfile = async (profile) => {
+    const label = profile.display_name || profile.id;
+    if (!window.confirm(`Xóa "${label}" khỏi app?`)) return;
+
+    setRemovingId(profile.id);
+    try {
+      await window.electronAPI.deleteAppBrowserProfile(profile);
+      if (activeImportProfileId === profile.id) {
+        setActiveImportProfileId('');
+        setActiveImportPath('');
+      }
+      await dispatch(fetchBrowserProfiles());
+      loadRecordingProfiles();
+      dispatch(showToast({ type: 'success', message: 'Đã xóa profile' }));
+    } catch (err) {
+      dispatch(showToast({ type: 'error', message: err.message || 'Xóa profile thất bại' }));
+    } finally {
+      setRemovingId('');
+    }
+  };
+
+  const handleRemoveImportedData = async (profile) => {
+    await handleDeleteAppProfile(profile);
+    setActiveTab('machine');
+  };
+
+  const handleOpenAppProfile = async (profile) => {
+    try {
+      await window.electronAPI.openAppBrowserProfile(profile);
+      dispatch(showToast({ type: 'success', message: 'Đã mở browser profile' }));
+    } catch (err) {
+      dispatch(showToast({ type: 'error', message: err.message || 'Không mở được browser' }));
     }
   };
 
@@ -131,6 +232,12 @@ export default function BrowserProfilesPage() {
     }
   };
 
+  const refreshAll = () => {
+    dispatch(fetchBrowserProfiles());
+    loadSettings();
+    loadRecordingProfiles();
+  };
+
   return (
     <div className="page-shell">
       <div className="page-header">
@@ -139,38 +246,57 @@ export default function BrowserProfilesPage() {
             <Globe className="h-7 w-7 text-[#7db4ff]" />
             Browser
           </h1>
-          <p className="page-subtitle">Quét browser Chromium trên máy và chọn profile để import data khi Record.</p>
+          <p className="page-subtitle">
+            Quét profile Chromium trên máy, import vào thư mục imports, rồi chọn profile dùng khi Record.
+          </p>
         </div>
         <div className="flex items-center gap-3">
-          <button type="button" onClick={() => dispatch(fetchBrowserProfiles())} className="btn-secondary">
+          <button type="button" onClick={refreshAll} className="btn-secondary">
             <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
             Làm mới
           </button>
-          <button type="button" onClick={handleScan} disabled={scanning} className="btn-secondary">
-            {scanning ? <Loader2 className="h-4 w-4 animate-spin" /> : <ScanLine className="h-4 w-4" />}
-            Quét browser
-          </button>
-          <button type="button" onClick={() => setShowForm(true)} className="btn-primary">
-            <Plus className="h-4 w-4" />
-            Thêm thủ công
-          </button>
+          {activeTab === 'machine' && (
+            <button type="button" onClick={handleScan} disabled={scanning} className="btn-secondary">
+              {scanning ? <Loader2 className="h-4 w-4 animate-spin" /> : <ScanLine className="h-4 w-4" />}
+              Quét browser
+            </button>
+          )}
+          {activeTab === 'machine' && (
+            <button type="button" onClick={() => setShowForm(true)} className="btn-primary">
+              <Plus className="h-4 w-4" />
+              Thêm thủ công
+            </button>
+          )}
         </div>
       </div>
 
-      {(error || lastScan?.message) && (
+      {(error || lastScan?.message) && activeTab === 'machine' && (
         <div className="mb-5 flex items-center gap-3 rounded-lg border border-[#344257] bg-[#182230] p-3 text-sm text-[#c7d0dc]">
           <AlertCircle className="h-5 w-5 shrink-0 text-[#7db4ff]" />
           <span>{error || lastScan.message}</span>
         </div>
       )}
 
-      {importPath && (
+      {activeImportPath && (
         <div className="mb-5 rounded-lg border border-emerald-600/40 bg-emerald-900/20 p-3 text-sm text-emerald-100">
-          Data import hiện tại: <span className="font-mono text-emerald-200">{importPath}</span>
+          Profile đang dùng khi Record: <span className="font-mono text-emerald-200">{activeImportPath}</span>
         </div>
       )}
 
-      {showForm && (
+      <div className="mb-5 flex gap-1 border-b border-[#2a2d34]">
+        <TabButton
+          active={activeTab === 'machine'}
+          onClick={() => setActiveTab('machine')}
+          label={`Trên máy (${machineProfiles.length})`}
+        />
+        <TabButton
+          active={activeTab === 'app'}
+          onClick={() => setActiveTab('app')}
+          label={`Trong app (${importedProfiles.length + recordingProfiles.length})`}
+        />
+      </div>
+
+      {showForm && activeTab === 'machine' && (
         <section className="card mb-6 p-5">
           <div className="mb-4 flex items-center justify-between">
             <h2 className="text-base font-semibold text-white">Thêm browser profile thủ công</h2>
@@ -218,52 +344,255 @@ export default function BrowserProfilesPage() {
         </section>
       )}
 
-      {loading && items.length === 0 ? (
-        <div className="panel flex h-48 items-center justify-center">
-          <Loader2 className="h-8 w-8 animate-spin text-[#9aa7b7]" />
+      {activeTab === 'machine' && (
+        <MachineProfilesList
+          loading={loading}
+          profiles={machineProfiles}
+          importingId={importingId}
+          opening={opening}
+          deleting={deleting}
+          onImport={handleImport}
+          onOpen={handleOpen}
+          onDelete={handleDelete}
+        />
+      )}
+
+      {activeTab === 'app' && (
+        <AppProfilesList
+          importedProfiles={importedProfiles}
+          recordingProfiles={recordingProfiles}
+          activeImportProfileId={activeImportProfileId}
+          removingId={removingId}
+          creatingBlank={creatingBlank}
+          opening={opening}
+          onCreateBlank={handleCreateBlankProfile}
+          onSetActive={handleSetActiveImport}
+          onOpen={handleOpenAppProfile}
+          onDelete={handleDeleteAppProfile}
+          onRemoveImported={handleRemoveImportedData}
+        />
+      )}
+    </div>
+  );
+}
+
+function TabButton({ active, onClick, label }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`border-b-2 px-4 py-2 text-sm font-semibold transition ${
+        active
+          ? 'border-[#635bff] text-white'
+          : 'border-transparent text-[#9aa7b7] hover:text-white'
+      }`}
+    >
+      {label}
+    </button>
+  );
+}
+
+function MachineProfilesList({
+  loading,
+  profiles,
+  importingId,
+  opening,
+  deleting,
+  onImport,
+  onOpen,
+  onDelete,
+}) {
+  if (loading && profiles.length === 0) {
+    return (
+      <div className="panel flex h-48 items-center justify-center">
+        <Loader2 className="h-8 w-8 animate-spin text-[#9aa7b7]" />
+      </div>
+    );
+  }
+
+  if (profiles.length === 0) {
+    return (
+      <div className="panel flex h-64 flex-col items-center justify-center text-center">
+        <Globe className="mb-3 h-12 w-12 text-[#6f7d90]" />
+        <p className="text-sm font-semibold text-white">Chưa có profile trên máy</p>
+        <p className="mt-1 max-w-md text-sm text-[#9aa7b7]">
+          Bấm &quot;Quét browser&quot; để tìm Chrome, Edge, Brave, Cốc Cốc rồi chọn Import.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+      {profiles.map((profile) => (
+        <article key={profile.id} className="card p-5">
+          <div className="mb-4 flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <h2 className="truncate text-base font-semibold text-white">{profile.display_name}</h2>
+              <p className="mt-1 text-sm text-[#9aa7b7]">{profile.browser_name} / {profile.profile_dir_name}</p>
+            </div>
+            <span className="badge">{profile.source || 'scan'}</span>
+          </div>
+          <div className="mb-4 space-y-2 text-xs text-[#9aa7b7]">
+            <Detail label="Executable" value={profile.executable_path} />
+            <Detail label="User data" value={profile.user_data_dir} />
+            <Detail label="Scanned" value={profile.last_scanned_at ? new Date(profile.last_scanned_at).toLocaleString('vi-VN') : 'Thủ công'} />
+          </div>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => onImport(profile)}
+              disabled={importingId === profile.id}
+              className="btn-primary flex-1"
+            >
+              {importingId === profile.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+              Import
+            </button>
+            <button type="button" onClick={() => onOpen(profile.id)} disabled={opening} className="btn-secondary">
+              <ExternalLink className="h-4 w-4" />
+              Mở thử
+            </button>
+            <button type="button" onClick={() => onDelete(profile.id)} disabled={deleting} className="btn-danger">
+              <Trash2 className="h-4 w-4" />
+              Xóa
+            </button>
+          </div>
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function AppProfilesList({
+  importedProfiles,
+  recordingProfiles,
+  activeImportProfileId,
+  removingId,
+  creatingBlank,
+  opening,
+  onCreateBlank,
+  onSetActive,
+  onOpen,
+  onDelete,
+  onRemoveImported,
+}) {
+  if (importedProfiles.length === 0 && recordingProfiles.length === 0) {
+    return (
+      <div className="space-y-4">
+        <div className="flex justify-end">
+          <button type="button" onClick={onCreateBlank} disabled={creatingBlank} className="btn-primary">
+            {creatingBlank ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+            Tạo profile trống
+          </button>
         </div>
-      ) : items.length === 0 ? (
         <div className="panel flex h-64 flex-col items-center justify-center text-center">
-          <Globe className="mb-3 h-12 w-12 text-[#6f7d90]" />
-          <p className="text-sm font-semibold text-white">Chưa có browser profile</p>
-          <p className="mt-1 max-w-md text-sm text-[#9aa7b7]">Bấm “Quét browser” để tự tìm Chrome, Edge, Brave, Cốc Cốc rồi chọn Import.</p>
+          <Monitor className="mb-3 h-12 w-12 text-[#6f7d90]" />
+          <p className="text-sm font-semibold text-white">Chưa có profile trong app</p>
+          <p className="mt-1 max-w-md text-sm text-[#9aa7b7]">
+            Import từ tab &quot;Trên máy&quot; hoặc tạo profile trống mới.
+          </p>
         </div>
-      ) : (
-        <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
-          {items.map((profile) => {
-            const isImported = importProfileId === profile.id;
-            return (
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      <div className="flex justify-end">
+        <button type="button" onClick={onCreateBlank} disabled={creatingBlank} className="btn-primary">
+          {creatingBlank ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+          Tạo profile trống
+        </button>
+      </div>
+      {importedProfiles.length > 0 && (
+        <section>
+          <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-[#76849b]">
+            Đã import ({importedProfiles.length})
+          </h2>
+          <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+            {importedProfiles.map((profile) => {
+              const isActive = activeImportProfileId === profile.id;
+              return (
+                <article key={profile.id} className="card p-5">
+                  <div className="mb-4 flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <h2 className="truncate text-base font-semibold text-white">{profile.display_name}</h2>
+                      <p className="mt-1 text-sm text-[#9aa7b7]">{profile.browser_name} / {profile.profile_dir_name}</p>
+                    </div>
+                    <span className={`badge ${isActive ? 'border-emerald-500/50 text-emerald-300' : ''}`}>
+                      {isActive ? 'Đang dùng' : 'imported'}
+                    </span>
+                  </div>
+                  <div className="mb-4 space-y-2 text-xs text-[#9aa7b7]">
+                    <Detail label="Import path" value={profile.import_path} />
+                    <Detail
+                      label="Imported"
+                      value={profile.imported_at ? new Date(profile.imported_at).toLocaleString('vi-VN') : '-'}
+                    />
+                  </div>
+                  <div className="flex gap-2">
+                    {!isActive && (
+                      <button type="button" onClick={() => onSetActive(profile.id)} className="btn-primary flex-1">
+                        <CheckCircle2 className="h-4 w-4" />
+                        Dùng khi Record
+                      </button>
+                    )}
+                    <button type="button" onClick={() => onOpen(profile)} disabled={opening} className="btn-secondary">
+                      <ExternalLink className="h-4 w-4" />
+                      Mở thử
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onRemoveImported(profile)}
+                      disabled={removingId === profile.id}
+                      className="btn-danger"
+                    >
+                      {removingId === profile.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+                      Xóa
+                    </button>
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        </section>
+      )}
+
+      {recordingProfiles.length > 0 && (
+        <section>
+          <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-[#76849b]">
+            Profile ghi từ Record ({recordingProfiles.length})
+          </h2>
+          <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+            {recordingProfiles.map((profile) => (
               <article key={profile.id} className="card p-5">
                 <div className="mb-4 flex items-start justify-between gap-3">
                   <div className="min-w-0">
                     <h2 className="truncate text-base font-semibold text-white">{profile.display_name}</h2>
-                    <p className="mt-1 text-sm text-[#9aa7b7]">{profile.browser_name} / {profile.profile_dir_name}</p>
+                    <p className="mt-1 text-sm text-[#9aa7b7]">Tạo tự động khi ghi kịch bản</p>
                   </div>
-                  <span className="badge">{profile.source || 'scan'}</span>
+                  <span className="badge">record</span>
                 </div>
-                <div className="mb-4 space-y-2 text-xs text-[#9aa7b7]">
-                  <Detail label="Executable" value={profile.executable_path} />
-                  <Detail label="User data" value={profile.user_data_dir} />
-                  <Detail label="Scanned" value={profile.last_scanned_at ? new Date(profile.last_scanned_at).toLocaleString('vi-VN') : 'Thủ công'} />
-                </div>
-                <div className="flex gap-2">
-                  <button type="button" onClick={() => handleImport(profile)} className={isImported ? 'btn-primary flex-1' : 'btn-secondary flex-1'}>
-                    <CheckCircle2 className="h-4 w-4" />
-                    {isImported ? 'Đang import' : 'Import'}
-                  </button>
-                  <button type="button" onClick={() => handleOpen(profile.id)} disabled={opening} className="btn-secondary">
+                <Detail label="Path" value={profile.import_path} />
+                <div className="mt-4 flex gap-2">
+                  <button type="button" onClick={() => onOpen(profile)} disabled={opening} className="btn-secondary flex-1">
                     <ExternalLink className="h-4 w-4" />
                     Mở thử
                   </button>
-                  <button type="button" onClick={() => handleDelete(profile.id)} disabled={deleting} className="btn-danger">
-                    <Trash2 className="h-4 w-4" />
+                  <button
+                    type="button"
+                    onClick={() => onDelete(profile)}
+                    disabled={removingId === profile.id}
+                    className="btn-danger"
+                  >
+                    {removingId === profile.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
                     Xóa
                   </button>
                 </div>
               </article>
-            );
-          })}
-        </div>
+            ))}
+          </div>
+        </section>
       )}
     </div>
   );

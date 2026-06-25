@@ -29,6 +29,9 @@ import {
 } from 'lucide-react';
 import { setCurrentPage, showToast } from '../slices/uiSlice';
 
+const DEFAULT_ACTION_DELAY_MS = 300;
+const MAX_UNDO_STEPS = 20;
+
 // ===== Helper Components =====
 
 function IconOnly({ icon: Icon, label, ...props }) {
@@ -84,7 +87,7 @@ function createStep(actionType, overrides = {}) {
     id: crypto.randomUUID ? crypto.randomUUID() : `${now}-${Math.random().toString(36).slice(2, 9)}`,
     action_type: actionType,
     target_anchor: { action_config: defaultConfig[actionType] || {} },
-    delay_ms: 1000,
+    delay_ms: DEFAULT_ACTION_DELAY_MS,
     created_at: new Date().toISOString(),
     ...overrides,
   };
@@ -93,6 +96,7 @@ function createStep(actionType, overrides = {}) {
 function toDatabaseStep(step) {
   return {
     ...step,
+    delay_ms: Number(step.delay_ms) || DEFAULT_ACTION_DELAY_MS,
     target_anchor: parseJsonObject(step.target_anchor),
   };
 }
@@ -101,11 +105,19 @@ function normalizeSteps(steps) {
   if (!steps || !Array.isArray(steps)) return [];
   return steps.map((step, idx) => ({
     ...step,
+    delay_ms: Number(step.delay_ms) || DEFAULT_ACTION_DELAY_MS,
     order: idx,
     target_anchor: parseJsonObject(step.target_anchor),
     action_config:
       parseJsonObject(step.target_anchor).action_config || {},
   }));
+}
+
+function createEditorSnapshot(steps, manifestFrames) {
+  return {
+    steps: normalizeSteps(JSON.parse(JSON.stringify(steps))),
+    manifestFrames: JSON.parse(JSON.stringify(manifestFrames)),
+  };
 }
 
 function parseJsonObject(value) {
@@ -178,15 +190,95 @@ function findStepIndexAtTime(time, steps) {
   if (!steps.length) return null;
   let accumulatedTime = 0;
   for (let i = 0; i < steps.length; i += 1) {
-    accumulatedTime += steps[i].delay_ms || 1000;
+    accumulatedTime += steps[i].delay_ms || DEFAULT_ACTION_DELAY_MS;
     if (time < accumulatedTime) return i;
   }
   return steps.length - 1;
 }
 
+// Find the step whose time_offset is closest to `time` (used when timeline uses recording timestamps).
+function findStepIndexByTimeOffset(time, steps) {
+  if (!steps.length) return null;
+  let closestIdx = 0;
+  let minDist = Infinity;
+  for (let i = 0; i < steps.length; i += 1) {
+    const t = steps[i].target_anchor?.time_offset != null
+      ? Number(steps[i].target_anchor.time_offset)
+      : getStepTime(steps[i], steps);
+    const dist = Math.abs(t - time);
+    if (dist < minDist) { minDist = dist; closestIdx = i; }
+  }
+  return closestIdx;
+}
+
+function getStepTimestamp(step, index, steps) {
+  if (step.target_anchor?.time_offset != null) {
+    return Number(step.target_anchor.time_offset);
+  }
+  return getStepTime({ ...step, order: index }, steps);
+}
+
+function isInTrimRange(time, ranges) {
+  return ranges.some((range) => time >= range.start_ms && time < range.end_ms);
+}
+
+function compactTimestamp(time, ranges) {
+  const sorted = [...ranges].sort((a, b) => a.start_ms - b.start_ms);
+  let offset = 0;
+  for (const range of sorted) {
+    if (time >= range.end_ms) {
+      offset += range.end_ms - range.start_ms;
+    } else if (time >= range.start_ms) {
+      return null;
+    } else {
+      break;
+    }
+  }
+  return time - offset;
+}
+
+function applyTrimDeletion(ranges, steps, manifestFrames) {
+  const merged = mergeTrimRanges(ranges);
+  if (!merged.length) {
+    return { steps, manifestFrames };
+  }
+
+  const keptSteps = steps
+    .map((step, index) => ({
+      step,
+      time: getStepTimestamp(step, index, steps),
+    }))
+    .filter(({ time }) => !isInTrimRange(time, merged))
+    .map(({ step, time }) => {
+      const newTime = compactTimestamp(time, merged);
+      const anchor = parseJsonObject(step.target_anchor);
+      return {
+        ...step,
+        target_anchor: {
+          ...anchor,
+          time_offset: newTime,
+        },
+      };
+    });
+
+  const newManifestFrames = manifestFrames
+    .filter((frame) => !isInTrimRange(Number(frame.time) || 0, merged))
+    .map((frame) => ({
+      ...frame,
+      time: compactTimestamp(Number(frame.time) || 0, merged),
+    }))
+    .filter((frame) => frame.time != null)
+    .sort((a, b) => a.time - b.time);
+
+  return {
+    steps: normalizeSteps(keptSteps),
+    manifestFrames: newManifestFrames,
+  };
+}
+
 function buildAutoTrimRanges(steps, totalTime, thresholdMs = 2500, bufferMs = 500) {
   if (!steps.length || totalTime <= 0) return [];
-  const actionTimes = steps.map((step, index) => getStepTime({ ...step, order: index }, steps));
+  const actionTimes = steps.map((step, index) => getStepTimestamp(step, index, steps));
   const ranges = [];
 
   if (actionTimes[0] > thresholdMs) {
@@ -227,7 +319,7 @@ function getStepTime(step, steps) {
   if (step.order === 0) return 0;
   const totalBefore = steps
     .slice(0, step.order)
-    .reduce((sum, s) => sum + (s.delay_ms || 1000), 0);
+    .reduce((sum, s) => sum + (s.delay_ms || DEFAULT_ACTION_DELAY_MS), 0);
   return totalBefore;
 }
 
@@ -305,7 +397,7 @@ function StepCard({ step, index, isSelected, onSelect, onDelete, onUpdate }) {
   const time = getStepTime(step, []);
   const selector = config.selector || step.target_anchor?.selector_value || '';
   const text = config.text || '';
-  const duration = config.duration || step.delay_ms || 1000;
+  const duration = config.duration || step.delay_ms || DEFAULT_ACTION_DELAY_MS;
 
   return (
     <div
@@ -362,6 +454,8 @@ function ScenarioInfoPanel({
   description,
   platform,
   targetUrl,
+  browserProfileId,
+  browserProfiles,
   onScenarioChange,
 }) {
   return (
@@ -390,6 +484,22 @@ function ScenarioInfoPanel({
           className="input-field h-9"
           placeholder="https://..."
         />
+      </label>
+
+      <label className="col-span-2 block">
+        <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">Browser khi Record</span>
+        <select
+          value={browserProfileId || ''}
+          onChange={(event) => onScenarioChange({ nextBrowserProfileId: event.target.value || null })}
+          className="select-field h-9"
+        >
+          <option value="">Guest (không lưu profile)</option>
+          {browserProfiles.map((profile) => (
+            <option key={profile.id} value={profile.id}>
+              {profile.display_name}
+            </option>
+          ))}
+        </select>
       </label>
 
       <label className="col-span-2 block">
@@ -440,7 +550,7 @@ function StepEditPanel({
       <div className="grid grid-cols-2 gap-3">
         {selectedStep ? (
           <>
-            <label className="block">
+            <label className="col-span-2 block">
               <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">Loại bước</span>
               <select
                 value={selectedStep.action_type}
@@ -459,16 +569,6 @@ function StepEditPanel({
                 <option value="type">Type</option>
                 <option value="wait">Wait</option>
               </select>
-            </label>
-
-            <label className="block">
-              <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">Delay ms</span>
-              <input
-                type="number"
-                value={selectedStep.delay_ms || 1000}
-                onChange={(event) => onStepChange({ delay_ms: Number(event.target.value) })}
-                className="input-field h-9"
-              />
             </label>
 
             <label className="col-span-2 block">
@@ -504,7 +604,7 @@ function StepEditPanel({
                 <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">Thời gian chờ</span>
                 <input
                   type="number"
-                  value={config.duration || selectedStep.delay_ms || 1000}
+                  value={config.duration || selectedStep.delay_ms || DEFAULT_ACTION_DELAY_MS}
                   onChange={(event) => updateActionConfig({ duration: Number(event.target.value) })}
                   className="input-field h-9"
                 />
@@ -526,14 +626,13 @@ function Timeline({
   currentTime,
   totalTime,
   onSeek,
-  trimRanges = [],
   selectingTrim = false,
   pendingTrimRange = null,
   onTrimRangeChange,
 }) {
   const timelineRef = useRef(null);
   const [dragStartTime, setDragStartTime] = useState(null);
-  const maxTime = totalTime || steps.reduce((sum, s) => sum + (s.delay_ms || 1000), 0) || 10000;
+  const maxTime = totalTime || steps.reduce((sum, s) => sum + (s.delay_ms || DEFAULT_ACTION_DELAY_MS), 0) || 10000;
   const progress = maxTime > 0 ? (currentTime / maxTime) * 100 : 0;
 
   const timeFromEvent = (e) => {
@@ -599,22 +698,9 @@ function Timeline({
           </div>
         ))}
 
-        {trimRanges.map((range, index) => {
-          const left = maxTime > 0 ? (range.start_ms / maxTime) * 100 : 0;
-          const width = maxTime > 0 ? ((range.end_ms - range.start_ms) / maxTime) * 100 : 0;
-          return (
-            <div
-              key={`${range.start_ms}-${range.end_ms}-${index}`}
-              className="absolute top-0 h-full border-x border-[#ff5c75]/60 bg-[#ff3b59]/20"
-              style={{ left: `${left}%`, width: `${Math.max(0.2, width)}%` }}
-              title={`Trim ${formatSeconds(range.start_ms)} - ${formatSeconds(range.end_ms)}`}
-            />
-          );
-        })}
-
         {pendingTrimRange && (
           <div
-            className="absolute top-0 h-full border-x border-[#ff9aaa] bg-[#ff3b59]/35"
+            className="absolute top-0 h-full border-x border-[#635bff]/70 bg-[#635bff]/15"
             style={{
               left: `${(Math.min(pendingTrimRange.start_ms, pendingTrimRange.end_ms) / maxTime) * 100}%`,
               width: `${Math.max(0.2, (Math.abs(pendingTrimRange.end_ms - pendingTrimRange.start_ms) / maxTime) * 100)}%`,
@@ -626,15 +712,20 @@ function Timeline({
 
         {steps.map((step, idx) => {
           const stepTime = getStepTime(step, steps);
-          const left = maxTime > 0 ? Math.min(98, (stepTime / maxTime) * 100) : 0;
+          // Prefer time_offset (actual recording timestamp) over cumulative delay_ms so
+          // keyframe diamonds spread across the full recording timeline.
+          const displayTime = step.target_anchor?.time_offset != null
+            ? Number(step.target_anchor.time_offset)
+            : stepTime;
+          const left = maxTime > 0 ? Math.min(98, (displayTime / maxTime) * 100) : 0;
           return (
             <button
               key={step.id || idx}
               type="button"
               className="absolute top-1/2 h-4 w-4 -translate-x-1/2 -translate-y-1/2 rotate-45 border border-[#7e8da5] bg-[#20242c] data-[active=true]:border-[#ffd2d2] data-[active=true]:bg-[#ff3b59]"
               style={{ left: `${left}%` }}
-              data-active={Math.abs(stepTime - currentTime) < Math.max(120, step.delay_ms || 1000)}
-              title={`${describeStep(step.action_type)} - ${formatSeconds(stepTime)}`}
+              data-active={Math.abs(displayTime - currentTime) < Math.max(120, step.delay_ms || DEFAULT_ACTION_DELAY_MS)}
+              title={`${describeStep(step.action_type)} - ${formatSeconds(displayTime)}`}
             />
           );
         })}
@@ -680,27 +771,40 @@ export default function ScenarioEditor({ scenario, onBack }) {
   const [previewPlaying, setPreviewPlaying] = useState(false);
   const [previewCurrentTime, setPreviewCurrentTime] = useState(0);
   const [scenarioPreviewPath, setScenarioPreviewPath] = useState(scenario?.preview_path || null);
+  const [scenarioManifestPath, setScenarioManifestPath] = useState(scenario?.preview_manifest_path || null);
   const [scenarioPreviewUrl, setScenarioPreviewUrl] = useState(scenario?.preview_url || null);
   const [recordStatus, setRecordStatus] = useState(null);
   const [saving, setSaving] = useState(false);
   const [publishing, setPublishing] = useState(false);
   const [settings, setSettings] = useState({});
+  const [browserProfileId, setBrowserProfileId] = useState(scenario?.browser_profile_id || '');
+  const [browserProfileOptions, setBrowserProfileOptions] = useState([]);
   const [frameDataUrls, setFrameDataUrls] = useState({});
-  const [trimRanges, setTrimRanges] = useState(normalizeTrimRanges(scenario?.preview_trim_ranges));
+  const [manifestFrames, setManifestFrames] = useState([]);
   const [selectingTrim, setSelectingTrim] = useState(false);
   const [pendingTrimRange, setPendingTrimRange] = useState(null);
+  const undoStackRef = useRef([]);
+  const redoStackRef = useRef([]);
+  const isApplyingHistoryRef = useRef(false);
+  const stepEditUndoPushedRef = useRef(false);
+  const stepEditUndoTimerRef = useRef(null);
   const scenarioDraftRef = useRef({
     name: scenario?.name || '',
     description: scenario?.description || '',
     platform: scenario?.platform || 'facebook',
     targetUrl: scenario?.target_url || '',
+    browserProfileId: scenario?.browser_profile_id || '',
   });
 
   // ======== Derived State ========
   const hasSteps = steps.length > 0;
-  const totalTime = steps.reduce((sum, s) => sum + (s.delay_ms || 1000), 0);
+  const stepTotalTime = steps.reduce((sum, s) => sum + (s.delay_ms || DEFAULT_ACTION_DELAY_MS), 0);
+  const manifestDuration = manifestFrames.length
+    ? Math.max(...manifestFrames.map((frame) => Number(frame.time) || 0))
+    : 0;
+  const totalTime = Math.max(stepTotalTime, manifestDuration);
   const selectedStep = selectedStepIndex !== null ? steps[selectedStepIndex] : null;
-  const previewFrames = useMemo(() => (
+  const stepPreviewFrames = useMemo(() => (
     steps
       .map((step, index) => {
         const stepTime = getStepTime(step, steps);
@@ -714,6 +818,18 @@ export default function ScenarioEditor({ scenario, onBack }) {
       .filter((frame) => Boolean(frame.url))
       .sort((a, b) => a.time - b.time)
   ), [frameDataUrls, steps]);
+  const manifestPreviewFrames = useMemo(() => (
+    manifestFrames
+      .map((frame, index) => ({
+        index,
+        time: Number(frame.time) || 0,
+        path: frame.path || null,
+        url: frameDataUrls[frame.path] || frame.url || null,
+      }))
+      .filter((frame) => Boolean(frame.url))
+      .sort((a, b) => a.time - b.time)
+  ), [frameDataUrls, manifestFrames]);
+  const previewFrames = manifestPreviewFrames.length ? manifestPreviewFrames : stepPreviewFrames;
   const currentPreviewFrame = useMemo(() => {
     if (!previewFrames.length) return null;
     let activeFrame = previewFrames[0];
@@ -741,7 +857,79 @@ export default function ScenarioEditor({ scenario, onBack }) {
       scenarioDraftRef.current.targetUrl = patch.nextTargetUrl;
       setTargetUrl(patch.nextTargetUrl);
     }
+    if (patch.nextBrowserProfileId !== undefined) {
+      scenarioDraftRef.current.browserProfileId = patch.nextBrowserProfileId || '';
+      setBrowserProfileId(patch.nextBrowserProfileId || '');
+    }
   }, []);
+
+  const clearUndoHistory = useCallback(() => {
+    undoStackRef.current = [];
+    redoStackRef.current = [];
+  }, []);
+
+  const pushUndoSnapshot = useCallback(() => {
+    if (isApplyingHistoryRef.current) return;
+    const snapshot = createEditorSnapshot(steps, manifestFrames);
+    undoStackRef.current = [...undoStackRef.current, snapshot].slice(-MAX_UNDO_STEPS);
+    redoStackRef.current = [];
+  }, [steps, manifestFrames]);
+
+  const applyEditorSnapshot = useCallback((snapshot) => {
+    isApplyingHistoryRef.current = true;
+    stepEditUndoPushedRef.current = false;
+    if (stepEditUndoTimerRef.current) {
+      clearTimeout(stepEditUndoTimerRef.current);
+      stepEditUndoTimerRef.current = null;
+    }
+    setSteps(snapshot.steps);
+    setManifestFrames(snapshot.manifestFrames);
+    setSelectedStepIndex(null);
+    setPreviewCurrentTime(0);
+    queueMicrotask(() => {
+      isApplyingHistoryRef.current = false;
+    });
+  }, []);
+
+  const undo = useCallback(() => {
+    if (!undoStackRef.current.length) return;
+    const current = createEditorSnapshot(steps, manifestFrames);
+    redoStackRef.current = [...redoStackRef.current, current].slice(-MAX_UNDO_STEPS);
+    const previous = undoStackRef.current[undoStackRef.current.length - 1];
+    undoStackRef.current = undoStackRef.current.slice(0, -1);
+    applyEditorSnapshot(previous);
+  }, [applyEditorSnapshot, manifestFrames, steps]);
+
+  const redo = useCallback(() => {
+    if (!redoStackRef.current.length) return;
+    const current = createEditorSnapshot(steps, manifestFrames);
+    undoStackRef.current = [...undoStackRef.current, current].slice(-MAX_UNDO_STEPS);
+    const next = redoStackRef.current[redoStackRef.current.length - 1];
+    redoStackRef.current = redoStackRef.current.slice(0, -1);
+    applyEditorSnapshot(next);
+  }, [applyEditorSnapshot, manifestFrames, steps]);
+
+  useEffect(() => {
+    const handleKeyDown = (event) => {
+      const target = event.target;
+      const tag = target?.tagName?.toLowerCase();
+      if (tag === 'input' || tag === 'textarea' || target?.isContentEditable) return;
+
+      const mod = event.ctrlKey || event.metaKey;
+      if (!mod) return;
+
+      if (event.key === 'z' || event.key === 'Z') {
+        event.preventDefault();
+        undo();
+      } else if (event.key === 'y' || event.key === 'Y') {
+        event.preventDefault();
+        redo();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [redo, undo]);
 
   // ======== Load Settings ========
   useEffect(() => {
@@ -754,6 +942,10 @@ export default function ScenarioEditor({ scenario, onBack }) {
         });
       }
     }).catch(() => {});
+
+    window.electronAPI.listAppBrowserProfiles?.()
+      .then((profiles) => setBrowserProfileOptions(Array.isArray(profiles) ? profiles : []))
+      .catch(() => setBrowserProfileOptions([]));
   }, []);
 
   // ======== Load Scenario Frames ========
@@ -769,26 +961,34 @@ export default function ScenarioEditor({ scenario, onBack }) {
           description: s.description || '',
           platform: s.platform || 'custom',
           targetUrl: s.target_url || '',
+          browserProfileId: s.browser_profile_id || '',
         };
         setName(s.name || name);
         setDescription(s.description || '');
         setPlatform(s.platform || 'custom');
         setTargetUrl(s.target_url || '');
+        setBrowserProfileId(s.browser_profile_id || '');
       }
       if (s?.preview_path) {
         setScenarioPreviewPath(s.preview_path);
         setScenarioPreviewUrl(s.preview_url || null);
       }
+      if (s?.preview_manifest_path) {
+        setScenarioManifestPath(s.preview_manifest_path);
+      }
       if (s?.recorded_width && s?.recorded_height) {
         setActiveViewport({ width: s.recorded_width, height: s.recorded_height });
       }
-      setTrimRanges(normalizeTrimRanges(s?.preview_trim_ranges));
+      setManifestFrames(Array.isArray(s?.preview_frames) ? s.preview_frames : []);
+      clearUndoHistory();
     }).catch(() => {});
-  }, [currentScenarioId]);
+  }, [clearUndoHistory, currentScenarioId]);
 
   useEffect(() => {
-    const missingPaths = steps
-      .map((step) => step.target_anchor?.associated_frame)
+    const missingPaths = [
+      ...steps.map((step) => step.target_anchor?.associated_frame),
+      ...manifestFrames.map((frame) => frame.path),
+    ]
       .filter((item) => item && !frameDataUrls[item]);
 
     if (!missingPaths.length || !window.electronAPI.readFrameDataUrl) return;
@@ -815,7 +1015,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
     return () => {
       cancelled = true;
     };
-  }, [frameDataUrls, steps]);
+  }, [frameDataUrls, manifestFrames, steps]);
 
   // ======== Listen for recording status events ========
   useEffect(() => {
@@ -837,7 +1037,10 @@ export default function ScenarioEditor({ scenario, onBack }) {
   useEffect(() => {
     if (!previewPlaying || !hasSteps) return;
 
-    const totalTime = steps.reduce((sum, s) => sum + (s.delay_ms || 1000), 0);
+    // Use the full totalTime (max of stepTotalTime and manifestDuration) so all manifest
+    // frames are reachable during playback, not just the first stepTotalTime milliseconds.
+    const playDuration = totalTime;
+    const hasTimeOffset = steps.some((s) => s.target_anchor?.time_offset != null);
     let lastTick = Date.now();
 
     const timer = setInterval(() => {
@@ -846,13 +1049,17 @@ export default function ScenarioEditor({ scenario, onBack }) {
       lastTick = now;
 
       setPreviewCurrentTime((current) => {
-        const nextTime = skipTrimForward(current + delta, trimRanges, totalTime);
-        if (nextTime >= totalTime) {
+        const nextTime = Math.min(current + delta, playDuration);
+        if (nextTime >= playDuration) {
           setPreviewPlaying(false);
           setSelectedStepIndex(steps.length - 1);
-          return totalTime;
+          return playDuration;
         }
-        setSelectedStepIndex(findStepIndexAtTime(nextTime, steps));
+        setSelectedStepIndex(
+          hasTimeOffset
+            ? findStepIndexByTimeOffset(nextTime, steps)
+            : findStepIndexAtTime(nextTime, steps),
+        );
         return nextTime;
       });
     }, 100);
@@ -860,7 +1067,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
     return () => {
       clearInterval(timer);
     };
-  }, [previewPlaying, hasSteps, steps, trimRanges]);
+  }, [previewPlaying, hasSteps, steps, totalTime]);
 
   // ======== Callbacks ========
 
@@ -873,9 +1080,13 @@ export default function ScenarioEditor({ scenario, onBack }) {
         description: scenarioDraftRef.current.description,
         platform: scenarioDraftRef.current.platform || platform,
         target_url: scenarioDraftRef.current.targetUrl || '',
+        browser_profile_id: scenarioDraftRef.current.browserProfileId || null,
         recorded_width: activeViewport.width,
         recorded_height: activeViewport.height,
-        preview_trim_ranges: trimRanges,
+        preview_trim_ranges: [],
+        preview_manifest_path: scenarioManifestPath,
+        preview_manifest_frames: manifestFrames,
+        preview_duration_ms: manifestDuration,
       };
       const dbSteps = steps.map(toDatabaseStep);
       const saved = await window.electronAPI.saveScenario(scenarioData, dbSteps);
@@ -890,7 +1101,12 @@ export default function ScenarioEditor({ scenario, onBack }) {
     } finally {
       setSaving(false);
     }
-  }, [currentScenarioId, name, platform, activeViewport, steps, trimRanges, dispatch]);
+  }, [currentScenarioId, name, platform, activeViewport, steps, manifestFrames, manifestDuration, scenarioManifestPath, dispatch]);
+
+  const resolveRecordImportProfileId = useCallback(() => {
+    const selected = scenarioDraftRef.current.browserProfileId || browserProfileId;
+    return selected || null;
+  }, [browserProfileId]);
 
   const handleRecordClick = useCallback(async () => {
     if (recording) {
@@ -918,6 +1134,11 @@ export default function ScenarioEditor({ scenario, onBack }) {
           if (details?.steps) {
             setSteps(normalizeSteps(details.steps));
           }
+          if (details?.preview_manifest_path) {
+            setScenarioManifestPath(details.preview_manifest_path);
+          }
+          setManifestFrames(Array.isArray(details?.preview_frames) ? details.preview_frames : []);
+          clearUndoHistory();
         }
       } catch (error) {
         dispatch(showToast({ type: 'error', message: error.message || 'Dừng record thất bại' }));
@@ -969,7 +1190,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
         targetUrl: latestTargetUrl || defaultUrl(latestPlatform) || 'about:blank',
         viewport,
         mode,
-        importProfileId: s['browser.importProfileId'] || null,
+        importProfileId: resolveRecordImportProfileId(),
       });
 
       if (result) {
@@ -982,7 +1203,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
     } finally {
       setRecordingBusy(false);
     }
-  }, [currentScenarioId, name, targetUrl, platform, activeViewport, settings, persist, dispatch]);
+  }, [currentScenarioId, name, targetUrl, platform, activeViewport, resolveRecordImportProfileId, persist, dispatch]);
 
   const handleRun = useCallback(async () => {
     if (!hasSteps) {
@@ -1038,7 +1259,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
         scenarioId: saved.id,
         targetUrl: latestTargetUrl || defaultUrl(latestPlatform) || 'about:blank',
         viewport,
-        importProfileId: s['browser.importProfileId'] || null,
+        importProfileId: resolveRecordImportProfileId(),
       });
 
       if (result.success) {
@@ -1057,7 +1278,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
     } finally {
       setReplaying(false);
     }
-  }, [activeViewport, dispatch, persist, platform, targetUrl, settings]);
+  }, [activeViewport, dispatch, persist, platform, resolveRecordImportProfileId, targetUrl]);
 
   const handlePublish = useCallback(async () => {
     if (!currentScenarioId) {
@@ -1087,50 +1308,104 @@ export default function ScenarioEditor({ scenario, onBack }) {
   }, [currentScenarioId, dispatch, persist]);
 
   const addStep = useCallback((actionType) => {
+    pushUndoSnapshot();
     const newStep = createStep(actionType);
     setSteps((prev) => [...prev, newStep]);
-  }, []);
+  }, [pushUndoSnapshot]);
 
   const handleDeleteStep = useCallback((index) => {
+    pushUndoSnapshot();
     setSteps((prev) => prev.filter((_, i) => i !== index));
     setSelectedStepIndex((prev) => (prev === index ? null : prev > index ? prev - 1 : prev));
-  }, []);
+  }, [pushUndoSnapshot]);
 
   const handleSelectStep = useCallback((index) => {
     setSelectedStepIndex(index);
-  }, []);
+    const step = steps[index];
+    if (step) {
+      // Seek preview to the step's actual recording time so the correct frame is shown
+      const stepTime = step.target_anchor?.time_offset != null
+        ? Number(step.target_anchor.time_offset)
+        : getStepTime(step, steps);
+      setPreviewCurrentTime(Math.max(0, stepTime));
+    }
+  }, [steps]);
 
   const handleUpdateStep = useCallback((index, updates) => {
+    if (!stepEditUndoPushedRef.current) {
+      pushUndoSnapshot();
+      stepEditUndoPushedRef.current = true;
+    }
+    if (stepEditUndoTimerRef.current) {
+      clearTimeout(stepEditUndoTimerRef.current);
+    }
+    stepEditUndoTimerRef.current = setTimeout(() => {
+      stepEditUndoPushedRef.current = false;
+    }, 1000);
+
     setSteps((prev) => {
       const next = [...prev];
       next[index] = { ...next[index], ...updates };
       return next;
     });
-  }, []);
+  }, [pushUndoSnapshot]);
 
-  const saveTrimRanges = useCallback(async (nextRanges) => {
+  useEffect(() => {
+    stepEditUndoPushedRef.current = false;
+    if (stepEditUndoTimerRef.current) {
+      clearTimeout(stepEditUndoTimerRef.current);
+      stepEditUndoTimerRef.current = null;
+    }
+  }, [selectedStepIndex]);
+
+  const saveScenarioEdits = useCallback(async (nextSteps, nextManifestFrames) => {
     try {
+      const nextDuration = nextManifestFrames.length
+        ? Math.max(...nextManifestFrames.map((frame) => Number(frame.time) || 0))
+        : nextSteps.reduce((sum, s) => sum + (s.delay_ms || DEFAULT_ACTION_DELAY_MS), 0);
       const scenarioData = {
         ...(currentScenarioId ? { id: currentScenarioId } : {}),
         name: scenarioDraftRef.current.name || name,
         description: scenarioDraftRef.current.description,
         platform: scenarioDraftRef.current.platform || platform,
         target_url: scenarioDraftRef.current.targetUrl || '',
+        browser_profile_id: scenarioDraftRef.current.browserProfileId || null,
         recorded_width: activeViewport.width,
         recorded_height: activeViewport.height,
         preview_path: scenarioPreviewPath,
-        preview_trim_ranges: nextRanges,
+        preview_manifest_path: scenarioManifestPath,
+        preview_manifest_frames: nextManifestFrames,
+        preview_duration_ms: nextDuration,
+        preview_trim_ranges: [],
       };
-      const saved = await window.electronAPI.saveScenario(scenarioData, steps.map(toDatabaseStep));
+      const saved = await window.electronAPI.saveScenario(scenarioData, nextSteps.map(toDatabaseStep));
       if (saved?.id) {
         setCurrentScenarioId(saved.id);
       }
       return saved;
     } catch (error) {
-      dispatch(showToast({ type: 'error', message: error.message || 'Không lưu được vùng trim' }));
+      dispatch(showToast({ type: 'error', message: error.message || 'Không lưu được thay đổi' }));
       return null;
     }
-  }, [activeViewport, currentScenarioId, description, dispatch, name, platform, scenarioPreviewPath, steps, targetUrl]);
+  }, [activeViewport, currentScenarioId, dispatch, name, platform, scenarioManifestPath, scenarioPreviewPath, targetUrl]);
+
+  const applyAndSaveTrim = useCallback(async (ranges) => {
+    const merged = mergeTrimRanges(ranges);
+    if (!merged.length) return false;
+
+    pushUndoSnapshot();
+    const { steps: nextSteps, manifestFrames: nextManifestFrames } = applyTrimDeletion(merged, steps, manifestFrames);
+
+    setSteps(nextSteps);
+    setManifestFrames(nextManifestFrames);
+    setPendingTrimRange(null);
+    setSelectingTrim(false);
+    setPreviewCurrentTime(0);
+    setSelectedStepIndex(nextSteps.length ? 0 : null);
+
+    const saved = await saveScenarioEdits(nextSteps, nextManifestFrames);
+    return Boolean(saved);
+  }, [manifestFrames, pushUndoSnapshot, saveScenarioEdits, steps]);
 
   const handleAutoTrim = useCallback(async () => {
     const autoRanges = buildAutoTrimRanges(steps, totalTime || 0);
@@ -1138,14 +1413,11 @@ export default function ScenarioEditor({ scenario, onBack }) {
       dispatch(showToast({ type: 'info', message: 'Không có đoạn trống dài để cắt.' }));
       return;
     }
-    const manualRanges = trimRanges.filter((range) => range.source === 'manual');
-    const nextRanges = mergeTrimRanges([...manualRanges, ...autoRanges]);
-    setTrimRanges(nextRanges);
-    setPendingTrimRange(null);
-    setSelectingTrim(false);
-    await saveTrimRanges(nextRanges);
-    dispatch(showToast({ type: 'success', message: `Đã auto trim ${autoRanges.length} đoạn trống.` }));
-  }, [dispatch, saveTrimRanges, steps, totalTime, trimRanges]);
+    const ok = await applyAndSaveTrim(autoRanges);
+    if (ok) {
+      dispatch(showToast({ type: 'success', message: `Đã xóa ${autoRanges.length} đoạn trống khỏi timeline.` }));
+    }
+  }, [applyAndSaveTrim, dispatch, steps, totalTime]);
 
   const handleSavePendingTrim = useCallback(async () => {
     const normalized = normalizeTrimRanges([pendingTrimRange], totalTime || 0);
@@ -1153,27 +1425,23 @@ export default function ScenarioEditor({ scenario, onBack }) {
       dispatch(showToast({ type: 'error', message: 'Vùng chọn quá ngắn.' }));
       return;
     }
-    const nextRanges = mergeTrimRanges([...trimRanges, { ...normalized[0], source: 'manual' }]);
-    setTrimRanges(nextRanges);
-    setPendingTrimRange(null);
-    setSelectingTrim(false);
-    await saveTrimRanges(nextRanges);
-    dispatch(showToast({ type: 'success', message: 'Đã trim vùng đã chọn.' }));
-  }, [dispatch, pendingTrimRange, saveTrimRanges, totalTime, trimRanges]);
-
-  const handleClearTrim = useCallback(async () => {
-    setTrimRanges([]);
-    setPendingTrimRange(null);
-    setSelectingTrim(false);
-    await saveTrimRanges([]);
-    dispatch(showToast({ type: 'success', message: 'Đã bỏ toàn bộ trim preview.' }));
-  }, [dispatch, saveTrimRanges]);
+    const range = normalized[0];
+    const ok = await applyAndSaveTrim([range]);
+    if (ok) {
+      dispatch(showToast({ type: 'success', message: 'Đã xóa vùng đã chọn khỏi timeline.' }));
+    }
+  }, [applyAndSaveTrim, dispatch, pendingTrimRange, totalTime]);
 
   const handleSeek = useCallback((time) => {
-    const nextTime = skipTrimForward(time, trimRanges, totalTime || 0);
+    const nextTime = Math.max(0, Math.min(time, totalTime || 0));
     setPreviewCurrentTime(nextTime);
-    setSelectedStepIndex(findStepIndexAtTime(nextTime, steps));
-  }, [steps, totalTime, trimRanges]);
+    const hasTimeOffset = steps.some((s) => s.target_anchor?.time_offset != null);
+    setSelectedStepIndex(
+      hasTimeOffset
+        ? findStepIndexByTimeOffset(nextTime, steps)
+        : findStepIndexAtTime(nextTime, steps),
+    );
+  }, [steps, totalTime]);
 
   // ======== Render ========
   return (
@@ -1195,14 +1463,9 @@ export default function ScenarioEditor({ scenario, onBack }) {
             />
             <p className="truncate text-xs text-[#7e8da5]">Puppeteer scenario editor</p>
           </div>
-          <span className="ml-4 rounded border border-[#3f4a5f] px-2 py-1 text-[10px] uppercase text-[#9eb2d0]">
-            Premiere View
-          </span>
         </div>
 
         <div className="flex items-center gap-2">
-          <button type="button" className="rounded-full bg-[#5a5b5f] px-3 py-1 text-xs font-semibold text-white">Mã</button>
-          <button type="button" className="rounded-full bg-[#111216] px-3 py-1 text-xs font-semibold text-white ring-1 ring-[#5b5f69]">Xem trước</button>
           <IconOnly icon={FileDown} label="Xuất file" />
           <IconOnly icon={Upload} label={publishing ? 'Đang xuất...' : 'Xuất bản'} onClick={handlePublish} disabled={recording || !hasSteps || publishing} />
           <IconOnly icon={Share2} label="Chia sẻ" />
@@ -1238,7 +1501,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
             </div>
 
             <div className="flex min-h-0 flex-1 flex-col p-4">
-              <div className="mx-auto flex w-full max-w-[720px] flex-1 items-center">
+              <div className="mx-auto flex w-full max-w-[720px] min-h-0 flex-1 items-center overflow-hidden">
                 <ProgramMonitor
                   platform={platform}
                   selectedStep={selectedStep}
@@ -1252,7 +1515,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
                 />
               </div>
 
-              <div className="mt-3 flex items-center justify-between">
+              <div className="mt-3 flex shrink-0 items-center justify-between">
                 <span className="rounded border border-[#2f3541] bg-[#0b0d12] px-3 py-1.5 text-xs font-semibold text-[#9eb2d0]">
                   {recording
                     ? `REC ${formatSeconds(recordStatus?.elapsedMs || 0)} | ${recordStatus?.eventsCount || 0} events`
@@ -1310,6 +1573,8 @@ export default function ScenarioEditor({ scenario, onBack }) {
                         description={description}
                         platform={platform}
                         targetUrl={targetUrl}
+                        browserProfileId={browserProfileId}
+                        browserProfiles={browserProfileOptions}
                         onScenarioChange={updateScenarioDraft}
                       />
                     </div>
@@ -1405,40 +1670,31 @@ export default function ScenarioEditor({ scenario, onBack }) {
                 disabled={!hasSteps}
                 className={`rounded border px-2 py-1 text-[10px] disabled:cursor-not-allowed disabled:opacity-40 ${
                   selectingTrim
-                    ? 'border-[#ff6b7a] bg-[#3a1d28] text-[#ffd0d8]'
+                    ? 'border-[#635bff] bg-[#2a2550] text-[#c8c4ff]'
                     : 'border-[#3c465c] text-[#c7d0dc] hover:bg-[#243047]'
                 }`}
               >
-                Select Trim
+                Chọn vùng xóa
               </button>
               {pendingTrimRange && Math.abs(pendingTrimRange.end_ms - pendingTrimRange.start_ms) >= 100 && (
                 <button
                   type="button"
                   onClick={handleSavePendingTrim}
-                  className="rounded border border-[#ff6b7a] bg-[#3a1d28] px-2 py-1 text-[10px] text-[#ffd0d8] hover:bg-[#4a2431]"
+                  className="rounded border border-[#635bff] bg-[#2a2550] px-2 py-1 text-[10px] text-[#c8c4ff] hover:bg-[#342f66]"
                 >
-                  Delete selected range
+                  Xóa vùng đã chọn
                 </button>
               )}
-              <button
-                type="button"
-                onClick={handleClearTrim}
-                disabled={!trimRanges.length}
-                className="rounded border border-[#3c465c] px-2 py-1 text-[10px] text-[#c7d0dc] hover:bg-[#243047] disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                Clear Trim
-              </button>
               <span className="text-[#7e8da5]">KEYFRAME KIM CƯƠNG = HÀNH ĐỘNG</span>
             </div>
           </div>
-          <div className="px-4 pb-4 pt-3">
+          <div className="px-4 pb-3 pt-3">
             <div className="h-24">
               <Timeline
                 steps={steps}
                 currentTime={previewCurrentTime}
                 totalTime={totalTime || 20000}
                 onSeek={handleSeek}
-                trimRanges={trimRanges}
                 selectingTrim={selectingTrim}
                 pendingTrimRange={pendingTrimRange}
                 onTrimRangeChange={(range) => setPendingTrimRange(normalizeTrimRanges([range], totalTime || 20000)[0] || null)}
@@ -1447,7 +1703,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
             <div className="mt-2 flex items-center justify-between text-xs text-[#7e8da5]">
               <span>
                 {selectingTrim
-                  ? 'Kéo trên timeline để chọn vùng trống, rồi bấm Delete selected range.'
+                  ? 'Kéo trên timeline để chọn vùng cần xóa, rồi bấm Xóa vùng đã chọn.'
                   : 'Mẹo: Click vào khoảng trống bất kỳ trên timeline để chọn bước cần sửa.'}
               </span>
               <button type="button" className="inline-flex items-center gap-2 text-[#ff9f9f]">
@@ -1643,13 +1899,13 @@ function ProgramMonitor({ platform, selectedStep, targetUrl, hasSteps, recording
         </div>
       )}
 
-      {selectedStep && selectedStep.action_type !== 'navigate' && (
+      {selectedStep?.action_type === 'click' && (
         <div
           className="absolute h-6 w-6 -translate-x-1/2 -translate-y-1/2 rounded-full border-4 border-[#ff3b59] bg-[#ff3b59]/20"
           style={{ left: coords.x + '%', top: coords.y + '%' }}
         >
           <div className="absolute left-6 top-5 min-w-[128px] rounded bg-[#1b1b1f] px-2 py-1 text-[10px] font-bold uppercase text-[#ffb6c0] shadow">
-            {selectedStep.action_type} event
+            click event
           </div>
         </div>
       )}

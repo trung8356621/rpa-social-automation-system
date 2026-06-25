@@ -145,8 +145,36 @@ function registerDatabaseHandlers() {
     return browserProfileService.openBrowserProfile(profileId);
   });
 
+  ipcMain.handle('browser:open-app-profile', (_event, profile) => {
+    return browserProfileService.openAppBrowserProfile(profile);
+  });
+
   ipcMain.handle('browser:import-profile', (_event, profileId) => {
     return browserProfileService.importBrowserProfile(profileId);
+  });
+
+  ipcMain.handle('browser:remove-imported-data', (_event, profileId) => {
+    return browserProfileService.removeImportedBrowserData(profileId);
+  });
+
+  ipcMain.handle('browser:set-active-import', (_event, profileId) => {
+    return browserProfileService.setActiveImportProfile(profileId);
+  });
+
+  ipcMain.handle('browser:list-app-recording-profiles', () => {
+    return browserProfileService.listAppRecordingProfiles();
+  });
+
+  ipcMain.handle('browser:list-app-browser-profiles', () => {
+    return browserProfileService.listAppBrowserProfiles();
+  });
+
+  ipcMain.handle('browser:create-blank-profile', (_event, displayName) => {
+    return browserProfileService.createBlankAppProfile(displayName);
+  });
+
+  ipcMain.handle('browser:delete-app-profile', (_event, profile) => {
+    return browserProfileService.deleteAppProfile(profile);
   });
 
   ipcMain.handle('db:save-browser-profile', (_event, profile) => {

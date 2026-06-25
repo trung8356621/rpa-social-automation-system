@@ -4,6 +4,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer';
 
+const DEFAULT_ACTION_DELAY_MS = 300;
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -156,7 +158,7 @@ class ExecutorService {
   }
 
   async _executeStep(step, stepIndex) {
-    const delayMs = Math.max(0, Number(step.delay_ms) || 0);
+    const delayMs = randomRuntimeDelay(step.delay_ms || DEFAULT_ACTION_DELAY_MS);
     if (delayMs) {
       await this._sleep(delayMs);
     }
@@ -176,7 +178,7 @@ class ExecutorService {
         await this._executeScroll(step);
         break;
       case 'wait':
-        await this._sleep(Number(step.target_anchor?.action_config?.duration || step.delay_ms || 1000));
+        await this._sleep(randomRuntimeDelay(step.target_anchor?.action_config?.duration || step.delay_ms || DEFAULT_ACTION_DELAY_MS));
         break;
       default:
         console.warn(`[Executor] Unsupported action type at step ${stepIndex}: ${step.action_type}`);
@@ -229,7 +231,7 @@ class ExecutorService {
     await this.page.keyboard.down('Control');
     await this.page.keyboard.press('A');
     await this.page.keyboard.up('Control');
-    await this.page.keyboard.type(text, { delay: config.delay || 50 });
+    await this.page.keyboard.type(text, { delay: randomRuntimeDelay(config.delay || 50, 25, 120) });
   }
 
   _resolveVariables(value) {
@@ -347,6 +349,12 @@ class ExecutorService {
   _sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
+}
+
+function randomRuntimeDelay(baseMs = DEFAULT_ACTION_DELAY_MS, minMs = 120, maxMs = 1500) {
+  const base = Math.max(1, Number(baseMs) || DEFAULT_ACTION_DELAY_MS);
+  const factor = 0.7 + Math.random() * 1.1;
+  return Math.round(Math.max(minMs, Math.min(maxMs, base * factor)));
 }
 
 let executorInstance = null;

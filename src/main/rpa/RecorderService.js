@@ -8,6 +8,7 @@ import ffmpegStatic from 'ffmpeg-static';
 import puppeteer from 'puppeteer';
 
 const DEFAULT_VIEWPORT = { width: 1280, height: 720 };
+const DEFAULT_ACTION_DELAY_MS = 300;
 const execFileAsync = promisify(execFile);
 if (ffmpegStatic) {
   ffmpeg.setFfmpegPath(ffmpegStatic);
@@ -57,20 +58,28 @@ class RecorderService {
     const existingScenario = payloadScenarioId ? this.dbService.getScenarioById(payloadScenarioId) : null;
     const scenarioId = scenario?.id || payloadScenarioId || crypto.randomUUID();
     const sourceScenario = scenario || existingScenario || {};
+    const settings = this.dbService.getSettings();
+    const effectiveViewport = this._getViewportFromSettings(settings, viewport);
     const safeScenario = {
       id: scenarioId,
       name: sourceScenario?.name || 'Kich ban moi',
       description: sourceScenario?.description || '',
       platform: sourceScenario?.platform || 'custom',
       target_url: targetUrl || sourceScenario?.target_url || 'about:blank',
-      recorded_width: viewport.width || DEFAULT_VIEWPORT.width,
-      recorded_height: viewport.height || DEFAULT_VIEWPORT.height,
+      recorded_width: effectiveViewport.width,
+      recorded_height: effectiveViewport.height,
       device_pixel_ratio: sourceScenario?.device_pixel_ratio || 1,
+      browser_profile_id: sourceScenario?.browser_profile_id || existingScenario?.browser_profile_id || null,
     };
+
+    const effectiveImportProfileId = importProfileId
+      ?? existingScenario?.browser_profile_id
+      ?? sourceScenario?.browser_profile_id
+      ?? null;
 
     this.scenario = safeScenario;
     this.mode = mode === 'append' ? 'append' : 'replace';
-    this.lastImportProfileId = importProfileId;
+    this.lastImportProfileId = effectiveImportProfileId;
     this.viewport = {
       width: safeScenario.recorded_width,
       height: safeScenario.recorded_height,
@@ -90,39 +99,17 @@ class RecorderService {
     await fs.mkdir(this.framesDir, { recursive: true });
 
     // Lay settings tu DB (su dung root browser.userDataDir lam noi debug frame/profile)
-    const settings = this.dbService.getSettings();
     const configuredUserDataDir = settings?.['browser.userDataDir'];
 
-    let userDataDir;
     if (configuredUserDataDir) {
-      // Cau truc 3 thu muc con trong folder nguoi dung chi dinh:
-      //   profiles/   -> chua profile browser mac dinh cho tung scenario
-      //   imports/    -> chua data import tu browser khac
-      //   storage/    -> chua du lieu chung (cookies, localStorage...)
-      const profilesDir = path.join(configuredUserDataDir, 'profiles');
-      const importsDir = path.join(configuredUserDataDir, 'imports');
-      const storageDir = path.join(configuredUserDataDir, 'storage');
-      await fs.mkdir(profilesDir, { recursive: true });
-      await fs.mkdir(importsDir, { recursive: true });
-      await fs.mkdir(storageDir, { recursive: true });
-
-      // Neu co importProfileId, dung thu muc imports/ => data duoc giu lai qua cac lan record
-      if (importProfileId) {
-        userDataDir = path.join(importsDir, scenarioId);
-      } else {
-        // Mac dinh: dung profiles/ => moi scenario co profile rieng, duoc giu lai
-        userDataDir = path.join(profilesDir, scenarioId);
-      }
-      // Khong xoa — giu nguyen data browser qua cac lan record
-      await fs.mkdir(userDataDir, { recursive: true });
-    } else {
-      // Fallback: tao thu muc tam thoi trong cache (bi mat khi app dong)
-      userDataDir = path.join(this._getBrowserUserDataRoot(), 'profiles', scenarioId);
-      await fs.rm(userDataDir, { recursive: true, force: true }).catch(() => {});
-      await fs.mkdir(userDataDir, { recursive: true });
+      await fs.mkdir(path.join(configuredUserDataDir, 'profiles'), { recursive: true });
+      await fs.mkdir(path.join(configuredUserDataDir, 'imports'), { recursive: true });
+      await fs.mkdir(path.join(configuredUserDataDir, 'storage'), { recursive: true });
+      await fs.mkdir(path.join(configuredUserDataDir, 'guest'), { recursive: true });
     }
+
+    const userDataDir = await this._resolveRecordingUserDataDir(scenarioId, effectiveImportProfileId);
     this.usedUserDataDir = userDataDir;
-    await this._prepareImportedProfile(importProfileId, userDataDir);
 
     this.isRecording = true;
 
@@ -143,9 +130,10 @@ class RecorderService {
       this.browser.on('disconnected', () => {
         this.isRecording = false;
       });
-      await this._pinBrowserOnTop();
+      await this._releaseBrowserTopMost();
 
       this.page = await this.browser.newPage();
+      await this._releaseBrowserTopMost();
       this.page.setDefaultTimeout(30000);
       this.page.setDefaultNavigationTimeout(60000);
       await this.page.exposeFunction('onRpaRecordedAction', (payload) => {
@@ -153,14 +141,25 @@ class RecorderService {
       });
       await this.page.evaluateOnNewDocument(this._getInjectionScript());
 
-      this._screenshotTimer = setInterval(() => {
-        this._lastScreenshotPromise = this._takeScreenshot();
-      }, 250);
-
       await this.page.goto(safeScenario.target_url, {
         waitUntil: 'domcontentloaded',
         timeout: 60000,
       });
+
+      // Reset timing anchors to post-load so step time_offset is relative to page-ready,
+      // not to browser launch. This prevents the first step from carrying a large load delay.
+      this.startTime = Date.now();
+      this.lastEventTime = this.startTime;
+
+      // Start capturing frames only after the page has loaded — avoids blank/loading frames
+      // polluting the manifest and keeps manifestDuration in sync with step time_offset values.
+      this._screenshotTimer = setInterval(() => {
+        this._lastScreenshotPromise = this._takeScreenshot();
+      }, 250);
+
+      await this._releaseBrowserTopMost();
+      // Chromium may re-assert topmost after first paint; release again after render settles
+      setTimeout(() => this._releaseBrowserTopMost().catch(() => {}), 1000);
       await this.page.evaluate(this._getInjectionScript()).catch(() => {});
 
       this.devicePixelRatio = await this.page.evaluate(() => window.devicePixelRatio || 1).catch(() => 1);
@@ -248,6 +247,7 @@ class RecorderService {
     // De nguoi dung co the kiem tra thu cong trang thai browser.
     // Luon dung profiles/<scenarioId> de session duoc giu lai qua cac lan mo.
     const settings = this.dbService.getSettings();
+    const effectiveViewport = this._getViewportFromSettings(settings, viewport);
     const configuredUserDataDir = settings?.['browser.userDataDir'];
     const dirId = scenarioId || 'manual';
     let userDataDir;
@@ -260,14 +260,14 @@ class RecorderService {
 
     const browser = await puppeteer.launch({
       headless: false,
-      defaultViewport: viewport,
+      defaultViewport: effectiveViewport,
       userDataDir,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-gpu',
-        `--window-size=${viewport.width},${viewport.height}`,
+        `--window-size=${effectiveViewport.width},${effectiveViewport.height}`,
       ],
     }).catch((err) => {
       console.error('[Recorder] openBrowser loi:', err.message);
@@ -288,7 +288,7 @@ class RecorderService {
     return {
       opened: true,
       userDataDir,
-      viewport,
+      viewport: effectiveViewport,
     };
   }
 
@@ -305,26 +305,21 @@ class RecorderService {
 
     // Lay settings de xac dinh userDataDir
     const settings = this.dbService.getSettings();
-    const configuredUserDataDir = settings?.['browser.userDataDir'];
-    let userDataDir;
-    if (configuredUserDataDir) {
-      userDataDir = path.join(configuredUserDataDir, 'profiles', scenarioId);
-    } else {
-      userDataDir = path.join(this.appDataPath, 'cache', 'recording-profiles', scenarioId);
-    }
-    await fs.mkdir(userDataDir, { recursive: true });
+    const effectiveViewport = this._getViewportFromSettings(settings, viewport);
+    const effectiveImportProfileId = importProfileId || scenario.browser_profile_id || null;
+    const userDataDir = await this._resolveRecordingUserDataDir(scenarioId, effectiveImportProfileId);
 
     // Mo browser va phat lai tung buoc
     const browser = await puppeteer.launch({
       headless: false,
-      defaultViewport: viewport,
+      defaultViewport: effectiveViewport,
       userDataDir,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-gpu',
-        `--window-size=${viewport.width},${viewport.height}`,
+        `--window-size=${effectiveViewport.width},${effectiveViewport.height}`,
       ],
     }).catch(() => null);
 
@@ -335,6 +330,7 @@ class RecorderService {
     try {
       const page = await browser.newPage();
       page.setDefaultTimeout(30000);
+      await this._releaseBrowserTopMost(browser);
 
       // Dieu huong den target_url cua scenario truoc khi phat lai step
       const initialUrl = scenario.target_url || 'about:blank';
@@ -342,8 +338,9 @@ class RecorderService {
       await page.goto(initialUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {
         console.warn(`[Recorder] Khong the mo URL ban dau: ${initialUrl}`);
       });
+      await this._releaseBrowserTopMost(browser);
       // Doi trang load
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+      await new Promise((resolve) => setTimeout(resolve, randomRuntimeDelay(1000)));
 
       for (const step of steps) {
         const { action_type, target_anchor, delay_ms } = step;
@@ -362,9 +359,9 @@ class RecorderService {
             console.warn(`[Recorder] Navigate that bai: ${err.message}`);
           });
         } else if (action_type === 'click') {
-          await this._replayClick(page, anchor, selector, viewport);
+          await this._replayClick(page, anchor, selector, effectiveViewport);
         } else if (action_type === 'type') {
-          await this._replayType(page, anchor, selector, config.text || '', viewport, config.delay || 50);
+          await this._replayType(page, anchor, selector, config.text || '', effectiveViewport, config.delay || 50);
         } else if (action_type === 'scroll') {
           const scrollX = anchor.scroll_x ?? config.scrollX ?? 0;
           const scrollY = anchor.scroll_y ?? config.scrollY ?? 0;
@@ -374,7 +371,7 @@ class RecorderService {
         }
 
         // Doi delay_ms truoc khi chay buoc tiep theo
-        await new Promise((resolve) => setTimeout(resolve, Math.min(delay_ms || 1000, 5000)));
+        await new Promise((resolve) => setTimeout(resolve, randomRuntimeDelay(delay_ms || DEFAULT_ACTION_DELAY_MS)));
       }
 
       // Sau khi phat lai xong, bat dau record append mode
@@ -391,13 +388,13 @@ class RecorderService {
         description: scenario.description,
         platform: scenario.platform,
         target_url: scenario.target_url,
-        recorded_width: viewport.width,
-        recorded_height: viewport.height,
+        recorded_width: effectiveViewport.width,
+        recorded_height: effectiveViewport.height,
         device_pixel_ratio: scenario.device_pixel_ratio || 1,
       };
       this.mode = 'append';
-      this.lastImportProfileId = importProfileId;
-      this.viewport = { width: viewport.width, height: viewport.height };
+      this.lastImportProfileId = effectiveImportProfileId;
+      this.viewport = { width: effectiveViewport.width, height: effectiveViewport.height };
       this.recordedEvents = [];
       this.frames = [];
       this.frameCounter = 0;
@@ -428,6 +425,7 @@ class RecorderService {
         replayedSteps: steps.length,
         scenarioId,
         cacheDir: this.cacheDir,
+        viewport: effectiveViewport,
         startedAt: this.startTime,
       };
     } catch (error) {
@@ -486,7 +484,7 @@ class RecorderService {
     await page.keyboard.down('Control').catch(() => {});
     await page.keyboard.press('A').catch(() => {});
     await page.keyboard.up('Control').catch(() => {});
-    await page.keyboard.type(String(text || ''), { delay }).catch(() => {});
+    await page.keyboard.type(String(text || ''), { delay: randomRuntimeDelay(delay, 25, 120) }).catch(() => {});
   }
 
   async _replayFocus(page, anchor = {}, selector = '') {
@@ -851,7 +849,7 @@ class RecorderService {
 
       return {
         action_type: event.action_type,
-        delay_ms: Math.max(100, Number(event.delay_ms) || 1000),
+        delay_ms: DEFAULT_ACTION_DELAY_MS,
         target_anchor: {
           ...anchor,
           relative_coords: relativeCoords,
@@ -920,7 +918,7 @@ class RecorderService {
       return { url: event.url || this.scenario?.target_url || '' };
     }
     if (event.action_type === 'type') {
-      return { selector: selectorValue || '', text: event.text || '', delay: 50 };
+      return { selector: selectorValue || '', text: event.text || '', delay: randomRuntimeDelay(50, 25, 120) };
     }
     if (event.action_type === 'scroll') {
       return { scrollX: event.scroll_x || 0, scrollY: event.scroll_y || 0 };
@@ -942,6 +940,34 @@ class RecorderService {
     if (anchor.ariaLabel) return `[aria-label="${anchor.ariaLabel}"]`;
     if (anchor.placeholder) return `[placeholder="${anchor.placeholder}"]`;
     return anchor.xpath || '';
+  }
+
+  async _resolveRecordingUserDataDir(scenarioId, importProfileId) {
+    const browserDataRoot = this._getBrowserUserDataRoot();
+    const importsDir = path.join(browserDataRoot, 'imports');
+    const guestDir = path.join(browserDataRoot, 'guest');
+
+    await fs.mkdir(importsDir, { recursive: true });
+    await fs.mkdir(guestDir, { recursive: true });
+
+    if (importProfileId) {
+      const profile = this.dbService.getBrowserProfileById(importProfileId);
+      if (profile?.import_path) {
+        await fs.mkdir(profile.import_path, { recursive: true });
+        await fs.mkdir(path.join(profile.import_path, 'Default'), { recursive: true });
+        return profile.import_path;
+      }
+
+      const legacyDir = path.join(importsDir, scenarioId);
+      await fs.mkdir(legacyDir, { recursive: true });
+      await this._prepareImportedProfile(importProfileId, legacyDir);
+      return legacyDir;
+    }
+
+    const guestSessionDir = path.join(guestDir, scenarioId, crypto.randomUUID());
+    await fs.rm(guestSessionDir, { recursive: true, force: true }).catch(() => {});
+    await fs.mkdir(guestSessionDir, { recursive: true });
+    return guestSessionDir;
   }
 
   async _prepareImportedProfile(importProfileId, userDataDir) {
@@ -1147,10 +1173,19 @@ class RecorderService {
     this.browser = null;
   }
 
-  async _pinBrowserOnTop() {
+  _getViewportFromSettings(settings = {}, fallbackViewport = DEFAULT_VIEWPORT) {
+    const width = Number(settings?.['browser.viewportWidth']);
+    const height = Number(settings?.['browser.viewportHeight']);
+    return {
+      width: width > 0 ? width : fallbackViewport.width || DEFAULT_VIEWPORT.width,
+      height: height > 0 ? height : fallbackViewport.height || DEFAULT_VIEWPORT.height,
+    };
+  }
+
+  async _releaseBrowserTopMost(browser = this.browser) {
     if (process.platform !== 'win32') return;
 
-    const pid = this.browser?.process()?.pid;
+    const pid = browser?.process()?.pid;
     if (!pid) return;
 
     const script = `
@@ -1167,14 +1202,26 @@ public class Win32 {
 '@
 Add-Type $signature -ErrorAction SilentlyContinue
 $targetPid = ${pid}
-$topMost = New-Object IntPtr(-1)
+$targetPids = New-Object 'System.Collections.Generic.HashSet[UInt32]'
+[void]$targetPids.Add([uint32]$targetPid)
+$changed = $true
+while ($changed) {
+  $changed = $false
+  Get-CimInstance Win32_Process | ForEach-Object {
+    if ($_.ParentProcessId -and $targetPids.Contains([uint32]$_.ParentProcessId) -and -not $targetPids.Contains([uint32]$_.ProcessId)) {
+      [void]$targetPids.Add([uint32]$_.ProcessId)
+      $changed = $true
+    }
+  }
+}
+$notTopMost = New-Object IntPtr(-2)
 $flags = 0x0001 -bor 0x0002 -bor 0x0010
 [Win32]::EnumWindows({
   param($hWnd, $lParam)
   [uint32]$windowPid = 0
   [void][Win32]::GetWindowThreadProcessId($hWnd, [ref]$windowPid)
-  if ($windowPid -eq $targetPid -and [Win32]::IsWindowVisible($hWnd)) {
-    [void][Win32]::SetWindowPos($hWnd, $topMost, 0, 0, 0, 0, $flags)
+  if ($targetPids.Contains($windowPid) -and [Win32]::IsWindowVisible($hWnd)) {
+    [void][Win32]::SetWindowPos($hWnd, $notTopMost, 0, 0, 0, 0, $flags)
   }
   return $true
 }, [IntPtr]::Zero)
@@ -1207,6 +1254,12 @@ $flags = 0x0001 -bor 0x0002 -bor 0x0010
 
 function toCacheUrl(filePath) {
   return `rpa-cache://file/${Buffer.from(filePath).toString('base64url')}`;
+}
+
+function randomRuntimeDelay(baseMs = DEFAULT_ACTION_DELAY_MS, minMs = 120, maxMs = 1500) {
+  const base = Math.max(1, Number(baseMs) || DEFAULT_ACTION_DELAY_MS);
+  const factor = 0.7 + Math.random() * 1.1;
+  return Math.round(Math.max(minMs, Math.min(maxMs, base * factor)));
 }
 
 function escapeConcatPath(filePath) {

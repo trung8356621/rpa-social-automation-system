@@ -147,6 +147,25 @@ class DatabaseService {
       if (!hasPreviewTrimRanges) {
         this.db.exec("ALTER TABLE scenarios ADD COLUMN preview_trim_ranges TEXT DEFAULT '[]'");
       }
+
+      const hasScenarioBrowserProfileId = scenarioColumns.some((col) => col.name === 'browser_profile_id');
+      if (!hasScenarioBrowserProfileId) {
+        this.db.exec('ALTER TABLE scenarios ADD COLUMN browser_profile_id TEXT');
+      }
+    }
+
+    const browserProfilesTable = this.db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='browser_profiles'")
+      .get();
+
+    if (browserProfilesTable) {
+      const browserProfileColumns = this.db.prepare('PRAGMA table_info(browser_profiles)').all();
+      if (!browserProfileColumns.some((col) => col.name === 'imported_at')) {
+        this.db.exec('ALTER TABLE browser_profiles ADD COLUMN imported_at TEXT');
+      }
+      if (!browserProfileColumns.some((col) => col.name === 'import_path')) {
+        this.db.exec('ALTER TABLE browser_profiles ADD COLUMN import_path TEXT');
+      }
     }
   }
 
@@ -189,6 +208,8 @@ class DatabaseService {
           source            TEXT NOT NULL DEFAULT 'scan',
           status            TEXT NOT NULL DEFAULT 'active',
           last_scanned_at   TEXT,
+          imported_at       TEXT,
+          import_path       TEXT,
           is_dirty          INTEGER NOT NULL DEFAULT 1,
           updated_at        TEXT NOT NULL DEFAULT (datetime('now')),
           UNIQUE(browser_key, user_data_dir, profile_dir_name)
@@ -238,6 +259,7 @@ class DatabaseService {
           preview_manifest_path TEXT,
           preview_duration_ms INTEGER,
           preview_trim_ranges TEXT DEFAULT '[]',
+          browser_profile_id TEXT,
           is_dirty            INTEGER NOT NULL DEFAULT 1,
           updated_at          TEXT NOT NULL DEFAULT (datetime('now'))
         );
@@ -268,9 +290,23 @@ class DatabaseService {
           step_order    INTEGER NOT NULL,
           action_type   TEXT NOT NULL,
           target_anchor TEXT,
-          delay_ms      INTEGER DEFAULT 1000,
+          delay_ms      INTEGER DEFAULT 300,
           created_at    TEXT NOT NULL DEFAULT (datetime('now')),
           FOREIGN KEY (scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS scenario_step_frames (
+          id                 TEXT PRIMARY KEY,
+          scenario_id        TEXT NOT NULL,
+          step_id            TEXT NOT NULL,
+          frame_path         TEXT NOT NULL,
+          frame_name         TEXT,
+          frame_timestamp_ms INTEGER,
+          role               TEXT NOT NULL DEFAULT 'associated',
+          created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+          UNIQUE(step_id, frame_path, role),
+          FOREIGN KEY (scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE,
+          FOREIGN KEY (step_id) REFERENCES scenario_steps(id) ON DELETE CASCADE
         );
 
         -- ============================================================
@@ -359,9 +395,10 @@ class DatabaseService {
             id, name, description, platform, target_url,
             recorded_width, recorded_height, device_pixel_ratio,
             preview_path, preview_manifest_path, preview_duration_ms, preview_trim_ranges,
+            browser_profile_id,
             is_dirty, updated_at
           )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
         `)
       : this.db.prepare(`
           UPDATE scenarios
@@ -369,6 +406,7 @@ class DatabaseService {
               recorded_width = ?, recorded_height = ?, device_pixel_ratio = ?,
               preview_path = ?, preview_manifest_path = ?, preview_duration_ms = ?,
               preview_trim_ranges = ?,
+              browser_profile_id = ?,
               is_dirty = 1, updated_at = ?
           WHERE id = ?
         `);
@@ -380,6 +418,29 @@ class DatabaseService {
     const insertStep = this.db.prepare(`
       INSERT INTO scenario_steps (id, scenario_id, step_order, action_type, target_anchor, delay_ms, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    const previousFramePaths = new Set(
+      this.db
+        .prepare('SELECT frame_path FROM scenario_step_frames WHERE scenario_id = ?')
+        .all(scenarioId)
+        .map((row) => row.frame_path)
+        .filter(Boolean)
+    );
+    const nextFramePaths = new Set();
+
+    const deleteStepFrames = this.db.prepare(
+      'DELETE FROM scenario_step_frames WHERE scenario_id = ?'
+    );
+
+    const insertStepFrame = this.db.prepare(`
+      INSERT INTO scenario_step_frames (
+        id, scenario_id, step_id, frame_path, frame_name, frame_timestamp_ms, role, created_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(step_id, frame_path, role) DO UPDATE SET
+        frame_name = excluded.frame_name,
+        frame_timestamp_ms = excluded.frame_timestamp_ms
     `);
 
     // Transaction: đảm bảo tính nguyên tử — hoặc tất cả thành công hoặc rollback toàn bộ
@@ -399,6 +460,7 @@ class DatabaseService {
           scenario.preview_manifest_path ?? null,
           scenario.preview_duration_ms ?? null,
           JSON.stringify(parseJsonArray(scenario.preview_trim_ranges)),
+          scenario.browser_profile_id ?? null,
           now
         );
       } else {
@@ -417,32 +479,91 @@ class DatabaseService {
           scenario.preview_trim_ranges !== undefined
             ? JSON.stringify(parseJsonArray(scenario.preview_trim_ranges))
             : existingScenario.preview_trim_ranges || '[]',
+          scenario.browser_profile_id !== undefined
+            ? scenario.browser_profile_id
+            : existingScenario.browser_profile_id || null,
           now,
           scenarioId
         );
       }
 
       // Xóa steps cũ và thêm steps mới (thay thế toàn bộ)
+      deleteStepFrames.run(scenarioId);
       deleteSteps.run(scenarioId);
 
       steps.forEach((step, index) => {
+        const stepId = step.id || crypto.randomUUID();
+        const targetAnchor = step.target_anchor ? parseJsonObject(step.target_anchor) : null;
+        const delayMs = Number(step.delay_ms) || 300;
         insertStep.run(
-          step.id || crypto.randomUUID(),
+          stepId,
           scenarioId,
           index + 1,
           step.action_type,
           // target_anchor là object — serialize thành JSON string khi ghi DB
-          step.target_anchor ? JSON.stringify(parseJsonObject(step.target_anchor)) : null,
-          step.delay_ms || 1000,
+          targetAnchor ? JSON.stringify(targetAnchor) : null,
+          delayMs,
           now
         );
+
+        const framePath = targetAnchor?.associated_frame;
+        if (framePath) {
+          nextFramePaths.add(framePath);
+          insertStepFrame.run(
+            crypto.randomUUID(),
+            scenarioId,
+            stepId,
+            framePath,
+            targetAnchor.associated_frame_name || path.basename(framePath),
+            Number(targetAnchor.time_offset) || null,
+            'associated',
+            now
+          );
+        }
       });
     });
 
     saveTransaction();
+    this._deleteOrphanedScenarioFrames(previousFramePaths, nextFramePaths);
+
+    if (Array.isArray(scenario.preview_manifest_frames)) {
+      const manifestPath = scenario.preview_manifest_path || existingScenario?.preview_manifest_path;
+      if (manifestPath) {
+        const durationMs = scenario.preview_duration_ms != null
+          ? Number(scenario.preview_duration_ms)
+          : (scenario.preview_manifest_frames.length
+            ? Math.max(...scenario.preview_manifest_frames.map((frame) => Number(frame.time) || 0))
+            : 0);
+        this.writePreviewManifest(manifestPath, scenario.preview_manifest_frames, durationMs);
+      }
+    }
 
     // Trả về dữ liệu đã lưu với steps đã được deserialize
     return this.getScenarioById(scenarioId);
+  }
+
+  writePreviewManifest(manifestPath, frames = [], durationMs = 0) {
+    if (!manifestPath) return null;
+
+    const manifest = {
+      durationMs: Math.max(0, Number(durationMs) || 0),
+      frameCount: frames.length,
+      frames: frames.map((frame) => ({
+        timestamp: Number(frame.time) || 0,
+        fileName: frame.name || (frame.path ? path.basename(frame.path) : null),
+        filePath: frame.path || null,
+        fileUrl: frame.path ? toCacheUrl(frame.path) : frame.url || null,
+      })).filter((frame) => frame.filePath),
+      createdAt: new Date().toISOString(),
+    };
+
+    try {
+      fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
+      return manifestPath;
+    } catch (error) {
+      console.warn(`[DatabaseService] Khong ghi duoc preview manifest: ${manifestPath} - ${error.message}`);
+      return null;
+    }
   }
 
   /**
@@ -463,9 +584,27 @@ class DatabaseService {
       .prepare('SELECT * FROM scenario_steps WHERE scenario_id = ? ORDER BY step_order ASC')
       .all(id);
 
+    const frameRows = this.db
+      .prepare('SELECT * FROM scenario_step_frames WHERE scenario_id = ? ORDER BY created_at ASC')
+      .all(id);
+    const frameByStepId = new Map();
+    for (const row of frameRows) {
+      if (!frameByStepId.has(row.step_id)) {
+        frameByStepId.set(row.step_id, row);
+      }
+    }
+
     // Deserialize target_anchor từ JSON string về object
     const stepsDeserialized = steps.map((step) => {
-      const targetAnchor = step.target_anchor ? parseJsonObject(step.target_anchor) : null;
+      const targetAnchor = step.target_anchor ? parseJsonObject(step.target_anchor) : {};
+      const mappedFrame = frameByStepId.get(step.id);
+      if (mappedFrame?.frame_path) {
+        targetAnchor.associated_frame = mappedFrame.frame_path;
+        targetAnchor.associated_frame_name = mappedFrame.frame_name || path.basename(mappedFrame.frame_path);
+        if (mappedFrame.frame_timestamp_ms !== null && mappedFrame.frame_timestamp_ms !== undefined) {
+          targetAnchor.time_offset = mappedFrame.frame_timestamp_ms;
+        }
+      }
       if (targetAnchor?.associated_frame) {
         targetAnchor.associated_frame_url = toCacheUrl(targetAnchor.associated_frame);
       }
@@ -479,6 +618,7 @@ class DatabaseService {
       ...scenario,
       preview_trim_ranges: parseJsonArray(scenario.preview_trim_ranges),
       preview_url: scenario.preview_path ? toCacheUrl(scenario.preview_path) : null,
+      preview_frames: readPreviewFrames(scenario.preview_manifest_path),
       steps: stepsDeserialized,
     };
   }
@@ -767,6 +907,50 @@ class DatabaseService {
       .all();
   }
 
+  getMachineBrowserProfiles() {
+    return this.db
+      .prepare(`
+        SELECT * FROM browser_profiles
+        WHERE imported_at IS NULL
+        ORDER BY browser_name ASC, profile_name ASC
+      `)
+      .all();
+  }
+
+  getImportedBrowserProfiles() {
+    return this.db
+      .prepare(`
+        SELECT * FROM browser_profiles
+        WHERE imported_at IS NOT NULL
+        ORDER BY imported_at DESC
+      `)
+      .all();
+  }
+
+  markBrowserProfileImported(profileId, importPath, importedAt = new Date().toISOString()) {
+    this.db
+      .prepare(`
+        UPDATE browser_profiles
+        SET imported_at = ?, import_path = ?, status = 'imported', is_dirty = 1, updated_at = ?
+        WHERE id = ?
+      `)
+      .run(importedAt, importPath, importedAt, profileId);
+
+    return this.getBrowserProfileById(profileId);
+  }
+
+  clearBrowserProfileImport(profileId) {
+    this.db
+      .prepare(`
+        UPDATE browser_profiles
+        SET imported_at = NULL, import_path = NULL, status = 'active', is_dirty = 1, updated_at = ?
+        WHERE id = ?
+      `)
+      .run(new Date().toISOString(), profileId);
+
+    return this.getBrowserProfileById(profileId);
+  }
+
   getBrowserProfileById(id) {
     return this.db.prepare('SELECT * FROM browser_profiles WHERE id = ?').get(id);
   }
@@ -847,9 +1031,17 @@ class DatabaseService {
     `);
 
     const saveAll = this.db.transaction((items) => {
+      const findExisting = this.db.prepare(`
+        SELECT id, imported_at FROM browser_profiles
+        WHERE browser_key = ? AND user_data_dir = ? AND profile_dir_name = ?
+      `);
+
       for (const item of items) {
+        const existing = findExisting.get(item.browser_key, item.user_data_dir, item.profile_dir_name);
+        if (existing?.imported_at) continue;
+
         upsert.run(
-          item.id || crypto.randomUUID(),
+          existing?.id || item.id || crypto.randomUUID(),
           item.browser_key,
           item.browser_name,
           item.profile_name,
@@ -903,6 +1095,26 @@ class DatabaseService {
     return this.getSettings();
   }
 
+  _deleteOrphanedScenarioFrames(previousFramePaths, nextFramePaths) {
+    for (const framePath of previousFramePaths) {
+      if (!framePath || nextFramePaths.has(framePath)) continue;
+
+      const stillUsed = this.db
+        .prepare('SELECT COUNT(*) AS count FROM scenario_step_frames WHERE frame_path = ?')
+        .get(framePath);
+
+      if (stillUsed?.count > 0) continue;
+
+      try {
+        if (fs.existsSync(framePath)) {
+          fs.unlinkSync(framePath);
+        }
+      } catch (error) {
+        console.warn(`[DatabaseService] Khong xoa duoc frame orphan: ${framePath} - ${error.message}`);
+      }
+    }
+  }
+
   /**
    * Đóng kết nối database an toàn.
    * Nên gọi khi ứng dụng thoát (app.on('before-quit')).
@@ -946,6 +1158,29 @@ function parseJsonArray(value) {
     }
   }
   return Array.isArray(parsed) ? parsed : [];
+}
+
+function readPreviewFrames(manifestPath) {
+  if (!manifestPath || !fs.existsSync(manifestPath)) return [];
+
+  try {
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    if (!Array.isArray(manifest.frames)) return [];
+
+    return manifest.frames
+      .map((frame, index) => ({
+        index,
+        time: Number(frame.timestamp) || 0,
+        path: frame.filePath || null,
+        name: frame.fileName || (frame.filePath ? path.basename(frame.filePath) : null),
+        url: frame.filePath ? toCacheUrl(frame.filePath) : frame.fileUrl || null,
+      }))
+      .filter((frame) => frame.path)
+      .sort((a, b) => a.time - b.time);
+  } catch (error) {
+    console.warn(`[DatabaseService] Khong doc duoc preview manifest: ${manifestPath} - ${error.message}`);
+    return [];
+  }
 }
 
 export default DatabaseService;
