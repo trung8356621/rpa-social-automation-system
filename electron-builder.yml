@@ -1,0 +1,42 @@
+appId: com.rpa.social-automation
+productName: RPA Social Automation
+directories:
+  output: release
+  buildResources: build
+files:
+  - src/main/**/*
+  - src/preload/**/*
+  - dist/renderer/**/*
+  - package.json
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  icon: build/icon.ico
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  deleteAppDataOnUninstall: false
+mac:
+  target:
+    - target: dmg
+      arch:
+        - x64
+        - arm64
+  icon: build/icon.icns
+linux:
+  target:
+    - target: AppImage
+      arch:
+        - x64
+  icon: build/icon.png
+extraResources:
+  - from: node_modules/better-sqlite3
+    to: native/better-sqlite3
+    filter:
+      - "**/*"
+asar: true
+asarUnpack:
+  - "node_modules/better-sqlite3/**"
+  - "node_modules/puppeteer/**"

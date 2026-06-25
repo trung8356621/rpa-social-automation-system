@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="vi">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      CSP (Content Security Policy):
+      - Trong development, Vite cần kết nối WebSocket tới localhost:5173 cho HMR.
+      - connect-src 'self' ws://localhost:* cho phép HMR và IPC.
+      - script-src 'self' 'unsafe-inline' cho React và Redux DevTools.
+      - style-src 'self' 'unsafe-inline' cho Tailwind và CSS-in-JS.
+      - img-src 'self' data: cho ảnh từ cache local và base64 encoding.
+      - font-src 'self' data: cho icon fonts.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' ws://localhost:* http://localhost:*;" />
+    <title>RPA Social Automation System</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./main.jsx"></script>
+  </body>
+</html>

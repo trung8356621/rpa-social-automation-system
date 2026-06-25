@@ -1,0 +1,84 @@
+---
+description: Project rules for the RPA Social Automation Electron app
+globs:
+  - "**/*"
+alwaysApply: true
+---
+
+# RPA Social Automation System - Cursor Rules
+
+This repository is a local-first Electron + React + SQLite RPA application for social automation. Use these rules for all code changes.
+
+## Project Shape
+
+- Runtime stack: Electron 30, Node ESM, React 18, Vite 6, Tailwind CSS 4, Redux Toolkit.
+- Main process: `src/main/**` owns Electron windows, IPC handlers, SQLite, and Puppeteer/RPA services.
+- Preload: `src/preload/preload.cjs` must stay CommonJS because `package.json` uses `"type": "module"`.
+- Renderer: `src/renderer/**` must access backend functionality only through `window.electronAPI`.
+- SQLite: `better-sqlite3` is allowed only in the main process.
+- RPA: Puppeteer automation belongs under `src/main/rpa/**`.
+
+## Electron And IPC
+
+- Keep `contextIsolation: true` and `nodeIntegration: false`.
+- Never expose Node modules, filesystem access, database instances, Puppeteer, or raw IPC to the renderer.
+- Add new backend capabilities through a narrow IPC path:
+  1. Main-process service behavior.
+  2. `ipcMain.handle` or `ipcMain.on` channel.
+  3. `contextBridge` wrapper in `src/preload/preload.cjs`.
+  4. Renderer call through `window.electronAPI`.
+- Use `invoke/handle` for request-response APIs.
+- Use `send/on` only for fire-and-forget commands or event streams.
+- Preload event subscriptions should return cleanup functions for React `useEffect`.
+
+## Database
+
+- Use UUID v4 text IDs via `crypto.randomUUID()`.
+- Preserve `is_dirty` fields for future sync.
+- Use prepared statements and transactions for multi-step writes.
+- Serialize JSON fields before writing to SQLite and deserialize them before returning to the UI.
+- Keep migrations idempotent and safe on startup.
+- Never query SQLite directly from React.
+
+## RPA / Scenario Logic
+
+- Keep Puppeteer code in main-process RPA services.
+- Prefer semantic anchors (`aria-label`, placeholder, role, stable text/attributes) over brittle selectors.
+- Preserve recorded viewport width, height, and device pixel ratio.
+- Convert recorded physical coordinates into viewport-relative execution intent where possible.
+- Maintain profile/cookie isolation for social accounts.
+- Report progress, failures, screenshots, and execution state back to the renderer through IPC events.
+
+## Renderer And UI
+
+- Use Redux Toolkit slices for shared state and async local data flows.
+- Put reusable UI in `src/renderer/components/**`.
+- Put large screens in `src/renderer/pages/**` or `src/renderer/views/**`.
+- Use `lucide-react` for icons.
+- Keep the UI practical and operational: dense, readable, predictable, and dashboard-like.
+- Do not import Electron, Node builtins, `better-sqlite3`, or Puppeteer into renderer files.
+
+## Styling
+
+- Use Tailwind CSS consistently with the existing dark dashboard style.
+- Avoid landing-page patterns, decorative gradients, oversized hero blocks, and marketing copy.
+- Ensure text and controls fit at the app minimum window size.
+- Use stable dimensions for toolbars, navigation items, tables, modals, and repeated controls.
+
+## Scripts And Build
+
+- `npm run dev` starts Vite and Electron in development mode.
+- `npm run build:renderer` builds the renderer.
+- `npm run build` builds the renderer and packages with electron-builder.
+- `npm run rebuild` currently points to `scripts/rebuild-native.js`; verify that file exists before relying on it.
+- `npm run rebuild:manual` rebuilds `better-sqlite3` for Electron.
+- If changing native module setup, validate `better-sqlite3` rebuild behavior.
+
+## Change Discipline
+
+- Match the existing ESM style in `.js` files.
+- Keep preload `.cjs` as CommonJS.
+- Keep changes focused on the requested behavior.
+- Add short comments only for non-obvious behavior.
+- Preserve existing Vietnamese domain wording where present.
+- Before finishing, run the smallest relevant check and report skipped checks.

@@ -1,0 +1,94 @@
+# RPA Social Automation System - AI Coding Rules
+
+You are working on a local-first Electron + React + SQLite RPA application for social automation.
+Follow these rules when editing or generating code in this repository.
+
+## Project Shape
+
+- Runtime: Electron 30, Node ESM, React 18, Vite 6, Tailwind CSS 4, Redux Toolkit.
+- Main process lives in `src/main/**` and owns Electron windows, IPC handlers, SQLite, and Puppeteer/RPA services.
+- Preload lives in `src/preload/preload.cjs`. Keep it CommonJS because `package.json` uses `"type": "module"`.
+- Renderer lives in `src/renderer/**` and must only access backend capabilities through `window.electronAPI`.
+- SQLite is managed by `better-sqlite3` inside the Electron main process only.
+- Browser automation is handled through Puppeteer services under `src/main/rpa/**`.
+
+## Architecture Rules
+
+- Keep `contextIsolation: true` and `nodeIntegration: false` in Electron windows.
+- Never expose Node modules, filesystem access, `better-sqlite3`, Puppeteer, or raw IPC directly to the renderer.
+- Add new renderer-to-main capabilities in this order:
+  1. Implement the main-process behavior or service method.
+  2. Register a typed/named `ipcMain.handle` or `ipcMain.on` channel in `src/main/main.js` or a nearby main-process module.
+  3. Expose a narrow wrapper in `src/preload/preload.cjs`.
+  4. Call only the preload wrapper from React/Redux code.
+- Prefer `ipcMain.handle` + `ipcRenderer.invoke` for request/response work.
+- Use `ipcMain.on` + `ipcRenderer.send` only for fire-and-forget commands, and pair long-running work with event updates when needed.
+- Event listeners exposed by preload should return cleanup functions so React effects can unsubscribe.
+
+## Data And SQLite
+
+- Use UUID v4 text IDs (`crypto.randomUUID()`), not autoincrement integer IDs.
+- Preserve `is_dirty` behavior for local-first/cloud-sync readiness.
+- Use prepared statements for queries and writes.
+- Wrap multi-table or multi-step writes in `better-sqlite3` transactions.
+- Store JSON fields such as `target_anchor` as strings in SQLite and deserialize before returning them to the renderer.
+- Keep schema migrations idempotent and safe to run on startup.
+- Do not access SQLite from the renderer process.
+
+## RPA / Automation Rules
+
+- Keep Puppeteer automation in `src/main/rpa/**`.
+- Design recorded steps to be resilient across viewport changes:
+  - Prefer semantic anchors such as `aria-label`, placeholder, role, text, stable attributes.
+  - Keep recorded viewport width, height, and device pixel ratio with scenarios.
+  - Convert fixed physical coordinates into viewport-relative intent when executing.
+- Avoid brittle selectors when semantic anchors are available.
+- Send execution status, step progress, errors, and screenshots back to the renderer through IPC events.
+- Keep profile/cookie isolation in mind: each social account should run in its own browser/profile partition or directory.
+
+## Renderer Rules
+
+- Keep React UI code under `src/renderer/**`.
+- Use Redux Toolkit slices for shared app state and async flows.
+- Keep page-level screens in `src/renderer/pages/**` or `src/renderer/views/**`.
+- Keep reusable UI in `src/renderer/components/**`.
+- Use `lucide-react` icons when an icon is needed.
+- Keep operational UI dense, clear, and practical. This is an automation tool, not a marketing landing page.
+- Do not import Electron, Node builtins, database libraries, or Puppeteer in renderer code.
+
+## Styling Rules
+
+- Use Tailwind CSS classes consistently with the existing dark operational dashboard style.
+- Avoid decorative gradients, oversized hero sections, and marketing copy.
+- Ensure controls have stable dimensions and text does not overflow on smaller windows.
+- Prefer familiar UI controls: icon buttons, tabs, toggles, selects, inputs, tables/lists, modals, and toasts.
+
+## Package And Build Notes
+
+- Scripts currently include:
+  - `npm run dev`: Vite renderer + Electron dev mode.
+  - `npm run build:renderer`: build renderer.
+  - `npm run build`: renderer build + electron-builder.
+  - `npm run rebuild`: points to `scripts/rebuild-native.js`.
+  - `npm run rebuild:manual`: `@electron/rebuild -f -w better-sqlite3`.
+- If touching native module setup, verify that `scripts/rebuild-native.js` exists or adjust the `rebuild` script.
+- `better-sqlite3` must be rebuilt for the Electron ABI when needed.
+- `electron-builder.yml` packages `src/main`, `src/preload`, `dist/renderer`, and unpacks native/Puppeteer resources.
+
+## Code Style
+
+- The repository uses ESM for `.js` files and CommonJS only for preload `.cjs`.
+- Prefer small service methods and clear IPC boundaries over large renderer-side logic.
+- Keep comments useful and short. Add comments only when behavior is non-obvious.
+- Preserve existing Vietnamese domain naming and user-facing text where present.
+- Do not introduce unrelated refactors while making focused changes.
+
+## Verification Checklist
+
+Before finishing a meaningful change:
+
+- Run the smallest relevant check available, such as `npm run build:renderer` for renderer changes.
+- For Electron/main/preload changes, start `npm run dev` when practical and verify the app opens.
+- For database changes, verify fresh startup schema creation and existing-data migration behavior.
+- For RPA changes, verify failures report useful execution status instead of silently failing.
+- Note any skipped checks and why.
