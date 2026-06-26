@@ -26,12 +26,33 @@ export function normalizeActionType(actionType) {
   return actionType === 'type' ? 'input' : actionType;
 }
 
-export function resolveVariableTemplate(value, variables = []) {
-  const map = new Map(
-    variables.map((item) => [item.key || item.name, item.value ?? '']),
-  );
+export function resolveVariableTemplate(value, variableMap) {
+  if (!value) return value;
 
-  return String(value ?? '').replace(/\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}/g, (match, key) => (
+  const map = variableMap instanceof Map
+    ? variableMap
+    : new Map((variableMap || []).map((item) => [item.key || item.name, item.value ?? '']));
+
+  return String(value).replace(/\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}/g, (match, key) => (
     map.has(key) ? map.get(key) : match
   ));
+}
+
+export function buildResolvedVariableMap(skeleton = [], profileValues = []) {
+  const profileMap = new Map(
+    profileValues.map((item) => [item.variable_key || item.key, item.value ?? '']),
+  );
+
+  const resolved = new Map();
+  for (const item of skeleton) {
+    const key = item.key || item.name;
+    const profileValue = profileMap.get(key);
+    const defaultValue = item.value ?? '';
+    resolved.set(
+      key,
+      (profileValue != null && profileValue !== '') ? profileValue : defaultValue,
+    );
+  }
+
+  return resolved;
 }

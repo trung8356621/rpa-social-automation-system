@@ -4,6 +4,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer';
+import { resolveVariableTemplate } from './VariableResolver.js';
 
 const DEFAULT_ACTION_DELAY_MS = 300;
 const DEFAULT_BROWSER_CLOSE_DELAY_MS = 5000;
@@ -29,17 +30,29 @@ class ExecutorService {
     this.isRunning = false;
     this.currentScenario = null;
     this._activeUserDataDir = null;
+    this._currentVariableProfileId = null;
+    this._variableMap = null;
   }
 
   async startScenario(scenarioId, options = {}) {
     if (this.isRunning) {
-      throw new Error('[Executor] Dang co tien trinh thuc thi dang chay.');
+      throw new Error('[Executor] Instance nay dang chay. Dung instance khac de chay song song.');
     }
 
     this.isRunning = true;
     const executionId = options.executionId || crypto.randomUUID();
     const startTime = Date.now();
     this._currentBrowserProfileId = options.browserProfileId ?? null;
+    this._currentVariableProfileId = options.variableProfileId
+      ? String(options.variableProfileId).trim() || null
+      : null;
+    this._variableMap = null;
+
+    let variableProfileName = null;
+    if (this._currentVariableProfileId) {
+      const profile = this.dbService.getVariableProfileById(this._currentVariableProfileId);
+      variableProfileName = profile?.name || null;
+    }
 
     try {
       const scenario = this.dbService.getScenarioById(scenarioId);
@@ -53,6 +66,17 @@ class ExecutorService {
       this.currentScenario = scenario;
       this._executionStartedAt = new Date().toISOString();
       this._failedStepIndex = null;
+
+      if (this._currentVariableProfileId) {
+        this._variableMap = this.dbService.buildVariableMap(
+          scenarioId,
+          this._currentVariableProfileId,
+        );
+        console.log(
+          `[Executor] Data profile "${variableProfileName || this._currentVariableProfileId}" `
+          + `(${this._variableMap.size} bien)`,
+        );
+      }
       this._sendTelemetry({
         type: 'execution:started',
         executionId,
@@ -67,6 +91,8 @@ class ExecutorService {
         scenario_id: scenarioId,
         scenario_name: scenario.name,
         browser_profile_id: this._currentBrowserProfileId,
+        variable_profile_id: this._currentVariableProfileId,
+        variable_profile_name: variableProfileName,
         status: 'running',
         total_steps: scenario.steps.length,
         started_at: this._executionStartedAt,
@@ -208,8 +234,9 @@ class ExecutorService {
       await this.browserProfileService.waitForProfileUnlock(userDataDir);
     }
 
+    const headless = options.headless === true;
     this.browser = await puppeteer.launch({
-      headless: false,
+      headless,
       userDataDir,
       defaultViewport: viewport,
       args: [
@@ -236,27 +263,15 @@ class ExecutorService {
       deviceScaleFactor: scenario.device_pixel_ratio || 1,
     });
 
-    if (this.browserProfileService) {
-      const restoreResult = await this.browserProfileService.restoreSessionCookies(this.page, userDataDir);
-      if (!restoreResult.restored) {
-        const startUrl = this._resolveStartUrl(scenario);
-        if (startUrl) {
-          await this.page.goto(startUrl, {
-            waitUntil: 'domcontentloaded',
-            timeout: 60000,
-          });
-          await this._sleep(400);
-        }
-      }
-    } else {
-      const startUrl = this._resolveStartUrl(scenario);
-      if (startUrl) {
-        await this.page.goto(startUrl, {
-          waitUntil: 'domcontentloaded',
-          timeout: 60000,
-        });
-        await this._sleep(400);
-      }
+    // Chromium's userDataDir persists all cookies natively — no JSON restore needed.
+    // Always navigate to the resolved start URL after launching.
+    const startUrl = this._resolveStartUrl(scenario);
+    if (startUrl) {
+      await this.page.goto(startUrl, {
+        waitUntil: 'domcontentloaded',
+        timeout: 60000,
+      });
+      await this._sleep(400);
     }
   }
 
@@ -464,14 +479,14 @@ class ExecutorService {
   _resolveVariables(value) {
     if (!value || !this.currentScenario?.id) return value;
 
-    const variables = this.dbService.getScenarioVariables(this.currentScenario.id);
-    const variableMap = new Map(
-      variables.map((item) => [item.key || item.name, item.value || '']),
-    );
+    if (!this._variableMap) {
+      this._variableMap = this.dbService.buildVariableMap(
+        this.currentScenario.id,
+        this._currentVariableProfileId,
+      );
+    }
 
-    return String(value).replace(/\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}/g, (match, name) => (
-      variableMap.has(name) ? variableMap.get(name) : match
-    ));
+    return resolveVariableTemplate(value, this._variableMap);
   }
 
   async _executeScroll(step) {
@@ -519,31 +534,21 @@ class ExecutorService {
   async _settleSessionAfterRun(executionId) {
     if (!this.page || this.page.isClosed()) return;
 
-    let sessionInfo = {
-      cookieCount: 0,
-      hasAuthCookie: false,
-      pageUrl: this.page.url(),
-      userDataDir: this._activeUserDataDir,
-    };
-
-    if (this.browserProfileService) {
-      sessionInfo = {
-        ...sessionInfo,
-        ...(await this.browserProfileService.settlePageBeforeClose(this.page)),
-      };
-      const saveResult = await this.browserProfileService.saveSessionCookies(
-        this._activeUserDataDir,
-        this.page,
-      );
-      sessionInfo.savedCookies = saveResult.cookieCount || 0;
-    } else {
-      await this._sleep(2000);
+    // Wait for any in-flight requests / JS to settle before we trigger Chrome flush.
+    try {
+      await Promise.race([
+        this.page.waitForNetworkIdle({ idleTime: 1000, timeout: 8000 }),
+        this._sleep(3000),
+      ]);
+    } catch {
+      // Ignore — page may have already navigated away.
     }
 
     this._sendTelemetry({
       type: 'execution:session-check',
       executionId,
-      ...sessionInfo,
+      pageUrl: this.page?.isClosed() ? null : this.page?.url(),
+      userDataDir: this._activeUserDataDir,
       timestamp: new Date().toISOString(),
     });
   }
@@ -591,40 +596,53 @@ class ExecutorService {
   }
 
   async _cleanupBrowser({ skipDelay = false } = {}) {
-    if (!skipDelay && this.browserProfileService && this.browser?.isConnected?.()) {
-      this._sendTelemetry({
-        type: 'execution:closing',
-        delayMs: this._getBrowserCloseDelayMs(),
-        message: `Đang lưu session trước khi đóng browser...`,
-        timestamp: new Date().toISOString(),
-      });
-      await this.browserProfileService.gracefulCloseBrowser(
-        this.browser,
-        this._activeUserDataDir,
-        this.page,
-      );
-    } else if (!skipDelay) {
+    if (!skipDelay) {
       await this._waitBeforeBrowserClose();
-      try {
-        if (this.browser && this.browser.isConnected()) {
-          await this.browser.close();
-        }
-      } catch {
-        // Ignore cleanup failures.
-      }
-    } else {
-      try {
-        if (this.browser && this.browser.isConnected()) {
-          await this.browser.close();
-        }
-      } catch {
-        // Ignore cleanup failures.
-      }
     }
+
+    await this._closeBrowserAndWait();
 
     this.page = null;
     this.browser = null;
     this._activeUserDataDir = null;
+  }
+
+  async _closeBrowserAndWait() {
+    if (!this.browser) return;
+
+    // Close the current page first — this triggers unload handlers so Chrome can
+    // flush pending writes (IndexedDB, localStorage, cookies WAL) before exit.
+    if (this.page && !this.page.isClosed()) {
+      await this.page.close().catch(() => {});
+    }
+
+    // Capture the underlying Chrome process before closing the CDP connection.
+    const chromeProcess = this.browser.process?.() ?? null;
+
+    try {
+      if (this.browser.isConnected()) {
+        await this.browser.close();
+      }
+    } catch {
+      // Ignore — browser may already be gone.
+    }
+
+    // Wait for the Chrome process to fully exit. This is more reliable than
+    // checking SingletonLock: it guarantees Chrome has checkpointed its SQLite
+    // WAL (Default/Cookies) before we return, so cookies survive the next open.
+    if (chromeProcess) {
+      await new Promise((resolve) => {
+        if (chromeProcess.exitCode !== null) {
+          resolve();
+          return;
+        }
+        const timer = setTimeout(resolve, 15000);
+        chromeProcess.once('exit', () => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+    }
   }
 
   _sleep(ms) {
@@ -638,30 +656,4 @@ function randomRuntimeDelay(baseMs = DEFAULT_ACTION_DELAY_MS, minMs = 120, maxMs
   return Math.round(Math.max(minMs, Math.min(maxMs, base * factor)));
 }
 
-let executorInstance = null;
-
-function initExecutorService({ dbService, browserProfileService, mainWindow, cacheRoot, appDataPath } = {}) {
-  if (!executorInstance) {
-    executorInstance = new ExecutorService({
-      dbService,
-      browserProfileService,
-      appDataPath,
-      sendTelemetry: (payload) => {
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('rpa:execution-status', payload);
-        }
-      },
-      cacheRoot,
-    });
-  }
-  return executorInstance;
-}
-
-function getExecutorService() {
-  if (!executorInstance) {
-    throw new Error('[Executor] ExecutorService is not initialized.');
-  }
-  return executorInstance;
-}
-
-export { ExecutorService, initExecutorService, getExecutorService };
+export { ExecutorService };

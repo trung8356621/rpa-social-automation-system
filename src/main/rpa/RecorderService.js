@@ -143,23 +143,11 @@ class RecorderService {
       });
       await this.page.evaluateOnNewDocument(this._getInjectionScript());
 
-      if (this.browserProfileService && this.usedUserDataDir) {
-        const restoreResult = await this.browserProfileService.restoreSessionCookies(
-          this.page,
-          this.usedUserDataDir,
-        );
-        if (!restoreResult.restored) {
-          await this.page.goto(safeScenario.target_url, {
-            waitUntil: 'domcontentloaded',
-            timeout: 60000,
-          });
-        }
-      } else {
-        await this.page.goto(safeScenario.target_url, {
-          waitUntil: 'domcontentloaded',
-          timeout: 60000,
-        });
-      }
+      // Chromium restores cookies natively from userDataDir — just navigate to the target.
+      await this.page.goto(safeScenario.target_url, {
+        waitUntil: 'domcontentloaded',
+        timeout: 60000,
+      });
 
       // Reset timing anchors to post-load so step time_offset is relative to page-ready,
       // not to browser launch. This prevents the first step from carrying a large load delay.

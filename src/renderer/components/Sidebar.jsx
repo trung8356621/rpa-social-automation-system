@@ -4,24 +4,22 @@ import { useDispatch, useSelector } from 'react-redux';
 import { setCurrentPage } from '../slices/uiSlice';
 import {
   Bot,
-  History,
+  Database,
   Globe,
   LayoutDashboard,
   PlayCircle,
   ScrollText,
   Settings,
   Shield,
-  Users,
 } from 'lucide-react';
 
 const navItems = [
   { id: 'dashboard', label: 'Tổng quan', icon: LayoutDashboard },
   { id: 'proxies', label: 'Proxy', icon: Shield },
   { id: 'browserProfiles', label: 'Browser', icon: Globe },
-  { id: 'profiles', label: 'Tài khoản', icon: Users },
+  { id: 'dataProfiles', label: 'Hồ sơ', icon: Database },
   { id: 'scenarios', label: 'Kịch bản', icon: ScrollText },
   { id: 'executions', label: 'Thực thi', icon: PlayCircle },
-  { id: 'history', label: 'Lịch sử', icon: History },
   { id: 'settings', label: 'Cài đặt', icon: Settings },
 ];
 

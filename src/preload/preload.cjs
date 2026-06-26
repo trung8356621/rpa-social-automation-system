@@ -32,10 +32,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
   deleteScenario: (id) => ipcRenderer.invoke('db:delete-scenario', id),
   getExecutions: (limit) => ipcRenderer.invoke('db:get-executions', limit),
   getExecution: (id) => ipcRenderer.invoke('db:get-execution', id),
+  clearExecutions: () => ipcRenderer.invoke('db:clear-executions'),
   getScenarioVariables: (scenarioId) => ipcRenderer.invoke('db:get-scenario-variables', scenarioId),
   saveScenarioVariable: (variable) => ipcRenderer.invoke('db:save-scenario-variable', variable),
   deleteScenarioVariable: (id) => ipcRenderer.invoke('db:delete-scenario-variable', id),
-  importProfileVariables: (payload) => ipcRenderer.invoke('db:import-profile-variables', payload),
+  getVariableProfiles: (scenarioId) => ipcRenderer.invoke('db:get-variable-profiles', scenarioId),
+  getVariableProfile: (profileId) => ipcRenderer.invoke('db:get-variable-profile', profileId),
+  saveVariableProfile: (profile) => ipcRenderer.invoke('db:save-variable-profile', profile),
+  deleteVariableProfile: (id) => ipcRenderer.invoke('db:delete-variable-profile', id),
+  saveProfileVariableValues: (payload) => ipcRenderer.invoke('db:save-profile-variable-values', payload),
+  buildResolvedVariables: (payload) => ipcRenderer.invoke('db:build-resolved-variables', payload),
   startScenarioRecording: (payload) => ipcRenderer.invoke('scenario:start-recording', payload),
   stopScenarioRecording: () => ipcRenderer.invoke('scenario:stop-recording'),
   getScenarioRecordingStatus: () => ipcRenderer.invoke('scenario:recording-status'),
@@ -53,16 +59,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   /** Xóa proxy theo ID. */
   deleteProxy: (id) => ipcRenderer.invoke('db:delete-proxy', id),
-
-  // ===== Database: Profile APIs =====
-  /** Lấy danh sách tất cả profile (kèm proxy_name). */
-  getProfiles: () => ipcRenderer.invoke('db:get-profiles'),
-
-  /** Lưu hoặc cập nhật một profile. */
-  saveProfile: (profile) => ipcRenderer.invoke('db:save-profile', { profile }),
-
-  /** Xóa profile theo ID. */
-  deleteProfile: (id) => ipcRenderer.invoke('db:delete-profile', id),
 
   getBrowserProfiles: () => ipcRenderer.invoke('db:get-browser-profiles'),
   scanBrowserProfiles: () => ipcRenderer.invoke('browser:scan-profiles'),
