@@ -208,6 +208,24 @@ export default function SettingsPage() {
                     />
                   </Field>
 
+                  <Field label="Chờ trước khi đóng browser sau thực thi (ms)">
+                    <input
+                      type="number"
+                      min="1000"
+                      max="120000"
+                      step="500"
+                      value={values['execution.browserCloseDelayMs']}
+                      onChange={(event) => setValue(
+                        'execution.browserCloseDelayMs',
+                        parseInt(event.target.value, 10) || 5000,
+                      )}
+                      className="input-field max-w-xs"
+                    />
+                    <p className="mt-1 text-xs text-[#6f7d90]">
+                      Chromium cần thời gian ghi cookie/session vào profile. Mặc định 5000ms.
+                    </p>
+                  </Field>
+
                   <label className="flex items-center gap-3 text-sm text-[#c7d0dc]">
                     <input
                       type="checkbox"

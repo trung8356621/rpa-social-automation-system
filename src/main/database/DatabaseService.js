@@ -167,6 +167,72 @@ class DatabaseService {
         this.db.exec('ALTER TABLE browser_profiles ADD COLUMN import_path TEXT');
       }
     }
+
+    const executionLogsTable = this.db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='execution_logs'")
+      .get();
+
+    if (!executionLogsTable) {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS execution_logs (
+          id                  TEXT PRIMARY KEY,
+          scenario_id         TEXT NOT NULL,
+          scenario_name       TEXT,
+          browser_profile_id  TEXT,
+          status              TEXT NOT NULL DEFAULT 'running',
+          total_steps         INTEGER NOT NULL DEFAULT 0,
+          completed_steps     INTEGER NOT NULL DEFAULT 0,
+          failed_steps        INTEGER NOT NULL DEFAULT 0,
+          failed_step_index   INTEGER,
+          error_message       TEXT,
+          duration_ms         INTEGER,
+          started_at          TEXT NOT NULL,
+          finished_at         TEXT,
+          is_dirty            INTEGER NOT NULL DEFAULT 1,
+          updated_at          TEXT NOT NULL DEFAULT (datetime('now')),
+          FOREIGN KEY (scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE
+        );
+      `);
+    }
+
+    this._migrateScenarioVariablesTable();
+    this.db.prepare(`
+      UPDATE scenario_steps
+      SET action_type = 'input'
+      WHERE action_type = 'type'
+    `).run();
+  }
+
+  _migrateScenarioVariablesTable() {
+    const table = this.db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='scenario_variables'")
+      .get();
+    if (!table) return;
+
+    const columns = this.db.prepare('PRAGMA table_info(scenario_variables)').all();
+    const hasKey = columns.some((col) => col.name === 'key');
+    if (hasKey) return;
+
+    const hasName = columns.some((col) => col.name === 'name');
+    if (!hasName) return;
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS scenario_variables_new (
+        id          TEXT PRIMARY KEY,
+        scenario_id TEXT NOT NULL,
+        key         TEXT NOT NULL,
+        value       TEXT,
+        UNIQUE(scenario_id, key),
+        FOREIGN KEY (scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE
+      );
+
+      INSERT OR REPLACE INTO scenario_variables_new (id, scenario_id, key, value)
+      SELECT id, scenario_id, name, value
+      FROM scenario_variables;
+
+      DROP TABLE scenario_variables;
+      ALTER TABLE scenario_variables_new RENAME TO scenario_variables;
+    `);
   }
 
   initSchema() {
@@ -265,18 +331,12 @@ class DatabaseService {
         );
 
         CREATE TABLE IF NOT EXISTS scenario_variables (
-          id                TEXT PRIMARY KEY,
-          scenario_id       TEXT NOT NULL,
-          name              TEXT NOT NULL,
-          value             TEXT,
-          type              TEXT NOT NULL DEFAULT 'text',
-          source            TEXT NOT NULL DEFAULT 'manual',
-          source_profile_id TEXT,
-          created_at        TEXT NOT NULL DEFAULT (datetime('now')),
-          updated_at        TEXT NOT NULL DEFAULT (datetime('now')),
-          UNIQUE(scenario_id, name),
-          FOREIGN KEY (scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE,
-          FOREIGN KEY (source_profile_id) REFERENCES profiles(id) ON DELETE SET NULL
+          id          TEXT PRIMARY KEY,
+          scenario_id TEXT NOT NULL,
+          key         TEXT NOT NULL,
+          value       TEXT,
+          UNIQUE(scenario_id, key),
+          FOREIGN KEY (scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE
         );
 
         -- ============================================================
@@ -353,6 +413,25 @@ class DatabaseService {
           screenshot  TEXT,
           created_at  TEXT NOT NULL DEFAULT (datetime('now')),
           FOREIGN KEY (step_id) REFERENCES scenario_steps(id) ON DELETE SET NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS execution_logs (
+          id                  TEXT PRIMARY KEY,
+          scenario_id         TEXT NOT NULL,
+          scenario_name       TEXT,
+          browser_profile_id  TEXT,
+          status              TEXT NOT NULL DEFAULT 'running',
+          total_steps         INTEGER NOT NULL DEFAULT 0,
+          completed_steps     INTEGER NOT NULL DEFAULT 0,
+          failed_steps        INTEGER NOT NULL DEFAULT 0,
+          failed_step_index   INTEGER,
+          error_message       TEXT,
+          duration_ms         INTEGER,
+          started_at          TEXT NOT NULL,
+          finished_at         TEXT,
+          is_dirty            INTEGER NOT NULL DEFAULT 1,
+          updated_at          TEXT NOT NULL DEFAULT (datetime('now')),
+          FOREIGN KEY (scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE
         );
       `);
     });
@@ -625,51 +704,37 @@ class DatabaseService {
 
   getScenarioVariables(scenarioId) {
     return this.db
-      .prepare('SELECT * FROM scenario_variables WHERE scenario_id = ? ORDER BY updated_at DESC, name ASC')
+      .prepare('SELECT id, scenario_id, key, value FROM scenario_variables WHERE scenario_id = ? ORDER BY key ASC')
       .all(scenarioId);
   }
 
   saveScenarioVariable(variable) {
-    const now = new Date().toISOString();
     const id = variable.id || crypto.randomUUID();
-    const name = String(variable.name || '').trim();
+    const scenarioId = variable.scenario_id;
+    const key = String(variable.key || variable.name || '').trim();
 
-    if (!variable.scenario_id) {
+    if (!scenarioId) {
       throw new Error('scenario_id is required for scenario variable.');
     }
-    if (!name) {
-      throw new Error('Variable name is required.');
+    if (!key) {
+      throw new Error('Variable key is required.');
     }
 
-    this.db
-      .prepare(`
-        INSERT INTO scenario_variables (
-          id, scenario_id, name, value, type, source, source_profile_id, created_at, updated_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(scenario_id, name)
-        DO UPDATE SET
-          value = excluded.value,
-          type = excluded.type,
-          source = excluded.source,
-          source_profile_id = excluded.source_profile_id,
-          updated_at = excluded.updated_at
-      `)
-      .run(
-        id,
-        variable.scenario_id,
-        name,
-        variable.value ?? '',
-        variable.type || 'text',
-        variable.source || 'manual',
-        variable.source_profile_id || null,
-        now,
-        now
-      );
+    this.db.prepare(`
+      INSERT INTO scenario_variables (id, scenario_id, key, value)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(scenario_id, key)
+      DO UPDATE SET value = excluded.value
+    `).run(
+      id,
+      scenarioId,
+      key,
+      variable.value ?? '',
+    );
 
     return this.db
-      .prepare('SELECT * FROM scenario_variables WHERE scenario_id = ? AND name = ?')
-      .get(variable.scenario_id, name);
+      .prepare('SELECT id, scenario_id, key, value FROM scenario_variables WHERE scenario_id = ? AND key = ?')
+      .get(scenarioId, key);
   }
 
   deleteScenarioVariable(id) {
@@ -690,11 +755,8 @@ class DatabaseService {
 
     const usernameVariable = this.saveScenarioVariable({
       scenario_id: scenarioId,
-      name: `${baseName}_username`,
+      key: `${baseName}_username`,
       value: profile.username || '',
-      type: 'text',
-      source: 'account_import',
-      source_profile_id: profileId,
     });
 
     const imported = [usernameVariable];
@@ -702,11 +764,8 @@ class DatabaseService {
     if (profile.password) {
       imported.push(this.saveScenarioVariable({
         scenario_id: scenarioId,
-        name: `${baseName}_password`,
+        key: `${baseName}_password`,
         value: profile.password,
-        type: 'secret',
-        source: 'account_import',
-        source_profile_id: profileId,
       }));
     }
 
@@ -1113,6 +1172,105 @@ class DatabaseService {
         console.warn(`[DatabaseService] Khong xoa duoc frame orphan: ${framePath} - ${error.message}`);
       }
     }
+  }
+
+  createExecutionLog(log) {
+    const now = new Date().toISOString();
+    const id = log.id || crypto.randomUUID();
+
+    this.db.prepare(`
+      INSERT INTO execution_logs (
+        id, scenario_id, scenario_name, browser_profile_id,
+        status, total_steps, completed_steps, failed_steps,
+        failed_step_index, error_message, duration_ms,
+        started_at, finished_at, is_dirty, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+    `).run(
+      id,
+      log.scenario_id,
+      log.scenario_name || null,
+      log.browser_profile_id || null,
+      log.status || 'running',
+      log.total_steps || 0,
+      log.completed_steps || 0,
+      log.failed_steps || 0,
+      log.failed_step_index ?? null,
+      log.error_message || null,
+      log.duration_ms ?? null,
+      log.started_at || now,
+      log.finished_at || null,
+      now,
+    );
+
+    return this.getExecutionLogById(id);
+  }
+
+  finishExecutionLog(id, patch = {}) {
+    const now = new Date().toISOString();
+    const existing = this.getExecutionLogById(id);
+    if (!existing) {
+      return this.createExecutionLog({ id, ...patch });
+    }
+
+    this.db.prepare(`
+      UPDATE execution_logs
+      SET status = ?,
+          completed_steps = ?,
+          failed_steps = ?,
+          failed_step_index = ?,
+          error_message = ?,
+          duration_ms = ?,
+          finished_at = ?,
+          is_dirty = 1,
+          updated_at = ?
+      WHERE id = ?
+    `).run(
+      patch.status || existing.status,
+      patch.completed_steps ?? existing.completed_steps,
+      patch.failed_steps ?? existing.failed_steps,
+      patch.failed_step_index ?? existing.failed_step_index,
+      patch.error_message ?? existing.error_message,
+      patch.duration_ms ?? existing.duration_ms,
+      patch.finished_at || now,
+      now,
+      id,
+    );
+
+    return this.getExecutionLogById(id);
+  }
+
+  getExecutionLogs(limit = 100) {
+    const rows = this.db.prepare(`
+      SELECT *
+      FROM execution_logs
+      ORDER BY datetime(started_at) DESC
+      LIMIT ?
+    `).all(limit);
+
+    return rows.map((row) => this._mapExecutionLogRow(row));
+  }
+
+  getExecutionLogById(id) {
+    const row = this.db.prepare('SELECT * FROM execution_logs WHERE id = ?').get(id);
+    return row ? this._mapExecutionLogRow(row) : null;
+  }
+
+  _mapExecutionLogRow(row) {
+    return {
+      id: row.id,
+      scenario_id: row.scenario_id,
+      scenario_name: row.scenario_name,
+      browser_profile_id: row.browser_profile_id,
+      status: row.status,
+      total_steps: row.total_steps,
+      completed_steps: row.completed_steps,
+      failed_steps: row.failed_steps,
+      failed_step_index: row.failed_step_index,
+      error_message: row.error_message,
+      duration_ms: row.duration_ms,
+      started_at: row.started_at,
+      finished_at: row.finished_at,
+    };
   }
 
   /**

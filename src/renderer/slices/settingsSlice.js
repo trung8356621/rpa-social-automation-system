@@ -9,6 +9,7 @@ export const defaultSettings = {
   'automation.defaultWaitAfter': 500,
   'automation.maxRetries': 3,
   'automation.screenshotOnError': true,
+  'execution.browserCloseDelayMs': 5000,
 };
 
 export const fetchSettings = createAsyncThunk(

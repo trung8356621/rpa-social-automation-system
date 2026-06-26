@@ -4,6 +4,7 @@ import { Trash2 } from 'lucide-react';
 const ACTION_LABELS = {
   navigate: 'Điều hướng đến URL',
   click: 'Click vào phần tử',
+  input: 'Nhập text vào ô input',
   type: 'Nhập text vào ô input',
   wait: 'Chờ một khoảng thời gian',
   waitForElement: 'Chờ phần tử xuất hiện',

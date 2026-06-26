@@ -51,6 +51,8 @@ export default function BrowserProfilesPage() {
   const [importingId, setImportingId] = useState('');
   const [removingId, setRemovingId] = useState('');
   const [creatingBlank, setCreatingBlank] = useState(false);
+  const [showBlankModal, setShowBlankModal] = useState(false);
+  const [blankProfileName, setBlankProfileName] = useState('');
 
   const machineProfiles = useMemo(
     () => items.filter((profile) => !profile.imported_at),
@@ -134,15 +136,18 @@ export default function BrowserProfilesPage() {
     }
   };
 
-  const handleCreateBlankProfile = async () => {
-    const displayName = window.prompt('Tên profile trống (để trống sẽ tự đặt tên):', '');
-    if (displayName === null) return;
+  const handleCreateBlankProfile = () => {
+    setBlankProfileName('');
+    setShowBlankModal(true);
+  };
 
+  const confirmCreateBlankProfile = async () => {
     setCreatingBlank(true);
     try {
-      const result = await window.electronAPI.createBlankBrowserProfile(displayName);
+      const result = await window.electronAPI.createBlankBrowserProfile(blankProfileName);
       await dispatch(fetchBrowserProfiles());
       dispatch(showToast({ type: 'success', message: result.message || 'Đã tạo profile trống' }));
+      setShowBlankModal(false);
       setActiveTab('app');
     } catch (err) {
       dispatch(showToast({ type: 'error', message: err.message || 'Tạo profile trống thất bại' }));
@@ -371,6 +376,38 @@ export default function BrowserProfilesPage() {
           onDelete={handleDeleteAppProfile}
           onRemoveImported={handleRemoveImportedData}
         />
+      )}
+
+      {showBlankModal && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/60 px-4">
+          <div className="w-full max-w-md rounded-lg border border-[#344054] bg-[#1c2535] p-5 shadow-2xl">
+            <div className="mb-4 flex items-center justify-between">
+              <h2 className="text-base font-semibold text-white">Tạo profile trống</h2>
+              <button type="button" className="icon-button" onClick={() => setShowBlankModal(false)}>
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <label className="block">
+              <span className="mb-1 block text-sm text-[#b7c4d8]">Tên profile</span>
+              <input
+                value={blankProfileName}
+                onChange={(event) => setBlankProfileName(event.target.value)}
+                className="input-field"
+                placeholder="Để trống sẽ tự đặt tên"
+                autoFocus
+              />
+            </label>
+            <div className="mt-5 flex justify-end gap-3">
+              <button type="button" onClick={() => setShowBlankModal(false)} className="btn-secondary">
+                Hủy
+              </button>
+              <button type="button" onClick={confirmCreateBlankProfile} disabled={creatingBlank} className="btn-primary">
+                {creatingBlank ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+                Tạo
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

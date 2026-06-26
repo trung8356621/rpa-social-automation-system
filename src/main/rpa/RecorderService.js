@@ -15,7 +15,7 @@ if (ffmpegStatic) {
 }
 
 class RecorderService {
-  constructor({ appDataPath, dbService } = {}) {
+  constructor({ appDataPath, dbService, browserProfileService } = {}) {
     if (!appDataPath) {
       throw new Error('[Recorder] appDataPath is required.');
     }
@@ -25,6 +25,7 @@ class RecorderService {
 
     this.appDataPath = appDataPath;
     this.dbService = dbService;
+    this.browserProfileService = browserProfileService || null;
     this.browser = null;
     this.page = null;
     this.cdpSession = null;
@@ -136,15 +137,29 @@ class RecorderService {
       await this._releaseBrowserTopMost();
       this.page.setDefaultTimeout(30000);
       this.page.setDefaultNavigationTimeout(60000);
+
       await this.page.exposeFunction('onRpaRecordedAction', (payload) => {
         this._handleClientAction(payload);
       });
       await this.page.evaluateOnNewDocument(this._getInjectionScript());
 
-      await this.page.goto(safeScenario.target_url, {
-        waitUntil: 'domcontentloaded',
-        timeout: 60000,
-      });
+      if (this.browserProfileService && this.usedUserDataDir) {
+        const restoreResult = await this.browserProfileService.restoreSessionCookies(
+          this.page,
+          this.usedUserDataDir,
+        );
+        if (!restoreResult.restored) {
+          await this.page.goto(safeScenario.target_url, {
+            waitUntil: 'domcontentloaded',
+            timeout: 60000,
+          });
+        }
+      } else {
+        await this.page.goto(safeScenario.target_url, {
+          waitUntil: 'domcontentloaded',
+          timeout: 60000,
+        });
+      }
 
       // Reset timing anchors to post-load so step time_offset is relative to page-ready,
       // not to browser launch. This prevents the first step from carrying a large load delay.
@@ -199,7 +214,15 @@ class RecorderService {
     await this._lastScreenshotPromise?.catch(() => {});
     this._screenshotInProgress = false;
 
-    await this._cleanupBrowser();
+    if (this.browserProfileService && this.browser?.isConnected?.()) {
+      await this.browserProfileService.gracefulCloseBrowser(
+        this.browser,
+        this.usedUserDataDir,
+        this.page,
+      );
+    } else {
+      await this._cleanupBrowser();
+    }
 
     await this._mirrorFramesToStorage();
     const recordedSteps = this._buildSteps();
@@ -360,7 +383,7 @@ class RecorderService {
           });
         } else if (action_type === 'click') {
           await this._replayClick(page, anchor, selector, effectiveViewport);
-        } else if (action_type === 'type') {
+        } else if (action_type === 'input' || action_type === 'type') {
           await this._replayType(page, anchor, selector, config.text || '', effectiveViewport, config.delay || 50);
         } else if (action_type === 'scroll') {
           const scrollX = anchor.scroll_x ?? config.scrollX ?? 0;
@@ -872,14 +895,14 @@ class RecorderService {
     const merged = [];
 
     for (const event of events) {
-      if (event.action_type !== 'type') {
+      if (event.action_type !== 'input' && event.action_type !== 'type') {
         merged.push(event);
         continue;
       }
 
       const previous = merged[merged.length - 1];
       const sameTarget = previous
-        && previous.action_type === 'type'
+        && (previous.action_type === 'input' || previous.action_type === 'type')
         && previous.selector_value === event.selector_value
         && JSON.stringify(previous.target_anchor || {}) === JSON.stringify(event.target_anchor || {})
         && event.time_offset - previous.time_offset < 2500;
@@ -917,7 +940,7 @@ class RecorderService {
     if (event.action_type === 'navigate') {
       return { url: event.url || this.scenario?.target_url || '' };
     }
-    if (event.action_type === 'type') {
+    if (event.action_type === 'input' || event.action_type === 'type') {
       return { selector: selectorValue || '', text: event.text || '', delay: randomRuntimeDelay(50, 25, 120) };
     }
     if (event.action_type === 'scroll') {
@@ -927,7 +950,7 @@ class RecorderService {
   }
 
   _describeEvent(event, selectorValue) {
-    if (event.action_type === 'type') return `Nhap: "${event.text || ''}"`;
+    if (event.action_type === 'input' || event.action_type === 'type') return `Nhap: "${event.text || ''}"`;
     if (event.action_type === 'scroll') return `Scroll den ${event.scroll_y || 0}px`;
     if (event.action_type === 'navigate') return event.url || 'Mo URL';
     return `Bam: ${selectorValue || event.target_anchor?.innerText || 'target'}`;
@@ -951,6 +974,10 @@ class RecorderService {
     await fs.mkdir(guestDir, { recursive: true });
 
     if (importProfileId) {
+      if (this.browserProfileService) {
+        return this.browserProfileService.resolveSessionUserDataDir(null, importProfileId);
+      }
+
       const profile = this.dbService.getBrowserProfileById(importProfileId);
       if (profile?.import_path) {
         await fs.mkdir(profile.import_path, { recursive: true });
@@ -1123,7 +1150,7 @@ class RecorderService {
 
         const anchor = getAnchor(target);
         send({
-          action_type: 'type',
+          action_type: 'input',
           selector_value: pickSelector(anchor),
           target_anchor: anchor,
           text: target.value || '',

@@ -15,11 +15,13 @@ import { createSlice, createAsyncThunk } from '@reduxjs/toolkit';
  */
 export const startLocalCampaign = createAsyncThunk(
   'executions/startLocal',
-  async (campaignId, { rejectWithValue }) => {
+  async ({ scenarioId, browserProfileId = null }, { rejectWithValue }) => {
     try {
-      window.electronAPI.startLocalCampaign(campaignId);
-      // Trả về ngay lập tức — telemetry sẽ cập nhật realtime
-      return { id: campaignId, status: 'triggered' };
+      if (!scenarioId) {
+        throw new Error('Thiếu kịch bản cần chạy');
+      }
+      window.electronAPI.startLocalCampaign({ scenarioId, browserProfileId });
+      return { id: scenarioId, browserProfileId, status: 'triggered' };
     } catch (error) {
       return rejectWithValue(error.message);
     }
@@ -40,13 +42,12 @@ export const runScenario = startLocalCampaign;
  */
 export const fetchAllExecutions = createAsyncThunk(
   'executions/fetchAll',
-  async (_, { getState, rejectWithValue }) => {
+  async (_, { rejectWithValue }) => {
     try {
-      // executions hiện được quản lý in-memory qua telemetry,
-      // nên trả về state hiện tại. Khi có DB table execution_logs,
-      // sẽ thay bằng window.electronAPI gọi SQLite.
-      const { executions } = getState();
-      return executions.items;
+      if (!window.electronAPI?.getExecutions) {
+        return [];
+      }
+      return await window.electronAPI.getExecutions(100);
     } catch (error) {
       return rejectWithValue(error.message);
     }
@@ -62,6 +63,10 @@ export const fetchExecutionDetail = createAsyncThunk(
   'executions/fetchDetail',
   async (executionId, { getState, rejectWithValue }) => {
     try {
+      if (window.electronAPI?.getExecution) {
+        const detail = await window.electronAPI.getExecution(executionId);
+        if (detail) return detail;
+      }
       const { executions } = getState();
       const found = executions.items.find((item) => item.id === executionId);
       return found || { id: executionId, status: 'unknown' };
@@ -157,6 +162,19 @@ const executionSlice = createSlice({
         case 'execution:failed':
           state.isRunning = false;
           state.error = status.error;
+          state.items.unshift({
+            id: status.executionId || `failed-${Date.now()}`,
+            scenario_id: status.scenarioId,
+            scenario_name: status.scenarioName || 'N/A',
+            status: 'failed',
+            total_steps: status.totalSteps || 0,
+            completed_steps: status.completedSteps ?? Math.max(0, (status.stepIndex || 1) - 1),
+            failed_steps: 1,
+            failed_step_index: status.stepIndex,
+            started_at: status.startedAt || new Date().toISOString(),
+            finished_at: new Date().toISOString(),
+            error_message: status.error,
+          });
           break;
 
         case 'execution:cancelled':
@@ -175,9 +193,8 @@ const executionSlice = createSlice({
         state.isRunning = true;
         state.error = null;
       })
-      .addCase(startLocalCampaign.fulfilled, (state, action) => {
+      .addCase(startLocalCampaign.fulfilled, (state) => {
         // Trạng thái thực tế sẽ được cập nhật qua telemetry
-        state.currentExecution = action.payload;
       })
       .addCase(startLocalCampaign.rejected, (state, action) => {
         state.isRunning = false;

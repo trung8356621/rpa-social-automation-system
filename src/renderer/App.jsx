@@ -91,7 +91,7 @@ export default function App() {
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-[#111827] text-[#eef2f7]">
       <Sidebar />
-      <main className="min-w-0 flex-1 overflow-y-auto">
+      <main className="min-w-0 flex-1 overflow-x-hidden overflow-y-auto">
         {renderPage()}
       </main>
       <Toast />
