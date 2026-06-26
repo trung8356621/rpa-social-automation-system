@@ -149,6 +149,17 @@ function registerDatabaseHandlers() {
     return browserProfileService.openAppBrowserProfile(profile);
   });
 
+  ipcMain.handle('browser:open-guest', (_event, options) => {
+    if (options && (options.scenarioId || options.browserProfileId)) {
+      return browserProfileService.openBrowserSession(options);
+    }
+    return browserProfileService.openGuestBrowser();
+  });
+
+  ipcMain.handle('browser:open-session', (_event, options) => {
+    return browserProfileService.openBrowserSession(options || {});
+  });
+
   ipcMain.handle('browser:import-profile', (_event, profileId) => {
     return browserProfileService.importBrowserProfile(profileId);
   });
@@ -254,6 +265,14 @@ function registerDatabaseHandlers() {
     return dbService.deleteScenario(id);
   });
 
+  ipcMain.handle('db:get-executions', (_event, limit) => {
+    return dbService.getExecutionLogs(limit || 100);
+  });
+
+  ipcMain.handle('db:get-execution', (_event, id) => {
+    return dbService.getExecutionLogById(id);
+  });
+
   ipcMain.handle('db:get-scenario-variables', (_event, scenarioId) => {
     return dbService.getScenarioVariables(scenarioId);
   });
@@ -283,13 +302,22 @@ function registerDatabaseHandlers() {
   });
 
   ipcMain.handle('scenario:open-browser', async (_event, payload) => {
-    // Mo Puppeteer browser rieng de nguoi dung kiem tra thu cong
-    // payload: { scenarioId, targetUrl, viewport }
-    return recorderService.openBrowser(
-      payload?.scenarioId || null,
-      payload?.targetUrl || null,
-      payload?.viewport || { width: 1280, height: 720 },
-    );
+    try {
+      const scenarioId = payload?.scenarioId || null;
+      let browserProfileId = payload?.browserProfileId || payload?.importProfileId || null;
+      if (!browserProfileId && scenarioId) {
+        const scenario = dbService.getScenarioById(scenarioId);
+        browserProfileId = scenario?.browser_profile_id || null;
+      }
+      const result = await browserProfileService.openBrowserSession({
+        scenarioId,
+        browserProfileId,
+        startUrl: payload?.targetUrl || null,
+      });
+      return { opened: true, ...result };
+    } catch (error) {
+      return { opened: false, error: error.message };
+    }
   });
 
   ipcMain.handle('scenario:replay-and-record', async (_event, payload) => {
@@ -323,18 +351,24 @@ function registerDatabaseHandlers() {
    * khi có module campaign hoàn chỉnh, sẽ load campaign_profiles
    * và lặp qua từng profile.
    */
-  ipcMain.on('rpa:start-campaign', async (_event, campaignId) => {
-    console.log(`[Main] Nhận lệnh khởi động campaign: ${campaignId}`);
+  ipcMain.on('rpa:start-campaign', async (_event, payload) => {
+    const scenarioId = typeof payload === 'string' ? payload : payload?.scenarioId;
+    const browserProfileId = typeof payload === 'object' ? payload?.browserProfileId || null : null;
+    if (!scenarioId) {
+      console.error('[Main] Thiếu scenarioId khi chạy kịch bản');
+      return;
+    }
+
+    console.log(`[Main] Nhận lệnh chạy kịch bản: ${scenarioId}, browser: ${browserProfileId || 'guest'}`);
     try {
       const executor = getExecutorService();
-      // Phân giải campaignId → scenarioId từ DB
-      // Tạm thời: campaignId chính là scenarioId
-      const result = await executor.startScenario(campaignId, {
+      const result = await executor.startScenario(scenarioId, {
         executionId: crypto.randomUUID(),
+        browserProfileId,
       });
-      console.log(`[Main] Campaign hoàn tất:`, result);
+      console.log('[Main] Thực thi hoàn tất:', result);
     } catch (err) {
-      console.error(`[Main] Lỗi campaign:`, err.message);
+      console.error('[Main] Lỗi thực thi:', err.message);
     }
   });
 }
@@ -344,6 +378,7 @@ function withDefaultSettings(settings) {
     ...settings,
     'browser.userDataDir':
       settings['browser.userDataDir'] || path.join(app.getPath('userData'), 'browser-data'),
+    'execution.browserCloseDelayMs': Number(settings['execution.browserCloseDelayMs']) || 5000,
   };
 }
 
@@ -450,6 +485,7 @@ app.whenReady().then(() => {
   recorderService = initRecorderService({
     appDataPath: app.getPath('userData'),
     dbService,
+    browserProfileService,
   });
   console.log('[Main] DatabaseService đã sẵn sàng');
 
@@ -464,7 +500,9 @@ app.whenReady().then(() => {
   // Cần mainWindow đã được tạo để gửi telemetry về Renderer
   initExecutorService({
     dbService,
+    browserProfileService,
     mainWindow,
+    appDataPath: app.getPath('userData'),
   });
   console.log('[Main] ExecutorService đã sẵn sàng');
 

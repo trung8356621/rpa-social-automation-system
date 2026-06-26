@@ -30,6 +30,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   saveScenario: (scenario, steps) =>
     ipcRenderer.invoke('db:save-scenario', { scenario, steps }),
   deleteScenario: (id) => ipcRenderer.invoke('db:delete-scenario', id),
+  getExecutions: (limit) => ipcRenderer.invoke('db:get-executions', limit),
+  getExecution: (id) => ipcRenderer.invoke('db:get-execution', id),
   getScenarioVariables: (scenarioId) => ipcRenderer.invoke('db:get-scenario-variables', scenarioId),
   saveScenarioVariable: (variable) => ipcRenderer.invoke('db:save-scenario-variable', variable),
   deleteScenarioVariable: (id) => ipcRenderer.invoke('db:delete-scenario-variable', id),
@@ -66,6 +68,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   scanBrowserProfiles: () => ipcRenderer.invoke('browser:scan-profiles'),
   openBrowserProfile: (profileId) => ipcRenderer.invoke('browser:open-profile', profileId),
   openAppBrowserProfile: (profile) => ipcRenderer.invoke('browser:open-app-profile', profile),
+  openGuestBrowser: (options) => ipcRenderer.invoke('browser:open-session', options || {}),
+  openBrowserSession: (options) => ipcRenderer.invoke('browser:open-session', options),
   importBrowserProfile: (profileId) => ipcRenderer.invoke('browser:import-profile', profileId),
   removeImportedBrowserData: (profileId) => ipcRenderer.invoke('browser:remove-imported-data', profileId),
   setActiveImportProfile: (profileId) => ipcRenderer.invoke('browser:set-active-import', profileId),
@@ -88,8 +92,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
    * Dùng ipcRenderer.send() (one-way) vì đây là lệnh fire-and-forget,
    * trạng thái thực thi được cập nhật qua event listener bên dưới.
    */
-  startLocalCampaign: (campaignId) => {
-    ipcRenderer.send('rpa:start-campaign', campaignId);
+  startLocalCampaign: (payload) => {
+    ipcRenderer.send('rpa:start-campaign', payload);
   },
 
   // ===== Event Listeners (Main → Renderer) =====
