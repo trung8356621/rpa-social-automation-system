@@ -17,13 +17,7 @@ import {
   EyeOff,
 } from 'lucide-react';
 
-const GUEST_BROWSER_PROFILE = '__guest__';
 const LS_HEADLESS = 'executions:headless';
-
-function resolveBrowserProfileId(selectedId) {
-  if (selectedId && selectedId !== GUEST_BROWSER_PROFILE) return selectedId;
-  return null;
-}
 
 function ProgressBar({ completed, total }) {
   const pct = total > 0 ? Math.round((completed / total) * 100) : 0;
@@ -71,7 +65,7 @@ export default function ExecutionsPage() {
     if (!selectedScenarioId) return;
     const scenario = scenarios.find((item) => item.id === selectedScenarioId);
     if (!scenario) return;
-    setSelectedBrowserProfileId(scenario.browser_profile_id || GUEST_BROWSER_PROFILE);
+    setSelectedBrowserProfileId(scenario.browser_profile_id || '');
   }, [selectedScenarioId, scenarios]);
 
   useEffect(() => {
@@ -129,7 +123,14 @@ export default function ExecutionsPage() {
 
   const handleRunScenario = async () => {
     if (!selectedScenarioId) return;
-    const browserProfileId = resolveBrowserProfileId(selectedBrowserProfileId);
+    if (!selectedBrowserProfileId) {
+      dispatch(showToast({
+        type: 'error',
+        message: 'Chọn profile browser để chạy. Guest chỉ dùng khi cấu hình trong kịch bản.',
+      }));
+      return;
+    }
+    const browserProfileId = selectedBrowserProfileId;
     const result = await dispatch(runScenario({
       scenarioId: selectedScenarioId,
       browserProfileId,
@@ -150,18 +151,16 @@ export default function ExecutionsPage() {
       dispatch(showToast({ type: 'error', message: 'Khởi động lại ứng dụng để cập nhật preload' }));
       return;
     }
-    if (!selectedBrowserProfileId && !selectedScenarioId) {
-      dispatch(showToast({ type: 'error', message: 'Chọn kịch bản hoặc profile app để mở browser' }));
+    if (!selectedBrowserProfileId) {
+      dispatch(showToast({ type: 'error', message: 'Chọn profile browser để mở trình duyệt' }));
       return;
     }
     const scenario = scenarios.find((item) => item.id === selectedScenarioId);
-    const browserProfileId = resolveBrowserProfileId(selectedBrowserProfileId);
+    const browserProfileId = selectedBrowserProfileId;
     setOpeningBrowser(true);
     try {
       await openBrowserSessionApi({ scenarioId: selectedScenarioId || null, browserProfileId, startUrl: scenario?.target_url || null });
-      const profileLabel = browserProfileId
-        ? browserProfileOptions.find((item) => item.id === browserProfileId)?.display_name || 'profile app'
-        : 'guest';
+      const profileLabel = browserProfileOptions.find((item) => item.id === browserProfileId)?.display_name || 'profile app';
       dispatch(showToast({ type: 'success', message: `Đã mở browser (${profileLabel})` }));
     } catch (err) {
       dispatch(showToast({ type: 'error', message: err.message || 'Không mở được browser' }));
@@ -224,7 +223,7 @@ export default function ExecutionsPage() {
               onChange={(e) => setSelectedBrowserProfileId(e.target.value)}
               className="select-field min-w-[200px] border-0 bg-transparent py-1 text-sm"
             >
-              <option value={GUEST_BROWSER_PROFILE}>Guest (session tạm)</option>
+              <option value="">Chọn profile browser...</option>
               {browserProfileOptions.map((profile) => (
                 <option key={profile.id} value={profile.id}>{profile.display_name}</option>
               ))}
@@ -240,7 +239,7 @@ export default function ExecutionsPage() {
             </button>
           </div>
           <p className="max-w-[280px] text-right text-xs text-slate-500">
-            Cùng thư mục profile với kịch bản — record, chạy và mở browser dùng chung session.
+            Bắt buộc chọn profile app. Guest chỉ cấu hình trong kịch bản khi ghi.
           </p>
         </div>
       </div>
@@ -291,7 +290,7 @@ export default function ExecutionsPage() {
 
           <button
             onClick={handleRunScenario}
-            disabled={!selectedScenarioId}
+            disabled={!selectedScenarioId || !selectedBrowserProfileId}
             className="flex items-center gap-2 px-5 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-700 disabled:text-slate-500 text-white rounded-xl text-sm font-medium transition-all"
           >
             <Play className="w-4 h-4" />
