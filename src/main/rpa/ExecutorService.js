@@ -11,6 +11,10 @@ const DEFAULT_BROWSER_CLOSE_DELAY_MS = 5000;
 const MIN_BROWSER_CLOSE_DELAY_MS = 1000;
 const MAX_BROWSER_CLOSE_DELAY_MS = 120000;
 
+// Module-level lock: prevents two executors from launching Chrome against the
+// same userDataDir simultaneously. Maps dir → resolve-fn of the pending lock.
+const userDataDirLocks = new Map();
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -32,6 +36,7 @@ class ExecutorService {
     this._activeUserDataDir = null;
     this._currentVariableProfileId = null;
     this._variableMap = null;
+    this._releaseDirLock = null;
   }
 
   async startScenario(scenarioId, options = {}) {
@@ -229,6 +234,25 @@ class ExecutorService {
     const browserProfileId = options.browserProfileId ?? null;
     const userDataDir = await this._resolveExecutionUserDataDir(scenario.id, browserProfileId);
     this._activeUserDataDir = userDataDir;
+
+    // Serialize browser launches against the same userDataDir. Without this,
+    // two executors starting nearly simultaneously can both pass the
+    // SingletonLock check before Chrome creates the file, then both call
+    // puppeteer.launch() — the second one fails with "Failed to launch the
+    // browser process!".
+    while (userDataDirLocks.has(userDataDir)) {
+      await userDataDirLocks.get(userDataDir);
+    }
+    let releaseDirLock;
+    userDataDirLocks.set(
+      userDataDir,
+      new Promise((resolve) => { releaseDirLock = resolve; }),
+    );
+    this._releaseDirLock = () => {
+      userDataDirLocks.delete(userDataDir);
+      releaseDirLock?.();
+      this._releaseDirLock = null;
+    };
 
     if (this.browserProfileService) {
       await this.browserProfileService.waitForProfileUnlock(userDataDir);
@@ -601,6 +625,9 @@ class ExecutorService {
     }
 
     await this._closeBrowserAndWait();
+
+    // Release the per-userDataDir lock so the next queued executor can proceed.
+    this._releaseDirLock?.();
 
     this.page = null;
     this.browser = null;
