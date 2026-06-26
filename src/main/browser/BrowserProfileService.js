@@ -207,246 +207,24 @@ class BrowserProfileService {
     return Math.min(120000, Math.max(1000, Math.round(configured)));
   }
 
-  _getSessionStoreDir(userDataDir) {
-    return path.join(userDataDir, 'rpa-session');
-  }
-
-  _getCookiesStorePath(userDataDir) {
-    return path.join(this._getSessionStoreDir(userDataDir), 'cookies.json');
-  }
-
-  _normalizeCookieForPuppeteer(cookie) {
-    const item = {
-      name: cookie.name,
-      value: cookie.value,
-      domain: cookie.domain,
-      path: cookie.path || '/',
-      httpOnly: Boolean(cookie.httpOnly),
-      secure: Boolean(cookie.secure),
-    };
-
-    if (cookie.expires && Number.isFinite(cookie.expires) && cookie.expires > 0) {
-      item.expires = cookie.expires;
-    }
-
-    const sameSite = cookie.sameSite;
-    if (sameSite === 'Strict' || sameSite === 'Lax' || sameSite === 'None') {
-      item.sameSite = sameSite;
-    }
-
-    return item;
-  }
-
-  _hostnameFromUrl(url) {
-    try {
-      return new URL(url).hostname.toLowerCase();
-    } catch {
-      return '';
-    }
-  }
-
-  _cookieMatchesHost(cookie, host) {
-    if (!host) return true;
-
-    const cookieDomain = String(cookie?.domain || '').toLowerCase().replace(/^\./, '');
-    if (!cookieDomain) return false;
-
-    return host === cookieDomain
-      || host.endsWith(`.${cookieDomain}`)
-      || cookieDomain.endsWith(host);
-  }
-
-  _filterCookiesForHost(cookies, host) {
-    return cookies.filter((cookie) => this._cookieMatchesHost(cookie, host));
-  }
-
-  _buildCookieUrl(cookie) {
-    const domain = String(cookie.domain || '').replace(/^\./, '');
-    const path = cookie.path || '/';
-    const scheme = cookie.secure ? 'https' : 'http';
-    return `${scheme}://${domain}${path}`;
-  }
-
-  async _setCookiesViaCdp(page, cookies) {
-    if (!cookies.length) return 0;
-
-    const client = await page.createCDPSession();
-    await client.send('Network.enable').catch(() => {});
-
-    let applied = 0;
-    for (const cookie of cookies) {
-      try {
-        const result = await client.send('Network.setCookie', {
-          name: cookie.name,
-          value: cookie.value,
-          domain: cookie.domain,
-          path: cookie.path || '/',
-          secure: Boolean(cookie.secure),
-          httpOnly: Boolean(cookie.httpOnly),
-          sameSite: cookie.sameSite,
-          expires: cookie.expires,
-          url: this._buildCookieUrl(cookie),
-        });
-        if (result?.success) applied += 1;
-      } catch {
-        // Skip cookies that cannot be applied for this profile.
-      }
-    }
-
-    await client.detach().catch(() => {});
-    return applied;
-  }
-
-  _resolveCookieSeedUrl(payload, cookies) {
-    const pageUrl = String(payload?.pageUrl || '').trim();
-    if (pageUrl.startsWith('http')) return pageUrl;
-
-    const domainCookie = cookies.find((cookie) => cookie?.domain);
-    if (!domainCookie?.domain) return null;
-
-    const domain = String(domainCookie.domain).replace(/^\./, '');
-    return `https://${domain}/`;
-  }
-
-  async _readAllCookies(page) {
-    if (!page || page.isClosed()) return [];
-
-    try {
-      const client = await page.createCDPSession();
-      const { cookies } = await client.send('Network.getAllCookies');
-      await client.detach().catch(() => {});
-      return Array.isArray(cookies) ? cookies : [];
-    } catch {
-      return page.cookies().catch(() => []);
-    }
-  }
-
-  async saveSessionCookies(userDataDir, page) {
-    if (!userDataDir || !page || page.isClosed()) {
-      return { saved: false, cookieCount: 0 };
-    }
-
-    const cookies = await this._readAllCookies(page);
-    if (!cookies.length) {
-      return { saved: false, cookieCount: 0 };
-    }
-
-    const pageHost = this._hostnameFromUrl(page.url());
-    const siteCookies = this._filterCookiesForHost(cookies, pageHost);
-    const cookiesToSave = (siteCookies.length ? siteCookies : cookies)
-      .filter((cookie) => cookie?.name && cookie?.value !== undefined)
-      .map((cookie) => this._normalizeCookieForPuppeteer(cookie));
-
-    if (!cookiesToSave.length) {
-      return { saved: false, cookieCount: 0 };
-    }
-
-    const storeDir = this._getSessionStoreDir(userDataDir);
-    fs.mkdirSync(storeDir, { recursive: true });
-
-    const payload = {
-      savedAt: new Date().toISOString(),
-      pageUrl: page.url(),
-      siteHost: pageHost,
-      cookies: cookiesToSave,
-    };
-
-    fs.writeFileSync(this._getCookiesStorePath(userDataDir), JSON.stringify(payload, null, 2), 'utf8');
-
-    return {
-      saved: true,
-      cookieCount: payload.cookies.length,
-      storePath: this._getCookiesStorePath(userDataDir),
-    };
-  }
-
-  async restoreSessionCookies(page, userDataDir) {
-    const storePath = this._getCookiesStorePath(userDataDir);
-    if (!storePath || !fs.existsSync(storePath) || !page || page.isClosed()) {
-      return { restored: false, cookieCount: 0, pageUrl: null };
-    }
-
-    let payload;
-    try {
-      payload = JSON.parse(fs.readFileSync(storePath, 'utf8'));
-    } catch {
-      return { restored: false, cookieCount: 0, pageUrl: null };
-    }
-
-    const cookies = Array.isArray(payload?.cookies) ? payload.cookies : [];
-    if (!cookies.length) {
-      return { restored: false, cookieCount: 0, pageUrl: null };
-    }
-
-    const siteHost = payload.siteHost
-      || this._hostnameFromUrl(payload.pageUrl)
-      || this._hostnameFromUrl(this._resolveCookieSeedUrl(payload, cookies));
-    const siteCookies = this._filterCookiesForHost(cookies, siteHost);
-    const normalized = (siteCookies.length ? siteCookies : cookies)
-      .map((cookie) => this._normalizeCookieForPuppeteer(cookie))
-      .filter((cookie) => cookie.name && cookie.value !== undefined);
-
-    if (!normalized.length) {
-      return { restored: false, cookieCount: 0, pageUrl: payload.pageUrl || null };
-    }
-
-    const seedUrl = this._resolveCookieSeedUrl(payload, normalized);
-    if (seedUrl) {
-      await page.goto(seedUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-    }
-
-    const appliedCount = await this._setCookiesViaCdp(page, normalized);
-    const targetUrl = String(payload.pageUrl || seedUrl || '').trim();
-
-    if (targetUrl) {
-      await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
-    }
-
-    return {
-      restored: appliedCount > 0,
-      cookieCount: appliedCount,
-      pageUrl: targetUrl || payload.pageUrl || null,
-    };
-  }
-
-  async settlePageBeforeClose(page) {
-    if (!page || page.isClosed()) return { cookieCount: 0, hasAuthCookie: false, pageUrl: null };
-
-    try {
-      await Promise.race([
-        page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => null),
-        page.waitForFunction(() => document.readyState === 'complete', { timeout: 8000 }).catch(() => null),
-        new Promise((resolve) => setTimeout(resolve, 3000)),
-      ]);
-    } catch {
-      // Ignore settle failures.
-    }
-
-    const cookies = await this._readAllCookies(page);
-    const hasAuthCookie = cookies.some((cookie) => (
-      /wordpress_logged_in|wp-settings|session/i.test(cookie.name)
-    ));
-
-    return {
-      cookieCount: cookies.length,
-      hasAuthCookie,
-      pageUrl: page.url(),
-    };
-  }
-
-  async gracefulCloseBrowser(browser, userDataDir, page = null) {
-    if (!browser?.isConnected?.()) return { savedCookies: 0 };
+  async gracefulCloseBrowser(browser, _userDataDir, page = null) {
+    if (!browser?.isConnected?.()) return;
 
     const delayMs = this.getSessionCloseDelayMs();
-    const activePage = page && !page.isClosed()
-      ? page
-      : (await browser.pages().catch(() => []))[0];
-
-    await this.settlePageBeforeClose(activePage);
-    const saveResult = await this.saveSessionCookies(userDataDir, activePage);
     if (delayMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
+
+    // Close the active page to trigger unload/beforeunload so Chrome flushes
+    // pending writes (cookies WAL, localStorage, IndexedDB) before exit.
+    const activePage = (page && !page.isClosed())
+      ? page
+      : (await browser.pages().catch(() => []))[0];
+    if (activePage && !activePage.isClosed()) {
+      await activePage.close().catch(() => {});
+    }
+
+    const chromeProcess = browser.process?.() ?? null;
 
     try {
       await browser.close();
@@ -454,11 +232,15 @@ class BrowserProfileService {
       // Browser may already be closed.
     }
 
-    if (userDataDir) {
-      await this.waitForProfileUnlock(userDataDir, 15000);
+    // Wait for Chrome to fully exit before returning — ensures the SQLite WAL
+    // (Default/Cookies) has been checkpointed and data is on disk.
+    if (chromeProcess) {
+      await new Promise((resolve) => {
+        if (chromeProcess.exitCode !== null) { resolve(); return; }
+        const timer = setTimeout(resolve, 15000);
+        chromeProcess.once('exit', () => { clearTimeout(timer); resolve(); });
+      });
     }
-
-    return saveResult;
   }
 
   async openBrowserSession({ scenarioId, browserProfileId = null, startUrl = null }) {
@@ -513,15 +295,11 @@ class BrowserProfileService {
         await extraPage.close().catch(() => {});
       }
 
-      const restoreResult = await this.restoreSessionCookies(page, userDataDir);
-      if (!restoreResult.restored) {
-        const url = String(startUrl || '').trim();
-        if (url) {
-          const effectiveUrl = this.resolveSessionStartUrl(url) || url;
-          await page.goto(effectiveUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
-        } else {
-          await page.goto('about:blank', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-        }
+      // Chromium persists cookies natively via userDataDir — no manual restore needed.
+      const url = String(startUrl || '').trim();
+      if (url) {
+        const effectiveUrl = this.resolveSessionStartUrl(url) || url;
+        await page.goto(effectiveUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
       }
     } catch {
       // Browser vẫn mở, bỏ qua lỗi điều hướng

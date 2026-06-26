@@ -106,12 +106,11 @@ class DatabaseService {
       .get();
 
     if (profilesTable) {
-      const profileColumns = this.db.prepare('PRAGMA table_info(profiles)').all();
-      const hasBrowserProfileId = profileColumns.some((col) => col.name === 'browser_profile_id');
-
-      if (!hasBrowserProfileId) {
-        this.db.exec('ALTER TABLE profiles ADD COLUMN browser_profile_id TEXT');
-      }
+      this.db.exec(`
+        DROP TABLE IF EXISTS campaign_profiles;
+        DROP TABLE IF EXISTS profiles;
+      `);
+      console.log('[DatabaseService] Da xoa bang profiles cu (tai khoan MXH)');
     }
 
     if (tableExists) {
@@ -196,6 +195,8 @@ class DatabaseService {
     }
 
     this._migrateScenarioVariablesTable();
+    this._migrateVariableProfilesTables();
+    this._migrateExecutionLogsProfileColumns();
     this.db.prepare(`
       UPDATE scenario_steps
       SET action_type = 'input'
@@ -233,6 +234,44 @@ class DatabaseService {
       DROP TABLE scenario_variables;
       ALTER TABLE scenario_variables_new RENAME TO scenario_variables;
     `);
+  }
+
+  _migrateVariableProfilesTables() {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS variable_profiles (
+        id          TEXT PRIMARY KEY,
+        scenario_id TEXT NOT NULL,
+        name        TEXT NOT NULL,
+        is_dirty    INTEGER NOT NULL DEFAULT 1,
+        updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(scenario_id, name),
+        FOREIGN KEY (scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS profile_variable_values (
+        id           TEXT PRIMARY KEY,
+        profile_id   TEXT NOT NULL,
+        variable_key TEXT NOT NULL,
+        value        TEXT,
+        UNIQUE(profile_id, variable_key),
+        FOREIGN KEY (profile_id) REFERENCES variable_profiles(id) ON DELETE CASCADE
+      );
+    `);
+  }
+
+  _migrateExecutionLogsProfileColumns() {
+    const table = this.db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='execution_logs'")
+      .get();
+    if (!table) return;
+
+    const columns = this.db.prepare('PRAGMA table_info(execution_logs)').all();
+    if (!columns.some((col) => col.name === 'variable_profile_id')) {
+      this.db.exec('ALTER TABLE execution_logs ADD COLUMN variable_profile_id TEXT');
+    }
+    if (!columns.some((col) => col.name === 'variable_profile_name')) {
+      this.db.exec('ALTER TABLE execution_logs ADD COLUMN variable_profile_name TEXT');
+    }
   }
 
   initSchema() {
@@ -289,26 +328,6 @@ class DatabaseService {
         );
 
         -- ============================================================
-        -- Bảng profiles: hồ sơ trình duyệt (cookies, cache phân vùng)
-        -- Mỗi profile gắn với một proxy (nếu có) và một nền tảng MXH
-        -- ============================================================
-        CREATE TABLE IF NOT EXISTS profiles (
-          id                TEXT PRIMARY KEY,
-          proxy_id          TEXT,
-          platform          TEXT NOT NULL,
-          username          TEXT NOT NULL,
-          password          TEXT,
-          cookie_data       TEXT,
-          profile_directory TEXT,
-          browser_profile_id TEXT,
-          status            TEXT NOT NULL DEFAULT 'active',
-          is_dirty          INTEGER NOT NULL DEFAULT 1,
-          updated_at        TEXT NOT NULL DEFAULT (datetime('now')),
-          FOREIGN KEY (proxy_id) REFERENCES proxies(id) ON DELETE SET NULL,
-          FOREIGN KEY (browser_profile_id) REFERENCES browser_profiles(id) ON DELETE SET NULL
-        );
-
-        -- ============================================================
         -- Bảng scenarios: kịch bản tự động hóa
         -- Lưu thông tin viewport gốc để chuyển đổi tọa độ sau này
         -- ============================================================
@@ -337,6 +356,25 @@ class DatabaseService {
           value       TEXT,
           UNIQUE(scenario_id, key),
           FOREIGN KEY (scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS variable_profiles (
+          id          TEXT PRIMARY KEY,
+          scenario_id TEXT NOT NULL,
+          name        TEXT NOT NULL,
+          is_dirty    INTEGER NOT NULL DEFAULT 1,
+          updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+          UNIQUE(scenario_id, name),
+          FOREIGN KEY (scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS profile_variable_values (
+          id           TEXT PRIMARY KEY,
+          profile_id   TEXT NOT NULL,
+          variable_key TEXT NOT NULL,
+          value        TEXT,
+          UNIQUE(profile_id, variable_key),
+          FOREIGN KEY (profile_id) REFERENCES variable_profiles(id) ON DELETE CASCADE
         );
 
         -- ============================================================
@@ -391,11 +429,10 @@ class DatabaseService {
         CREATE TABLE IF NOT EXISTS campaign_profiles (
           id          TEXT PRIMARY KEY,
           campaign_id TEXT NOT NULL,
-          profile_id  TEXT NOT NULL,
+          profile_ref TEXT NOT NULL,
           status      TEXT NOT NULL DEFAULT 'pending',
           updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
-          FOREIGN KEY (campaign_id) REFERENCES campaigns(id) ON DELETE CASCADE,
-          FOREIGN KEY (profile_id) REFERENCES profiles(id) ON DELETE CASCADE
+          FOREIGN KEY (campaign_id) REFERENCES campaigns(id) ON DELETE CASCADE
         );
 
         -- ============================================================
@@ -416,11 +453,13 @@ class DatabaseService {
         );
 
         CREATE TABLE IF NOT EXISTS execution_logs (
-          id                  TEXT PRIMARY KEY,
-          scenario_id         TEXT NOT NULL,
-          scenario_name       TEXT,
-          browser_profile_id  TEXT,
-          status              TEXT NOT NULL DEFAULT 'running',
+          id                    TEXT PRIMARY KEY,
+          scenario_id           TEXT NOT NULL,
+          scenario_name         TEXT,
+          browser_profile_id    TEXT,
+          variable_profile_id   TEXT,
+          variable_profile_name TEXT,
+          status                TEXT NOT NULL DEFAULT 'running',
           total_steps         INTEGER NOT NULL DEFAULT 0,
           completed_steps     INTEGER NOT NULL DEFAULT 0,
           failed_steps        INTEGER NOT NULL DEFAULT 0,
@@ -709,9 +748,9 @@ class DatabaseService {
   }
 
   saveScenarioVariable(variable) {
-    const id = variable.id || crypto.randomUUID();
     const scenarioId = variable.scenario_id;
     const key = String(variable.key || variable.name || '').trim();
+    const value = variable.value ?? '';
 
     if (!scenarioId) {
       throw new Error('scenario_id is required for scenario variable.');
@@ -720,56 +759,262 @@ class DatabaseService {
       throw new Error('Variable key is required.');
     }
 
-    this.db.prepare(`
-      INSERT INTO scenario_variables (id, scenario_id, key, value)
-      VALUES (?, ?, ?, ?)
-      ON CONFLICT(scenario_id, key)
-      DO UPDATE SET value = excluded.value
-    `).run(
-      id,
-      scenarioId,
-      key,
-      variable.value ?? '',
-    );
-
-    return this.db
+    const existingByKey = this.db
       .prepare('SELECT id, scenario_id, key, value FROM scenario_variables WHERE scenario_id = ? AND key = ?')
       .get(scenarioId, key);
+
+    if (variable.id) {
+      const existingById = this.db
+        .prepare('SELECT id, scenario_id, key, value FROM scenario_variables WHERE id = ?')
+        .get(variable.id);
+
+      if (existingById) {
+        if (existingByKey && existingByKey.id !== variable.id) {
+          throw new Error('Da ton tai bien voi key nay.');
+        }
+
+        const previousKey = existingById.key;
+        this.db
+          .prepare('UPDATE scenario_variables SET key = ?, value = ? WHERE id = ?')
+          .run(key, value, variable.id);
+
+        if (previousKey && previousKey !== key) {
+          this._renameProfileVariableKey(scenarioId, previousKey, key);
+        }
+
+        return this.db
+          .prepare('SELECT id, scenario_id, key, value FROM scenario_variables WHERE id = ?')
+          .get(variable.id);
+      }
+    }
+
+    if (existingByKey) {
+      this.db
+        .prepare('UPDATE scenario_variables SET value = ? WHERE id = ?')
+        .run(value, existingByKey.id);
+
+      return this.db
+        .prepare('SELECT id, scenario_id, key, value FROM scenario_variables WHERE scenario_id = ? AND key = ?')
+        .get(scenarioId, key);
+    }
+
+    const id = variable.id || crypto.randomUUID();
+    this.db
+      .prepare('INSERT INTO scenario_variables (id, scenario_id, key, value) VALUES (?, ?, ?, ?)')
+      .run(id, scenarioId, key, value);
+
+    return this.db
+      .prepare('SELECT id, scenario_id, key, value FROM scenario_variables WHERE id = ?')
+      .get(id);
   }
 
   deleteScenarioVariable(id) {
+    const existing = this.db
+      .prepare('SELECT id, scenario_id, key FROM scenario_variables WHERE id = ?')
+      .get(id);
+
+    if (existing?.scenario_id && existing?.key) {
+      this._deleteProfileValuesForScenarioKey(existing.scenario_id, existing.key);
+    }
+
     this.db.prepare('DELETE FROM scenario_variables WHERE id = ?').run(id);
     return { success: true, id };
   }
 
-  importProfileVariables({ scenarioId, profileId }) {
-    const profile = this.db.prepare('SELECT * FROM profiles WHERE id = ?').get(profileId);
-    if (!profile) {
-      throw new Error('Khong tim thay tai khoan de import variable.');
+  _deleteProfileValuesForScenarioKey(scenarioId, variableKey) {
+    const profiles = this.db
+      .prepare('SELECT id FROM variable_profiles WHERE scenario_id = ?')
+      .all(scenarioId);
+
+    const deleteStmt = this.db.prepare(
+      'DELETE FROM profile_variable_values WHERE profile_id = ? AND variable_key = ?',
+    );
+
+    for (const profile of profiles) {
+      deleteStmt.run(profile.id, variableKey);
+    }
+  }
+
+  _renameProfileVariableKey(scenarioId, oldKey, newKey) {
+    const profiles = this.db
+      .prepare('SELECT id FROM variable_profiles WHERE scenario_id = ?')
+      .all(scenarioId);
+
+    const updateStmt = this.db.prepare(
+      'UPDATE profile_variable_values SET variable_key = ? WHERE profile_id = ? AND variable_key = ?',
+    );
+
+    for (const profile of profiles) {
+      updateStmt.run(newKey, profile.id, oldKey);
+    }
+  }
+
+  getVariableProfiles(scenarioId) {
+    return this.db
+      .prepare('SELECT id, scenario_id, name, updated_at FROM variable_profiles WHERE scenario_id = ? ORDER BY name ASC')
+      .all(scenarioId);
+  }
+
+  getVariableProfileById(profileId) {
+    const profile = this.db
+      .prepare('SELECT id, scenario_id, name, updated_at FROM variable_profiles WHERE id = ?')
+      .get(profileId);
+    if (!profile) return null;
+
+    const skeleton = this.getScenarioVariables(profile.scenario_id);
+    const values = this.getProfileVariableValues(profileId);
+    const valueMap = new Map(values.map((item) => [item.variable_key, item.value ?? '']));
+
+    return {
+      ...profile,
+      skeleton,
+      values: skeleton.map((item) => ({
+        variable_key: item.key,
+        value: valueMap.get(item.key) ?? '',
+        default_value: item.value ?? '',
+      })),
+    };
+  }
+
+  saveVariableProfile(profile) {
+    const id = profile.id || crypto.randomUUID();
+    const scenarioId = profile.scenario_id;
+    const name = String(profile.name || '').trim();
+    const now = new Date().toISOString();
+
+    if (!scenarioId) {
+      throw new Error('scenario_id is required for variable profile.');
+    }
+    if (!name) {
+      throw new Error('Profile name is required.');
     }
 
-    const baseName = `${profile.platform || 'account'}_${String(profile.username || 'user')
-      .replace(/[^a-zA-Z0-9]+/g, '_')
-      .replace(/^_+|_+$/g, '')
-      .toLowerCase()}`.slice(0, 48);
+    const existingByName = this.db
+      .prepare('SELECT id FROM variable_profiles WHERE scenario_id = ? AND name = ?')
+      .get(scenarioId, name);
 
-    const usernameVariable = this.saveScenarioVariable({
-      scenario_id: scenarioId,
-      key: `${baseName}_username`,
-      value: profile.username || '',
+    if (profile.id) {
+      const existingById = this.db
+        .prepare('SELECT id, scenario_id, name FROM variable_profiles WHERE id = ?')
+        .get(profile.id);
+
+      if (existingById) {
+        if (existingByName && existingByName.id !== profile.id) {
+          throw new Error('Da ton tai ho so voi ten nay.');
+        }
+
+        this.db.prepare(`
+          UPDATE variable_profiles
+          SET name = ?, is_dirty = 1, updated_at = ?
+          WHERE id = ?
+        `).run(name, now, profile.id);
+
+        return this.getVariableProfileById(profile.id);
+      }
+    }
+
+    if (existingByName) {
+      throw new Error('Da ton tai ho so voi ten nay.');
+    }
+
+    this.db.prepare(`
+      INSERT INTO variable_profiles (id, scenario_id, name, is_dirty, updated_at)
+      VALUES (?, ?, ?, 1, ?)
+    `).run(id, scenarioId, name, now);
+
+    return this.getVariableProfileById(id);
+  }
+
+  deleteVariableProfile(id) {
+    this.db.prepare('DELETE FROM variable_profiles WHERE id = ?').run(id);
+    return { success: true, id };
+  }
+
+  getProfileVariableValues(profileId) {
+    return this.db
+      .prepare('SELECT id, profile_id, variable_key, value FROM profile_variable_values WHERE profile_id = ? ORDER BY variable_key ASC')
+      .all(profileId);
+  }
+
+  saveProfileVariableValues(profileId, entries = []) {
+    if (!profileId) {
+      throw new Error('profile_id is required.');
+    }
+
+    const profile = this.db
+      .prepare('SELECT id, scenario_id FROM variable_profiles WHERE id = ?')
+      .get(profileId);
+    if (!profile) {
+      throw new Error('Khong tim thay ho so du lieu.');
+    }
+
+    const skeletonKeys = new Set(
+      this.getScenarioVariables(profile.scenario_id).map((item) => item.key),
+    );
+
+    const upsert = this.db.prepare(`
+      INSERT INTO profile_variable_values (id, profile_id, variable_key, value)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(profile_id, variable_key)
+      DO UPDATE SET value = excluded.value
+    `);
+
+    const deleteStmt = this.db.prepare(
+      'DELETE FROM profile_variable_values WHERE profile_id = ? AND variable_key = ?',
+    );
+
+    const saveMany = this.db.transaction((rows) => {
+      for (const entry of rows) {
+        const variableKey = String(entry.variable_key || entry.key || '').trim();
+        if (!variableKey || !skeletonKeys.has(variableKey)) continue;
+
+        const rawValue = entry.value ?? '';
+        if (rawValue === '') {
+          deleteStmt.run(profileId, variableKey);
+          continue;
+        }
+
+        upsert.run(crypto.randomUUID(), profileId, variableKey, rawValue);
+      }
     });
 
-    const imported = [usernameVariable];
+    saveMany(entries);
+    return this.getVariableProfileById(profileId);
+  }
 
-    if (profile.password) {
-      imported.push(this.saveScenarioVariable({
-        scenario_id: scenarioId,
-        key: `${baseName}_password`,
-        value: profile.password,
-      }));
+  buildVariableMap(scenarioId, profileId = null) {
+    const skeleton = this.getScenarioVariables(scenarioId);
+    let profileValues = [];
+    const normalizedProfileId = profileId ? String(profileId).trim() : '';
+
+    if (normalizedProfileId) {
+      const profile = this.db
+        .prepare('SELECT id, scenario_id FROM variable_profiles WHERE id = ?')
+        .get(normalizedProfileId);
+      if (profile?.scenario_id === scenarioId) {
+        profileValues = this.getProfileVariableValues(normalizedProfileId);
+      }
     }
 
-    return imported;
+    const profileMap = new Map(profileValues.map((item) => [item.variable_key, item.value ?? '']));
+
+    const resolved = new Map();
+    for (const item of skeleton) {
+      const key = item.key;
+      const profileValue = profileMap.get(key);
+      const defaultValue = item.value ?? '';
+      const resolvedValue = (profileValue != null && profileValue !== '')
+        ? profileValue
+        : defaultValue;
+      resolved.set(key, resolvedValue);
+    }
+
+    return resolved;
+  }
+
+  buildResolvedVariables(scenarioId, profileId = null) {
+    const map = this.buildVariableMap(scenarioId, profileId);
+    return Array.from(map.entries()).map(([key, value]) => ({ key, value }));
   }
 
   deleteScenario(id) {
@@ -851,112 +1096,6 @@ class DatabaseService {
    */
   deleteProxy(id) {
     this.db.prepare('DELETE FROM proxies WHERE id = ?').run(id);
-    return { success: true };
-  }
-
-  // ============================================================
-  // Profile CRUD
-  // ============================================================
-
-  /**
-   * Lấy danh sách tất cả profile (JOIN proxy để hiển thị tên proxy), sắp xếp mới nhất.
-   * @returns {Array<Object>}
-   */
-  getProfiles() {
-    return this.db
-      .prepare(
-        `SELECT p.*, pr.name AS proxy_name,
-                bp.display_name AS browser_profile_display_name,
-                bp.browser_name AS browser_name,
-                bp.profile_name AS browser_profile_name,
-                bp.executable_path AS browser_executable_path,
-                bp.user_data_dir AS browser_user_data_dir,
-                bp.profile_dir_name AS browser_profile_dir_name
-         FROM profiles p
-         LEFT JOIN proxies pr ON pr.id = p.proxy_id
-         LEFT JOIN browser_profiles bp ON bp.id = p.browser_profile_id
-         ORDER BY p.updated_at DESC`
-      )
-      .all();
-  }
-
-  /**
-   * Lưu hoặc cập nhật một profile.
-   * Nếu profile có id → UPDATE, nếu không → INSERT.
-   * @param {Object} profile - { id?, proxy_id?, browser_profile_id?, platform, username, password?, cookie_data?, profile_directory?, status? }
-   * @returns {Object} Profile đã lưu (kèm proxy_name).
-   */
-  saveProfile(profile) {
-    const now = new Date().toISOString();
-    const isNew = !profile.id;
-    const id = profile.id || crypto.randomUUID();
-
-    if (isNew) {
-      this.db
-        .prepare(
-          `INSERT INTO profiles (id, proxy_id, browser_profile_id, platform, username, password, cookie_data, profile_directory, status, is_dirty, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`
-        )
-        .run(
-          id,
-          profile.proxy_id || null,
-          profile.browser_profile_id || null,
-          profile.platform,
-          profile.username,
-          profile.password || null,
-          profile.cookie_data || null,
-          profile.profile_directory || null,
-          profile.status || 'active',
-          now
-        );
-    } else {
-      this.db
-        .prepare(
-          `UPDATE profiles
-           SET proxy_id = ?, browser_profile_id = ?, platform = ?, username = ?, password = ?,
-               cookie_data = ?, profile_directory = ?, status = ?,
-               is_dirty = 1, updated_at = ?
-           WHERE id = ?`
-        )
-        .run(
-          profile.proxy_id || null,
-          profile.browser_profile_id || null,
-          profile.platform,
-          profile.username,
-          profile.password || null,
-          profile.cookie_data || null,
-          profile.profile_directory || null,
-          profile.status || 'active',
-          now,
-          id
-        );
-    }
-
-    // Trả về profile kèm proxy_name
-    return this.db
-      .prepare(
-        `SELECT p.*, pr.name AS proxy_name,
-                bp.display_name AS browser_profile_display_name,
-                bp.browser_name AS browser_name,
-                bp.profile_name AS browser_profile_name,
-                bp.executable_path AS browser_executable_path,
-                bp.user_data_dir AS browser_user_data_dir,
-                bp.profile_dir_name AS browser_profile_dir_name
-         FROM profiles p
-         LEFT JOIN proxies pr ON pr.id = p.proxy_id
-         LEFT JOIN browser_profiles bp ON bp.id = p.browser_profile_id
-         WHERE p.id = ?`
-      )
-      .get(id);
-  }
-
-  /**
-   * Xóa một profile theo ID.
-   * @param {string} id
-   * @returns {{ success: boolean }}
-   */
-  deleteProfile(id) {
-    this.db.prepare('DELETE FROM profiles WHERE id = ?').run(id);
     return { success: true };
   }
 
@@ -1062,7 +1201,6 @@ class DatabaseService {
   }
 
   deleteBrowserProfile(id) {
-    this.db.prepare('UPDATE profiles SET browser_profile_id = NULL WHERE browser_profile_id = ?').run(id);
     this.db.prepare('DELETE FROM browser_profiles WHERE id = ?').run(id);
     return { success: true };
   }
@@ -1181,15 +1319,18 @@ class DatabaseService {
     this.db.prepare(`
       INSERT INTO execution_logs (
         id, scenario_id, scenario_name, browser_profile_id,
+        variable_profile_id, variable_profile_name,
         status, total_steps, completed_steps, failed_steps,
         failed_step_index, error_message, duration_ms,
         started_at, finished_at, is_dirty, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
     `).run(
       id,
       log.scenario_id,
       log.scenario_name || null,
       log.browser_profile_id || null,
+      log.variable_profile_id || null,
+      log.variable_profile_name || null,
       log.status || 'running',
       log.total_steps || 0,
       log.completed_steps || 0,
@@ -1255,12 +1396,19 @@ class DatabaseService {
     return row ? this._mapExecutionLogRow(row) : null;
   }
 
+  deleteAllExecutionLogs() {
+    const result = this.db.prepare('DELETE FROM execution_logs').run();
+    return { deleted: result.changes || 0 };
+  }
+
   _mapExecutionLogRow(row) {
     return {
       id: row.id,
       scenario_id: row.scenario_id,
       scenario_name: row.scenario_name,
       browser_profile_id: row.browser_profile_id,
+      variable_profile_id: row.variable_profile_id,
+      variable_profile_name: row.variable_profile_name,
       status: row.status,
       total_steps: row.total_steps,
       completed_steps: row.completed_steps,

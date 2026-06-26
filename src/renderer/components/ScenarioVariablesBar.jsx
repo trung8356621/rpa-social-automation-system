@@ -28,7 +28,11 @@ export default function ScenarioVariablesBar({
     setLoading(true);
     try {
       const items = await window.electronAPI.getScenarioVariables(scenarioId);
-      setRows(Array.isArray(items) && items.length ? items : []);
+      const normalized = (Array.isArray(items) ? items : []).map((item) => ({
+        ...item,
+        key: item.key || item.name || '',
+      }));
+      setRows(normalized.length ? normalized : []);
     } catch (error) {
       onToast?.({ type: 'error', message: error.message || 'Không tải được biến' });
     } finally {
@@ -41,26 +45,28 @@ export default function ScenarioVariablesBar({
   }, [scenarioId]);
 
   const persistRow = async (row) => {
-    const key = String(row.key || '').trim();
+    const key = String(row.key || row.name || '').trim();
     if (!scenarioId || !key) return null;
 
     const saved = await window.electronAPI.saveScenarioVariable({
       id: row.id || undefined,
       scenario_id: scenarioId,
       key,
+      name: key,
       value: row.value ?? '',
     });
     return saved;
   };
 
-  const handleSaveRow = async (index) => {
-    const row = rows[index];
-    const key = String(row?.key || '').trim();
+  const handleSaveRow = async (index, patch = {}) => {
+    const row = { ...rows[index], ...patch };
+    const key = String(row?.key || row?.name || '').trim();
     if (!key) return;
 
     setSaving(true);
     try {
       const saved = await persistRow(row);
+      if (!saved) return;
       setRows((prev) => prev.map((item, idx) => (idx === index ? saved : item)));
       onChanged?.();
     } catch (error) {
@@ -131,8 +137,8 @@ export default function ScenarioVariablesBar({
           <div className="absolute right-0 top-full z-50 mt-2 w-[420px] rounded-xl border border-[#2f3748] bg-[#12151c] p-3 shadow-2xl">
             <div className="mb-3 flex items-center justify-between">
               <div>
-                <p className="text-sm font-semibold text-white">Biến kịch bản</p>
-                <p className="text-[11px] text-[#76849b]">Dùng cú pháp {'{{ten_bien}}'} trong URL và Input</p>
+                <p className="text-sm font-semibold text-white">Biến mặc định (khung)</p>
+                <p className="text-[11px] text-[#76849b]">Giá trị fallback khi hồ sơ để trống. Dùng {'{{ten_bien}}'} trong URL và Input.</p>
               </div>
               <button
                 type="button"
@@ -148,23 +154,23 @@ export default function ScenarioVariablesBar({
               <p className="text-xs text-[#76849b]">Đang tải...</p>
             ) : rows.length === 0 ? (
               <p className="rounded-lg border border-dashed border-[#2f3748] px-3 py-4 text-center text-xs text-[#76849b]">
-                Chưa có biến. Thêm key/value để dùng trong bước Input và URL.
+                Chưa có biến khung. Thêm key/value mặc định trước khi tạo hồ sơ dữ liệu.
               </p>
             ) : (
               <div className="max-h-64 space-y-2 overflow-y-auto pr-1">
                 {rows.map((row, index) => (
                   <div key={row.id || `new-${index}`} className="grid grid-cols-[1fr_1fr_auto] gap-2">
                     <input
-                      value={row.key || ''}
+                      value={row.key || row.name || ''}
                       onChange={(event) => updateRow(index, { key: event.target.value })}
-                      onBlur={() => handleSaveRow(index)}
+                      onBlur={(event) => handleSaveRow(index, { key: event.target.value })}
                       className="input-field h-8 text-xs"
                       placeholder="key"
                     />
                     <input
                       value={row.value || ''}
                       onChange={(event) => updateRow(index, { value: event.target.value })}
-                      onBlur={() => handleSaveRow(index)}
+                      onBlur={(event) => handleSaveRow(index, { value: event.target.value })}
                       className="input-field h-8 text-xs"
                       placeholder="value"
                     />

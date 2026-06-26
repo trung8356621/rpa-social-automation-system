@@ -32,6 +32,7 @@ import {
 import { setCurrentPage, showToast } from '../slices/uiSlice';
 import VariableInput from './VariableInput';
 import ScenarioVariablesBar from './ScenarioVariablesBar';
+import DataProfileSelect, { readStoredDataProfileId } from './DataProfileSelect';
 import { normalizeActionType } from '../utils/variables';
 
 const DEFAULT_ACTION_DELAY_MS = 300;
@@ -828,11 +829,14 @@ export default function ScenarioEditor({ scenario, onBack }) {
   const [browserProfileId, setBrowserProfileId] = useState(scenario?.browser_profile_id || '');
   const [browserProfileOptions, setBrowserProfileOptions] = useState([]);
   const [frameDataUrls, setFrameDataUrls] = useState({});
+  const frameLoadFailedRef = useRef(new Set());
   const [manifestFrames, setManifestFrames] = useState([]);
   const [selectingTrim, setSelectingTrim] = useState(false);
   const [pendingTrimRange, setPendingTrimRange] = useState(null);
   const [scenarioVariables, setScenarioVariables] = useState([]);
   const [variablesRefreshKey, setVariablesRefreshKey] = useState(0);
+  const [profilesRefreshKey, setProfilesRefreshKey] = useState(0);
+  const [activeDataProfileId, setActiveDataProfileId] = useState('');
   const undoStackRef = useRef([]);
   const redoStackRef = useRef([]);
   const isApplyingHistoryRef = useRef(false);
@@ -854,7 +858,12 @@ export default function ScenarioEditor({ scenario, onBack }) {
 
     try {
       const items = await window.electronAPI.getScenarioVariables(scenarioId);
-      setScenarioVariables(Array.isArray(items) ? items : []);
+      setScenarioVariables(
+        (Array.isArray(items) ? items : []).map((item) => ({
+          ...item,
+          key: item.key || item.name || '',
+        })),
+      );
     } catch {
       setScenarioVariables([]);
     }
@@ -863,6 +872,14 @@ export default function ScenarioEditor({ scenario, onBack }) {
   useEffect(() => {
     loadScenarioVariables(currentScenarioId);
   }, [currentScenarioId, variablesRefreshKey, loadScenarioVariables]);
+
+  useEffect(() => {
+    if (!currentScenarioId) {
+      setActiveDataProfileId('');
+      return;
+    }
+    setActiveDataProfileId(readStoredDataProfileId(currentScenarioId));
+  }, [currentScenarioId]);
 
   // ======== Derived State ========
   const hasSteps = steps.length > 0;
@@ -1057,12 +1074,14 @@ export default function ScenarioEditor({ scenario, onBack }) {
       ...steps.map((step) => step.target_anchor?.associated_frame),
       ...manifestFrames.map((frame) => frame.path),
     ]
-      .filter((item) => item && !frameDataUrls[item]);
+      .filter((item) => item && !frameDataUrls[item] && !frameLoadFailedRef.current.has(item));
 
     if (!missingPaths.length || !window.electronAPI.readFrameDataUrl) return;
 
     let cancelled = false;
-    Promise.all([...new Set(missingPaths)].map(async (filePath) => {
+    const uniquePaths = [...new Set(missingPaths)];
+
+    Promise.all(uniquePaths.map(async (filePath) => {
       try {
         const dataUrl = await window.electronAPI.readFrameDataUrl(filePath);
         return dataUrl ? [filePath, dataUrl] : null;
@@ -1071,6 +1090,14 @@ export default function ScenarioEditor({ scenario, onBack }) {
       }
     })).then((entries) => {
       if (cancelled) return;
+
+      for (const filePath of uniquePaths) {
+        const loaded = entries.some((entry) => entry && entry[0] === filePath);
+        if (!loaded) {
+          frameLoadFailedRef.current.add(filePath);
+        }
+      }
+
       const next = {};
       for (const entry of entries) {
         if (entry) next[entry[0]] = entry[1];
@@ -1535,10 +1562,20 @@ export default function ScenarioEditor({ scenario, onBack }) {
         </div>
 
         <div className="flex items-center gap-2">
+          <DataProfileSelect
+            scenarioId={currentScenarioId}
+            value={activeDataProfileId}
+            onChange={setActiveDataProfileId}
+            refreshKey={profilesRefreshKey + variablesRefreshKey}
+            className="select-field h-9 min-w-[150px] max-w-[180px] text-xs"
+          />
           <ScenarioVariablesBar
             scenarioId={currentScenarioId}
             onToast={(payload) => dispatch(showToast(payload))}
-            onChanged={() => setVariablesRefreshKey((value) => value + 1)}
+            onChanged={() => {
+              setVariablesRefreshKey((value) => value + 1);
+              setProfilesRefreshKey((value) => value + 1);
+            }}
           />
           <IconOnly icon={FileDown} label="Xuất file" />
           <IconOnly icon={Upload} label={publishing ? 'Đang xuất...' : 'Xuất bản'} onClick={handlePublish} disabled={recording || !hasSteps || publishing} />

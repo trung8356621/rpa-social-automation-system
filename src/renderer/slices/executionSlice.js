@@ -15,13 +15,13 @@ import { createSlice, createAsyncThunk } from '@reduxjs/toolkit';
  */
 export const startLocalCampaign = createAsyncThunk(
   'executions/startLocal',
-  async ({ scenarioId, browserProfileId = null }, { rejectWithValue }) => {
+  async ({ scenarioId, browserProfileId = null, variableProfileId = null, headless = false }, { rejectWithValue }) => {
     try {
       if (!scenarioId) {
         throw new Error('Thiếu kịch bản cần chạy');
       }
-      window.electronAPI.startLocalCampaign({ scenarioId, browserProfileId });
-      return { id: scenarioId, browserProfileId, status: 'triggered' };
+      window.electronAPI.startLocalCampaign({ scenarioId, browserProfileId, variableProfileId, headless });
+      return { id: scenarioId, browserProfileId, variableProfileId, status: 'triggered' };
     } catch (error) {
       return rejectWithValue(error.message);
     }
@@ -76,6 +76,20 @@ export const fetchExecutionDetail = createAsyncThunk(
   }
 );
 
+export const clearAllExecutions = createAsyncThunk(
+  'executions/clearAll',
+  async (_, { rejectWithValue }) => {
+    try {
+      if (!window.electronAPI?.clearExecutions) {
+        throw new Error('Không hỗ trợ xóa lịch sử — hãy khởi động lại app');
+      }
+      return await window.electronAPI.clearExecutions();
+    } catch (error) {
+      return rejectWithValue(error.message);
+    }
+  }
+);
+
 // =============================================================================
 // Slice
 // =============================================================================
@@ -83,102 +97,100 @@ export const fetchExecutionDetail = createAsyncThunk(
 const executionSlice = createSlice({
   name: 'executions',
   initialState: {
-    /** @type {Array<Object>} Danh sách lịch sử thực thi */
+    /** @type {Array<Object>} Danh sách lịch sử thực thi đã hoàn thành */
     items: [],
+    /** @type {Object} Map executionId → live state (cho multitask) */
+    runningExecutions: {},
     /** @type {Object|null} Thực thi đang được xem chi tiết */
     currentExecution: null,
-    /** @type {boolean} Có tiến trình thực thi đang chạy không */
-    isRunning: false,
     /** @type {boolean} Trạng thái đang tải dữ liệu */
     loading: false,
-    /** @type {string|null} Thông báo lỗi */
+    /** @type {string|null} Thông báo lỗi gần nhất */
     error: null,
-
-    /**
-     * @type {Object|null} Telemetry realtime từ ExecutorService.
-     * Được cập nhật mỗi khi Main Process gửi 'rpa:execution-status'.
-     * Cấu trúc: { type, executionId, stepIndex, totalSteps, actionType, ... }
-     */
+    /** @type {Object|null} Telemetry event cuối cùng (dùng cho toast) */
     liveStatus: null,
   },
   reducers: {
-    /** Xóa thực thi đang chọn */
     clearCurrentExecution: (state) => {
       state.currentExecution = null;
     },
-    /** Set trạng thái đang chạy */
-    setRunning: (state, action) => {
-      state.isRunning = action.payload;
-    },
-    /**
-     * updateExecutionStatus — Cập nhật telemetry realtime từ Main Process.
-     *
-     * Reducer này được gọi từ listener trong App component khi nhận được
-     * event 'rpa:execution-status' từ window.electronAPI.onExecutionUpdate().
-     *
-     * @param {Object} action.payload - Telemetry payload từ ExecutorService.
-     *   Ví dụ: { type: 'step:completed', executionId, stepIndex, ... }
-     */
+    // kept for backward compat
+    setRunning: () => {},
     updateExecutionStatus: (state, action) => {
       const status = action.payload;
       state.liveStatus = status;
+      const eid = status.executionId;
 
-      // Cập nhật isRunning dựa trên loại telemetry
       switch (status.type) {
         case 'execution:started':
-          state.isRunning = true;
           state.error = null;
+          if (eid) {
+            state.runningExecutions[eid] = {
+              id: eid,
+              scenario_id: status.scenarioId,
+              scenario_name: status.scenarioName,
+              status: 'running',
+              total_steps: status.totalSteps || 0,
+              completed_steps: 0,
+              started_at: status.timestamp || new Date().toISOString(),
+            };
+          }
           break;
 
         case 'step:completed':
-          // Cập nhật step hiện tại vào currentExecution nếu đang xem
-          if (state.currentExecution && state.currentExecution.id === status.executionId) {
+          if (eid && state.runningExecutions[eid]) {
+            state.runningExecutions[eid].completed_steps = status.completedSteps ?? 0;
+          }
+          if (state.currentExecution?.id === eid) {
             state.currentExecution.completedSteps = status.completedSteps;
           }
           break;
 
         case 'step:failed':
-          // Lỗi step — vẫn đang chạy (không dừng)
           break;
 
-        case 'execution:completed':
-          state.isRunning = false;
-          // Tự động thêm vào lịch sử
+        case 'execution:completed': {
+          const running = state.runningExecutions[eid];
+          if (eid) delete state.runningExecutions[eid];
           state.items.unshift({
-            id: status.executionId,
+            id: eid,
             scenario_id: status.scenarioId,
             scenario_name: status.scenarioName,
-            status: status.failedSteps > 0 ? 'completed_with_errors' : 'completed',
+            variable_profile_name: running?.variable_profile_name ?? null,
+            status: (status.failedSteps ?? 0) > 0 ? 'completed_with_errors' : 'completed',
             total_steps: status.totalSteps,
             completed_steps: status.completedSteps,
             failed_steps: status.failedSteps,
-            started_at: new Date(Date.now() - status.durationMs).toISOString(),
+            started_at: running?.started_at || new Date(Date.now() - (status.durationMs || 0)).toISOString(),
             finished_at: new Date().toISOString(),
             duration_ms: status.durationMs,
-            errors: status.errors,
           });
           break;
+        }
 
-        case 'execution:failed':
-          state.isRunning = false;
+        case 'execution:failed': {
+          const running = state.runningExecutions[eid];
+          if (eid) delete state.runningExecutions[eid];
           state.error = status.error;
           state.items.unshift({
-            id: status.executionId || `failed-${Date.now()}`,
+            id: eid || `failed-${Date.now()}`,
             scenario_id: status.scenarioId,
             scenario_name: status.scenarioName || 'N/A',
+            variable_profile_name: running?.variable_profile_name ?? null,
             status: 'failed',
             total_steps: status.totalSteps || 0,
             completed_steps: status.completedSteps ?? Math.max(0, (status.stepIndex || 1) - 1),
             failed_steps: 1,
             failed_step_index: status.stepIndex,
-            started_at: status.startedAt || new Date().toISOString(),
+            started_at: running?.started_at || status.startedAt || new Date().toISOString(),
             finished_at: new Date().toISOString(),
             error_message: status.error,
           });
           break;
+        }
 
         case 'execution:cancelled':
-          state.isRunning = false;
+          if (eid) delete state.runningExecutions[eid];
           break;
 
         default:
@@ -217,6 +229,22 @@ const executionSlice = createSlice({
       // ===== fetchExecutionDetail =====
       .addCase(fetchExecutionDetail.fulfilled, (state, action) => {
         state.currentExecution = action.payload;
+      })
+
+      // ===== clearAllExecutions =====
+      .addCase(clearAllExecutions.pending, (state) => {
+        state.loading = true;
+      })
+      .addCase(clearAllExecutions.fulfilled, (state) => {
+        state.loading = false;
+        state.items = [];
+        state.currentExecution = null;
+        state.error = null;
+        // Keep runningExecutions intact — they are live tasks still in progress
+      })
+      .addCase(clearAllExecutions.rejected, (state, action) => {
+        state.loading = false;
+        state.error = action.payload;
       });
   },
 });

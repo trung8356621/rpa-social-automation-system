@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import DatabaseService from './database/DatabaseService.js';
 import BrowserProfileService from './browser/BrowserProfileService.js';
-import { initExecutorService, getExecutorService } from './rpa/ExecutorService.js';
+import { ExecutorService } from './rpa/ExecutorService.js';
 import { initRecorderService } from './rpa/RecorderService.js';
 
 // __dirname equivalent trong ESM:
@@ -106,32 +106,7 @@ function registerDatabaseHandlers() {
     return dbService.deleteProxy(id);
   });
 
-  // ===== Profile Handlers =====
-
-  /**
-   * Lấy danh sách tất cả profile (JOIN proxy để có proxy_name).
-   * Renderer gọi: window.electronAPI.getProfiles()
-   */
-  ipcMain.handle('db:get-profiles', () => {
-    return dbService.getProfiles();
-  });
-
-  /**
-   * Lưu hoặc cập nhật một profile.
-   * Renderer gọi: window.electronAPI.saveProfile(profile)
-   * Payload nhận: { profile: {...} }
-   */
-  ipcMain.handle('db:save-profile', (_event, { profile }) => {
-    return dbService.saveProfile(profile);
-  });
-
-  /**
-   * Xóa profile theo ID.
-   * Renderer gọi: window.electronAPI.deleteProfile(id)
-   */
-  ipcMain.handle('db:delete-profile', (_event, id) => {
-    return dbService.deleteProfile(id);
-  });
+  // ===== Browser Profile Handlers =====
 
   ipcMain.handle('db:get-browser-profiles', () => {
     return dbService.getBrowserProfiles();
@@ -273,6 +248,10 @@ function registerDatabaseHandlers() {
     return dbService.getExecutionLogById(id);
   });
 
+  ipcMain.handle('db:clear-executions', () => {
+    return dbService.deleteAllExecutionLogs();
+  });
+
   ipcMain.handle('db:get-scenario-variables', (_event, scenarioId) => {
     return dbService.getScenarioVariables(scenarioId);
   });
@@ -285,8 +264,28 @@ function registerDatabaseHandlers() {
     return dbService.deleteScenarioVariable(id);
   });
 
-  ipcMain.handle('db:import-profile-variables', (_event, payload) => {
-    return dbService.importProfileVariables(payload);
+  ipcMain.handle('db:get-variable-profiles', (_event, scenarioId) => {
+    return dbService.getVariableProfiles(scenarioId);
+  });
+
+  ipcMain.handle('db:get-variable-profile', (_event, profileId) => {
+    return dbService.getVariableProfileById(profileId);
+  });
+
+  ipcMain.handle('db:save-variable-profile', (_event, profile) => {
+    return dbService.saveVariableProfile(profile);
+  });
+
+  ipcMain.handle('db:delete-variable-profile', (_event, id) => {
+    return dbService.deleteVariableProfile(id);
+  });
+
+  ipcMain.handle('db:save-profile-variable-values', (_event, payload) => {
+    return dbService.saveProfileVariableValues(payload?.profileId, payload?.values || []);
+  });
+
+  ipcMain.handle('db:build-resolved-variables', (_event, payload) => {
+    return dbService.buildResolvedVariables(payload?.scenarioId, payload?.profileId || null);
   });
 
   ipcMain.handle('scenario:start-recording', async (_event, payload) => {
@@ -351,25 +350,44 @@ function registerDatabaseHandlers() {
    * khi có module campaign hoàn chỉnh, sẽ load campaign_profiles
    * và lặp qua từng profile.
    */
+  // Pool of active executors — each task gets its own instance for true parallel execution.
+  const activeExecutors = new Map();
+
   ipcMain.on('rpa:start-campaign', async (_event, payload) => {
     const scenarioId = typeof payload === 'string' ? payload : payload?.scenarioId;
     const browserProfileId = typeof payload === 'object' ? payload?.browserProfileId || null : null;
+    const variableProfileId = typeof payload === 'object' ? payload?.variableProfileId || null : null;
+    const headless = typeof payload === 'object' ? Boolean(payload?.headless) : false;
     if (!scenarioId) {
       console.error('[Main] Thiếu scenarioId khi chạy kịch bản');
       return;
     }
 
-    console.log(`[Main] Nhận lệnh chạy kịch bản: ${scenarioId}, browser: ${browserProfileId || 'guest'}`);
-    try {
-      const executor = getExecutorService();
-      const result = await executor.startScenario(scenarioId, {
-        executionId: crypto.randomUUID(),
-        browserProfileId,
-      });
-      console.log('[Main] Thực thi hoàn tất:', result);
-    } catch (err) {
-      console.error('[Main] Lỗi thực thi:', err.message);
-    }
+    const executionId = crypto.randomUUID();
+    const executor = new ExecutorService({
+      dbService,
+      browserProfileService,
+      appDataPath: app.getPath('userData'),
+      cacheRoot: path.join(app.getPath('userData'), 'cache'),
+      sendTelemetry: (telemetryPayload) => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('rpa:execution-status', telemetryPayload);
+        }
+      },
+    });
+
+    activeExecutors.set(executionId, executor);
+    console.log(`[Main] Bắt đầu thực thi ${executionId}: kịch bản=${scenarioId}, headless=${headless}`);
+
+    executor.startScenario(scenarioId, {
+      executionId,
+      browserProfileId,
+      variableProfileId,
+      headless,
+    })
+      .then((result) => console.log(`[Main] Thực thi ${executionId} hoàn tất:`, result))
+      .catch((err) => console.error(`[Main] Lỗi thực thi ${executionId}:`, err.message))
+      .finally(() => activeExecutors.delete(executionId));
   });
 }
 
@@ -409,10 +427,15 @@ async function readAllowedFrameAsDataUrl(filePath) {
     throw new Error('Frame path is outside allowed storage.');
   }
 
-  const data = await fs.readFile(resolvedFilePath);
-  const ext = path.extname(resolvedFilePath).toLowerCase();
-  const mime = ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : 'image/png';
-  return `data:${mime};base64,${data.toString('base64')}`;
+  try {
+    const data = await fs.readFile(resolvedFilePath);
+    const ext = path.extname(resolvedFilePath).toLowerCase();
+    const mime = ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : 'image/png';
+    return `data:${mime};base64,${data.toString('base64')}`;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
 }
 
 function registerCacheProtocol() {
@@ -496,15 +519,7 @@ app.whenReady().then(() => {
 
   createWindow();
 
-  // ===== Khởi tạo ExecutorService =====
-  // Cần mainWindow đã được tạo để gửi telemetry về Renderer
-  initExecutorService({
-    dbService,
-    browserProfileService,
-    mainWindow,
-    appDataPath: app.getPath('userData'),
-  });
-  console.log('[Main] ExecutorService đã sẵn sàng');
+  // ExecutorService instances are now created per-execution in the rpa:start-campaign handler.
 
   // macOS: tạo lại cửa sổ khi click vào dock icon
   app.on('activate', () => {
