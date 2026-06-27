@@ -10,8 +10,8 @@ import ExecutionsPage from './pages/ExecutionsPage';
 import HistoryPage from './pages/HistoryPage';
 import SettingsPage from './pages/SettingsPage';
 import BrowserProfilesPage from './pages/BrowserProfilesPage';
+import DataProfilesPage from './pages/DataProfilesPage';
 import ProxiesView from './views/ProxiesView';
-import ProfilesView from './views/ProfilesView';
 
 /**
  * useExecutionListener — Custom hook lắng nghe telemetry thực thi từ Main Process.
@@ -77,8 +77,8 @@ export default function App() {
         return <HistoryPage />;
       case 'proxies':
         return <ProxiesView />;
-      case 'profiles':
-        return <ProfilesView />;
+      case 'dataProfiles':
+        return <DataProfilesPage />;
       case 'browserProfiles':
         return <BrowserProfilesPage />;
       case 'settings':
@@ -91,7 +91,7 @@ export default function App() {
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-[#111827] text-[#eef2f7]">
       <Sidebar />
-      <main className="min-w-0 flex-1 overflow-y-auto">
+      <main className="min-w-0 flex-1 overflow-x-hidden overflow-y-auto">
         {renderPage()}
       </main>
       <Toast />

@@ -151,12 +151,124 @@ class BrowserProfileService {
     };
   }
 
+  resolveSessionUserDataDir(scenarioId, browserProfileId) {
+    const settings = this.dbService.getSettings();
+    const browserDataRoot = settings['browser.userDataDir'] || path.join(this.appDataPath, 'browser-data');
+
+    if (browserProfileId) {
+      const profile = this.dbService.getBrowserProfileById(browserProfileId);
+      if (profile?.import_path) {
+        fs.mkdirSync(path.join(profile.import_path, 'Default'), { recursive: true });
+        return profile.import_path;
+      }
+      throw new Error('Không tìm thấy thư mục profile trong app');
+    }
+
+    if (!scenarioId) {
+      throw new Error('Chọn kịch bản để dùng guest session');
+    }
+
+    const sessionDir = path.join(browserDataRoot, 'guest', 'sessions', scenarioId);
+    fs.mkdirSync(path.join(sessionDir, 'Default'), { recursive: true });
+    return sessionDir;
+  }
+
+  resolveSessionStartUrl(startUrl) {
+    const url = String(startUrl || '').trim();
+    if (!url) return null;
+
+    try {
+      const parsed = new URL(url);
+      if (parsed.pathname.includes('wp-login.php')) {
+        return `${parsed.origin}/wp-admin/`;
+      }
+      return url;
+    } catch {
+      return url;
+    }
+  }
+
+  async waitForProfileUnlock(userDataDir, maxWaitMs = 30000) {
+    if (!userDataDir) return;
+
+    const lockPath = path.join(userDataDir, 'SingletonLock');
+    const started = Date.now();
+
+    while (Date.now() - started < maxWaitMs) {
+      if (!fs.existsSync(lockPath)) return;
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+  }
+
+  getSessionCloseDelayMs() {
+    const settings = this.dbService.getSettings();
+    const configured = Number(settings['execution.browserCloseDelayMs']);
+    if (!Number.isFinite(configured)) return 5000;
+    return Math.min(120000, Math.max(1000, Math.round(configured)));
+  }
+
+  async gracefulCloseBrowser(browser, _userDataDir, page = null) {
+    if (!browser?.isConnected?.()) return;
+
+    const delayMs = this.getSessionCloseDelayMs();
+    if (delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+
+    // Close the active page to trigger unload/beforeunload so Chrome flushes
+    // pending writes (cookies WAL, localStorage, IndexedDB) before exit.
+    const activePage = (page && !page.isClosed())
+      ? page
+      : (await browser.pages().catch(() => []))[0];
+    if (activePage && !activePage.isClosed()) {
+      await activePage.close().catch(() => {});
+    }
+
+    const chromeProcess = browser.process?.() ?? null;
+
+    try {
+      await browser.close();
+    } catch {
+      // Browser may already be closed.
+    }
+
+    // Wait for Chrome to fully exit before returning — ensures the SQLite WAL
+    // (Default/Cookies) has been checkpointed and data is on disk.
+    if (chromeProcess) {
+      await new Promise((resolve) => {
+        if (chromeProcess.exitCode !== null) { resolve(); return; }
+        const timer = setTimeout(resolve, 15000);
+        chromeProcess.once('exit', () => { clearTimeout(timer); resolve(); });
+      });
+    }
+  }
+
+  async openBrowserSession({ scenarioId, browserProfileId = null, startUrl = null }) {
+    const userDataDir = this.resolveSessionUserDataDir(scenarioId, browserProfileId);
+    await this.waitForProfileUnlock(userDataDir);
+    const effectiveStartUrl = this.resolveSessionStartUrl(startUrl);
+    const result = await this._launchPuppeteerWithProfile(userDataDir, effectiveStartUrl);
+    return {
+      ...result,
+      browserProfileId: browserProfileId || null,
+      scenarioId: scenarioId || null,
+      startUrl: effectiveStartUrl,
+    };
+  }
+
+  async openGuestBrowser() {
+    throw new Error('Dùng openBrowserSession với scenarioId thay cho guest browser riêng');
+  }
+
   async openAppBrowserProfile(profile) {
     const userDataDir = profile?.import_path;
     if (!userDataDir || !fs.existsSync(userDataDir)) {
       throw new Error('Không tìm thấy thư mục profile trong app');
     }
+    return this._launchPuppeteerWithProfile(userDataDir, null);
+  }
 
+  async _launchPuppeteerWithProfile(userDataDir, startUrl = null) {
     const settings = this.dbService.getSettings();
     const viewportWidth = Number(settings['browser.viewportWidth']) || 1280;
     const viewportHeight = Number(settings['browser.viewportHeight']) || 720;
@@ -177,10 +289,20 @@ class BrowserProfileService {
     });
 
     try {
-      const page = await browser.newPage();
-      await page.goto('about:blank', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+      const pages = await browser.pages();
+      const page = pages[0] || await browser.newPage();
+      for (const extraPage of pages.slice(1)) {
+        await extraPage.close().catch(() => {});
+      }
+
+      // Chromium persists cookies natively via userDataDir — no manual restore needed.
+      const url = String(startUrl || '').trim();
+      if (url) {
+        const effectiveUrl = this.resolveSessionStartUrl(url) || url;
+        await page.goto(effectiveUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+      }
     } catch {
-      // Browser van mo, bo qua loi dieu huong
+      // Browser vẫn mở, bỏ qua lỗi điều hướng
     }
 
     return {

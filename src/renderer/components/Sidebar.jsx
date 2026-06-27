@@ -1,90 +1,113 @@
-import React from 'react';
+import React, { useState } from 'react';
+import { createPortal } from 'react-dom';
 import { useDispatch, useSelector } from 'react-redux';
 import { setCurrentPage } from '../slices/uiSlice';
 import {
   Bot,
-  ChevronLeft,
-  ChevronRight,
-  History,
+  Database,
   Globe,
   LayoutDashboard,
   PlayCircle,
   ScrollText,
   Settings,
   Shield,
-  Users,
 } from 'lucide-react';
 
 const navItems = [
   { id: 'dashboard', label: 'Tổng quan', icon: LayoutDashboard },
   { id: 'proxies', label: 'Proxy', icon: Shield },
   { id: 'browserProfiles', label: 'Browser', icon: Globe },
-  { id: 'profiles', label: 'Tài khoản', icon: Users },
+  { id: 'dataProfiles', label: 'Hồ sơ', icon: Database },
   { id: 'scenarios', label: 'Kịch bản', icon: ScrollText },
   { id: 'executions', label: 'Thực thi', icon: PlayCircle },
-  { id: 'history', label: 'Lịch sử', icon: History },
   { id: 'settings', label: 'Cài đặt', icon: Settings },
 ];
 
-export default function Sidebar() {
-  const dispatch = useDispatch();
-  const { sidebarOpen, currentPage } = useSelector((state) => state.ui);
+function NavItem({ item, isActive, onClick, onMouseEnter, onMouseLeave, onFocus, onBlur }) {
+  const Icon = item.icon;
 
   return (
-    <aside
-      className={`h-full shrink-0 border-r border-[#2e3b4e] bg-[#151f2d] transition-all duration-200 ${
-        sidebarOpen ? 'w-64' : 'w-[72px]'
+    <button
+      type="button"
+      onClick={onClick}
+      onMouseEnter={onMouseEnter}
+      onMouseLeave={onMouseLeave}
+      onFocus={onFocus}
+      onBlur={onBlur}
+      className={`flex h-10 w-full items-center justify-center rounded-lg transition-colors ${
+        isActive
+          ? 'bg-[#2f80ed] text-white shadow-sm shadow-[#2f80ed]/30'
+          : 'text-[#9aa7b7] hover:bg-[#202b3a] hover:text-white'
       }`}
     >
-      <div className="flex h-full flex-col">
-        <div className="flex h-16 items-center gap-3 border-b border-[#2e3b4e] px-4">
-          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-[#2f80ed] text-white">
-            <Bot className="h-5 w-5" />
-          </div>
-          {sidebarOpen && (
-            <div className="min-w-0">
-              <div className="truncate text-sm font-bold text-white">RPA Social</div>
-              <div className="truncate text-xs text-[#9aa7b7]">Automation console</div>
+      <Icon className="h-5 w-5 shrink-0" />
+    </button>
+  );
+}
+
+function SidebarTooltip({ tip }) {
+  if (!tip) return null;
+
+  return createPortal(
+    <div
+      role="tooltip"
+      className="pointer-events-none fixed z-[9999] -translate-y-1/2 whitespace-nowrap rounded-md border border-[#3d5068] bg-[#1a2433] px-2.5 py-1.5 text-xs font-medium text-[#e8eef7] shadow-xl shadow-black/50"
+      style={{ top: tip.top, left: tip.left }}
+    >
+      {tip.label}
+      <span className="absolute -left-1 top-1/2 h-2 w-2 -translate-y-1/2 rotate-45 border-b border-l border-[#3d5068] bg-[#1a2433]" />
+    </div>,
+    document.body,
+  );
+}
+
+export default function Sidebar() {
+  const dispatch = useDispatch();
+  const { currentPage } = useSelector((state) => state.ui);
+  const [hoverTip, setHoverTip] = useState(null);
+
+  const showTip = (event, label) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    setHoverTip({
+      label,
+      top: rect.top + rect.height / 2,
+      left: rect.right + 10,
+    });
+  };
+
+  const hideTip = () => setHoverTip(null);
+
+  return (
+    <>
+      <aside className="relative z-30 h-full w-[72px] shrink-0 border-r border-[#2e3b4e] bg-[#151f2d]">
+        <div className="flex h-full flex-col">
+          <div className="flex h-16 items-center justify-center border-b border-[#2e3b4e]">
+            <div
+              className="flex h-10 w-10 items-center justify-center rounded-lg bg-[#2f80ed] text-white"
+              onMouseEnter={(event) => showTip(event, 'RPA Social')}
+              onMouseLeave={hideTip}
+            >
+              <Bot className="h-5 w-5" />
             </div>
-          )}
-        </div>
+          </div>
 
-        <nav className="flex-1 space-y-1 overflow-y-auto px-3 py-4">
-          {navItems.map((item) => {
-            const Icon = item.icon;
-            const isActive = currentPage === item.id;
-
-            return (
-              <button
+          <nav className="flex-1 space-y-1 overflow-y-auto px-3 py-4">
+            {navItems.map((item) => (
+              <NavItem
                 key={item.id}
-                type="button"
-                title={sidebarOpen ? undefined : item.label}
+                item={item}
+                isActive={currentPage === item.id}
                 onClick={() => dispatch(setCurrentPage(item.id))}
-                className={`flex h-10 w-full items-center gap-3 rounded-lg px-3 text-sm font-medium transition-colors ${
-                  isActive
-                    ? 'bg-[#2f80ed] text-white'
-                    : 'text-[#9aa7b7] hover:bg-[#202b3a] hover:text-white'
-                } ${sidebarOpen ? 'justify-start' : 'justify-center'}`}
-              >
-                <Icon className="h-5 w-5 shrink-0" />
-                {sidebarOpen && <span className="truncate">{item.label}</span>}
-              </button>
-            );
-          })}
-        </nav>
-
-        <div className="border-t border-[#2e3b4e] p-3">
-          <button
-            type="button"
-            onClick={() => dispatch({ type: 'ui/toggleSidebar' })}
-            className="btn-ghost h-10 w-full px-0"
-            title={sidebarOpen ? 'Thu gọn' : 'Mở rộng'}
-          >
-            {sidebarOpen ? <ChevronLeft className="h-5 w-5" /> : <ChevronRight className="h-5 w-5" />}
-            {sidebarOpen && <span>Thu gọn</span>}
-          </button>
+                onMouseEnter={(event) => showTip(event, item.label)}
+                onMouseLeave={hideTip}
+                onFocus={(event) => showTip(event, item.label)}
+                onBlur={hideTip}
+              />
+            ))}
+          </nav>
         </div>
-      </div>
-    </aside>
+      </aside>
+      <SidebarTooltip tip={hoverTip} />
+    </>
   );
 }

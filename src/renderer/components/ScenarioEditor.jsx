@@ -2,6 +2,7 @@
 import { useDispatch } from 'react-redux';
 import {
   ArrowLeft,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   CircleDot,
@@ -10,7 +11,9 @@ import {
   Eye,
   FileDown,
   FolderOpen,
+  Info,
   KeyRound,
+  Keyboard,
   ListPlus,
   PanelRightClose,
   PanelRightOpen,
@@ -23,11 +26,14 @@ import {
   Square,
   Timer,
   Trash2,
-  Type,
   Upload,
   X,
 } from 'lucide-react';
 import { setCurrentPage, showToast } from '../slices/uiSlice';
+import VariableInput from './VariableInput';
+import ScenarioVariablesBar from './ScenarioVariablesBar';
+import DataProfileSelect, { readStoredDataProfileId } from './DataProfileSelect';
+import { normalizeActionType } from '../utils/variables';
 
 const DEFAULT_ACTION_DELAY_MS = 300;
 const MAX_UNDO_STEPS = 20;
@@ -39,6 +45,51 @@ function IconOnly({ icon: Icon, label, ...props }) {
     <button type="button" className="icon-button h-9 w-9 text-[#9aa7b7]" title={label} {...props}>
       <Icon className="h-4 w-4" />
     </button>
+  );
+}
+
+function PanelSectionHeader({ icon: Icon, title, trailing, onToggle, open }) {
+  const TitleTag = onToggle ? 'button' : 'span';
+  return (
+    <div className="flex h-8 shrink-0 items-center justify-between border-b border-[#2a2d34] px-3 text-[11px] font-bold uppercase text-[#7288ff]">
+      <TitleTag
+        type={onToggle ? 'button' : undefined}
+        onClick={onToggle}
+        className={`inline-flex min-w-0 items-center gap-2 ${onToggle ? 'hover:text-white' : ''}`}
+      >
+        {onToggle && (
+          <ChevronRight className={`h-3.5 w-3.5 shrink-0 transition ${open ? 'rotate-90' : ''}`} />
+        )}
+        {Icon && <Icon className="h-3.5 w-3.5 shrink-0" />}
+        <span className="truncate">{title}</span>
+      </TitleTag>
+      {trailing && <div className="ml-2 shrink-0">{trailing}</div>}
+    </div>
+  );
+}
+
+const ACTION_BUTTONS = [
+  { actionType: 'navigate', icon: ExternalLink, label: 'Đi tới URL' },
+  { actionType: 'click', icon: MousePointer2, label: 'Click' },
+  { actionType: 'input', icon: Keyboard, label: 'Input' },
+  { actionType: 'wait', icon: Timer, label: 'Wait' },
+];
+
+function ActionIconBar({ onAddStep }) {
+  return (
+    <div className="flex w-10 shrink-0 flex-col items-center gap-1 border-r border-[#2a2d34] bg-[#15171d] py-2">
+      {ACTION_BUTTONS.map(({ actionType, icon: ActionIcon, label }) => (
+        <button
+          key={actionType}
+          type="button"
+          onClick={() => onAddStep(actionType)}
+          className="flex h-9 w-9 items-center justify-center rounded text-[#9aa7b7] transition hover:bg-[#1c2130] hover:text-white"
+          title={label}
+        >
+          <ActionIcon className="h-4 w-4" />
+        </button>
+      ))}
+    </div>
   );
 }
 
@@ -65,6 +116,7 @@ function Field({ label, value, className = '' }) {
 const defaultConfig = {
   navigate: { url: '' },
   click: { selector: '' },
+  input: { selector: '', text: '' },
   type: { selector: '', text: '' },
   wait: { duration: 2000 },
 };
@@ -83,10 +135,11 @@ const defaultUrl = (platform) => {
 
 function createStep(actionType, overrides = {}) {
   const now = Date.now();
+  const normalizedType = normalizeActionType(actionType);
   return {
     id: crypto.randomUUID ? crypto.randomUUID() : `${now}-${Math.random().toString(36).slice(2, 9)}`,
-    action_type: actionType,
-    target_anchor: { action_config: defaultConfig[actionType] || {} },
+    action_type: normalizedType,
+    target_anchor: { action_config: defaultConfig[normalizedType] || defaultConfig[actionType] || {} },
     delay_ms: DEFAULT_ACTION_DELAY_MS,
     created_at: new Date().toISOString(),
     ...overrides,
@@ -105,6 +158,7 @@ function normalizeSteps(steps) {
   if (!steps || !Array.isArray(steps)) return [];
   return steps.map((step, idx) => ({
     ...step,
+    action_type: normalizeActionType(step.action_type),
     delay_ms: Number(step.delay_ms) || DEFAULT_ACTION_DELAY_MS,
     order: idx,
     target_anchor: parseJsonObject(step.target_anchor),
@@ -335,6 +389,7 @@ function describeStep(actionType, config) {
   const descriptions = {
     navigate: 'Điều hướng đến trang web',
     click: 'Click vào phần tử trên trang',
+    input: 'Nhập văn bản vào ô input',
     type: 'Nhập văn bản vào ô input',
     wait: 'Chờ trong một khoảng thời gian',
     waitForElement: 'Chờ phần tử xuất hiện',
@@ -355,7 +410,8 @@ function getAction(actionType) {
   const icons = {
     navigate: ArrowLeft,
     click: MousePointer2,
-    type: Type,
+    input: Keyboard,
+    type: Keyboard,
     wait: Timer,
     waitForElement: Eye,
     screenshot: SquareCode,
@@ -365,7 +421,7 @@ function getAction(actionType) {
     login: KeyRound,
     facebookPost: Share2,
     like: Plus,
-    comment: Type,
+    comment: Keyboard,
     customScript: Code2,
   };
   return icons[actionType] || CircleDot;
@@ -428,7 +484,7 @@ function StepCard({ step, index, isSelected, onSelect, onDelete, onUpdate }) {
           <div className="mt-0.5 truncate text-[10px] text-[#9aa7b7]">{selector}</div>
         )}
 
-        {step.action_type === 'type' && (
+        {(['input', 'type'].includes(step.action_type)) && (
           <div className="mt-0.5 truncate text-[10px] text-[#9aa7b7]">
             {selector ? `${selector} \u2192 ` : ''}{text ? `"${text}"` : ''}
           </div>
@@ -454,8 +510,7 @@ function ScenarioInfoPanel({
   description,
   platform,
   targetUrl,
-  browserProfileId,
-  browserProfiles,
+  variables,
   onScenarioChange,
 }) {
   return (
@@ -478,28 +533,12 @@ function ScenarioInfoPanel({
 
       <label className="block">
         <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">URL chính</span>
-        <input
+        <VariableInput
           value={targetUrl || ''}
-          onChange={(event) => onScenarioChange({ nextTargetUrl: event.target.value })}
-          className="input-field h-9"
-          placeholder="https://..."
+          onChange={(value) => onScenarioChange({ nextTargetUrl: value })}
+          variables={variables}
+          placeholder="https://... hoặc {{variable}}"
         />
-      </label>
-
-      <label className="col-span-2 block">
-        <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">Browser khi Record</span>
-        <select
-          value={browserProfileId || ''}
-          onChange={(event) => onScenarioChange({ nextBrowserProfileId: event.target.value || null })}
-          className="select-field h-9"
-        >
-          <option value="">Guest (không lưu profile)</option>
-          {browserProfiles.map((profile) => (
-            <option key={profile.id} value={profile.id}>
-              {profile.display_name}
-            </option>
-          ))}
-        </select>
       </label>
 
       <label className="col-span-2 block">
@@ -517,6 +556,7 @@ function ScenarioInfoPanel({
 
 function StepEditPanel({
   selectedStep,
+  variables,
   onStepChange,
 }) {
   const config = selectedStep?.action_config || {};
@@ -546,61 +586,69 @@ function StepEditPanel({
   };
 
   return (
-    <div className="max-h-[42vh] overflow-y-auto pr-1">
+    <div className="min-h-0 flex-1 overflow-y-auto pr-1">
       <div className="grid grid-cols-2 gap-3">
         {selectedStep ? (
           <>
-            <label className="col-span-2 block">
+            <label className="block">
               <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">Loại bước</span>
               <select
-                value={selectedStep.action_type}
-                onChange={(event) => onStepChange({
-                  action_type: event.target.value,
-                  action_config: defaultConfig[event.target.value] || {},
-                  target_anchor: {
-                    ...(selectedStep.target_anchor || {}),
-                    action_config: defaultConfig[event.target.value] || {},
-                  },
-                })}
+                value={normalizeActionType(selectedStep.action_type)}
+                onChange={(event) => {
+                  const nextType = normalizeActionType(event.target.value);
+                  onStepChange({
+                    action_type: nextType,
+                    action_config: defaultConfig[nextType] || {},
+                    target_anchor: {
+                      ...(selectedStep.target_anchor || {}),
+                      action_config: defaultConfig[nextType] || {},
+                    },
+                  });
+                }}
                 className="select-field h-9"
               >
                 <option value="navigate">Đi tới URL</option>
                 <option value="click">Click</option>
-                <option value="type">Type</option>
+                <option value="input">Input</option>
                 <option value="wait">Wait</option>
               </select>
             </label>
 
-            <label className="col-span-2 block">
+            <label className="block">
               <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">
                 {selectedStep.action_type === 'navigate' ? 'URL' : 'Selector'}
               </span>
-              <input
-                value={
-                  selectedStep.action_type === 'navigate'
-                    ? config.url || ''
-                    : config.selector || selectedStep.target_anchor?.selector_value || ''
-                }
-                onChange={(event) => updateSelector(event.target.value)}
-                className="input-field h-9"
-                placeholder={selectedStep.action_type === 'navigate' ? 'https://example.com' : 'CSS selector, aria label hoặc text'}
-              />
+              {selectedStep.action_type === 'navigate' ? (
+                <VariableInput
+                  value={config.url || ''}
+                  onChange={(value) => updateSelector(value)}
+                  variables={variables}
+                  placeholder="https://example.com hoặc {{variable}}"
+                />
+              ) : (
+                <input
+                  value={config.selector || selectedStep.target_anchor?.selector_value || ''}
+                  onChange={(event) => updateSelector(event.target.value)}
+                  className="input-field h-9"
+                  placeholder="CSS selector, aria label hoặc text"
+                />
+              )}
             </label>
 
-            {selectedStep.action_type === 'type' && (
+            {(['input', 'type'].includes(selectedStep.action_type)) && (
               <label className="col-span-2 block">
                 <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">Text nhập</span>
-                <input
+                <VariableInput
                   value={config.text || ''}
-                  onChange={(event) => updateActionConfig({ text: event.target.value })}
-                  className="input-field h-9"
-                  placeholder="Nội dung cần nhập hoặc {{variable}}"
+                  onChange={(value) => updateActionConfig({ text: value })}
+                  variables={variables}
+                  placeholder="Nội dung hoặc {{variable}}"
                 />
               </label>
             )}
 
             {selectedStep.action_type === 'wait' && (
-              <label className="col-span-2 block">
+              <label className="block">
                 <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">Thời gian chờ</span>
                 <input
                   type="number"
@@ -768,6 +816,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
   const [inspectorOpen, setInspectorOpen] = useState(true);
   const [scenarioInfoOpen, setScenarioInfoOpen] = useState(true);
   const [stepEditorOpen, setStepEditorOpen] = useState(true);
+  const [timelineOpen, setTimelineOpen] = useState(true);
   const [previewPlaying, setPreviewPlaying] = useState(false);
   const [previewCurrentTime, setPreviewCurrentTime] = useState(0);
   const [scenarioPreviewPath, setScenarioPreviewPath] = useState(scenario?.preview_path || null);
@@ -780,9 +829,14 @@ export default function ScenarioEditor({ scenario, onBack }) {
   const [browserProfileId, setBrowserProfileId] = useState(scenario?.browser_profile_id || '');
   const [browserProfileOptions, setBrowserProfileOptions] = useState([]);
   const [frameDataUrls, setFrameDataUrls] = useState({});
+  const frameLoadFailedRef = useRef(new Set());
   const [manifestFrames, setManifestFrames] = useState([]);
   const [selectingTrim, setSelectingTrim] = useState(false);
   const [pendingTrimRange, setPendingTrimRange] = useState(null);
+  const [scenarioVariables, setScenarioVariables] = useState([]);
+  const [variablesRefreshKey, setVariablesRefreshKey] = useState(0);
+  const [profilesRefreshKey, setProfilesRefreshKey] = useState(0);
+  const [activeDataProfileId, setActiveDataProfileId] = useState('');
   const undoStackRef = useRef([]);
   const redoStackRef = useRef([]);
   const isApplyingHistoryRef = useRef(false);
@@ -795,6 +849,37 @@ export default function ScenarioEditor({ scenario, onBack }) {
     targetUrl: scenario?.target_url || '',
     browserProfileId: scenario?.browser_profile_id || '',
   });
+
+  const loadScenarioVariables = useCallback(async (scenarioId) => {
+    if (!scenarioId || !window.electronAPI?.getScenarioVariables) {
+      setScenarioVariables([]);
+      return;
+    }
+
+    try {
+      const items = await window.electronAPI.getScenarioVariables(scenarioId);
+      setScenarioVariables(
+        (Array.isArray(items) ? items : []).map((item) => ({
+          ...item,
+          key: item.key || item.name || '',
+        })),
+      );
+    } catch {
+      setScenarioVariables([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadScenarioVariables(currentScenarioId);
+  }, [currentScenarioId, variablesRefreshKey, loadScenarioVariables]);
+
+  useEffect(() => {
+    if (!currentScenarioId) {
+      setActiveDataProfileId('');
+      return;
+    }
+    setActiveDataProfileId(readStoredDataProfileId(currentScenarioId));
+  }, [currentScenarioId]);
 
   // ======== Derived State ========
   const hasSteps = steps.length > 0;
@@ -989,12 +1074,14 @@ export default function ScenarioEditor({ scenario, onBack }) {
       ...steps.map((step) => step.target_anchor?.associated_frame),
       ...manifestFrames.map((frame) => frame.path),
     ]
-      .filter((item) => item && !frameDataUrls[item]);
+      .filter((item) => item && !frameDataUrls[item] && !frameLoadFailedRef.current.has(item));
 
     if (!missingPaths.length || !window.electronAPI.readFrameDataUrl) return;
 
     let cancelled = false;
-    Promise.all([...new Set(missingPaths)].map(async (filePath) => {
+    const uniquePaths = [...new Set(missingPaths)];
+
+    Promise.all(uniquePaths.map(async (filePath) => {
       try {
         const dataUrl = await window.electronAPI.readFrameDataUrl(filePath);
         return dataUrl ? [filePath, dataUrl] : null;
@@ -1003,6 +1090,14 @@ export default function ScenarioEditor({ scenario, onBack }) {
       }
     })).then((entries) => {
       if (cancelled) return;
+
+      for (const filePath of uniquePaths) {
+        const loaded = entries.some((entry) => entry && entry[0] === filePath);
+        if (!loaded) {
+          frameLoadFailedRef.current.add(filePath);
+        }
+      }
+
       const next = {};
       for (const entry of entries) {
         if (entry) next[entry[0]] = entry[1];
@@ -1223,6 +1318,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
         scenarioId: currentScenarioId || undefined,
         targetUrl: latestTargetUrl || defaultUrl(latestPlatform) || 'about:blank',
         viewport: activeViewport,
+        importProfileId: resolveRecordImportProfileId(),
       });
       if (result.opened) {
         dispatch(showToast({ type: 'success', message: 'Đã mở Chromium. Đóng cửa sổ Chromium khi xong.' }));
@@ -1232,7 +1328,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
     } catch (error) {
       dispatch(showToast({ type: 'error', message: error.message || 'Không thể mở Chromium' }));
     }
-  }, [activeViewport, currentScenarioId, dispatch, platform, targetUrl]);
+  }, [activeViewport, currentScenarioId, dispatch, platform, resolveRecordImportProfileId, targetUrl]);
 
   const handleReplayAndRecord = useCallback(async () => {
     const saved = await persist();
@@ -1445,7 +1541,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
 
   // ======== Render ========
   return (
-    <div className="flex h-full min-h-0 flex-col bg-[#111216] text-[#dce5f2]">
+    <div className="flex h-full min-h-0 flex-col overflow-x-hidden bg-[#111216] text-[#dce5f2]">
       <header className="flex h-16 shrink-0 items-center justify-between border-b border-[#2a2d34] px-5">
         <div className="flex min-w-0 items-center gap-3">
           <button type="button" onClick={onBack} className="icon-button" title="Quay lại">
@@ -1466,6 +1562,21 @@ export default function ScenarioEditor({ scenario, onBack }) {
         </div>
 
         <div className="flex items-center gap-2">
+          <DataProfileSelect
+            scenarioId={currentScenarioId}
+            value={activeDataProfileId}
+            onChange={setActiveDataProfileId}
+            refreshKey={profilesRefreshKey + variablesRefreshKey}
+            className="select-field h-9 min-w-[150px] max-w-[180px] text-xs"
+          />
+          <ScenarioVariablesBar
+            scenarioId={currentScenarioId}
+            onToast={(payload) => dispatch(showToast(payload))}
+            onChanged={() => {
+              setVariablesRefreshKey((value) => value + 1);
+              setProfilesRefreshKey((value) => value + 1);
+            }}
+          />
           <IconOnly icon={FileDown} label="Xuất file" />
           <IconOnly icon={Upload} label={publishing ? 'Đang xuất...' : 'Xuất bản'} onClick={handlePublish} disabled={recording || !hasSteps || publishing} />
           <IconOnly icon={Share2} label="Chia sẻ" />
@@ -1492,12 +1603,26 @@ export default function ScenarioEditor({ scenario, onBack }) {
         </div>
       </header>
 
-      <div className="grid min-h-0 flex-1 grid-rows-[minmax(0,1fr)_190px]">
-        <div className={`grid min-h-0 ${inspectorOpen ? 'grid-cols-[minmax(420px,1fr)_minmax(420px,0.98fr)]' : 'grid-cols-[minmax(420px,1fr)_320px]'}`}>
-          <section className="flex min-h-0 flex-col border-r border-[#2a2d34]">
-            <div className="flex h-8 shrink-0 items-center justify-between border-b border-[#2a2d34] px-3 text-[11px] font-bold uppercase text-[#7288ff]">
-              <span className="inline-flex items-center gap-2"><Code2 className="h-3.5 w-3.5" />PROGRAM: VIEWPORT MONITOR</span>
-              <span className="text-[#7e8da5]">RES: {activeViewport.width} x {activeViewport.height}</span>
+      <div className={`grid min-h-0 min-w-0 flex-1 overflow-x-hidden ${timelineOpen ? 'grid-rows-[minmax(0,1fr)_190px]' : 'grid-rows-[minmax(0,1fr)]'}`}>
+        <div className={`grid min-h-0 min-w-0 overflow-x-hidden ${inspectorOpen ? 'grid-cols-[minmax(420px,1fr)_minmax(480px,1.1fr)]' : 'grid-cols-[minmax(420px,1fr)_minmax(360px,0.9fr)]'}`}>
+          <section className="flex min-h-0 min-w-0 flex-col overflow-x-hidden border-r border-[#2a2d34]">
+            <div className="flex h-8 shrink-0 items-center justify-between gap-2 border-b border-[#2a2d34] px-3">
+              <label className="flex min-w-0 flex-1 items-center gap-2">
+                <Code2 className="h-3.5 w-3.5 shrink-0 text-[#7288ff]" />
+                <select
+                  value={browserProfileId || ''}
+                  onChange={(event) => updateScenarioDraft({ nextBrowserProfileId: event.target.value || null })}
+                  className="select-field h-7 min-w-0 flex-1 text-xs"
+                >
+                  <option value="">Guest (không lưu profile)</option>
+                  {browserProfileOptions.map((profile) => (
+                    <option key={profile.id} value={profile.id}>
+                      {profile.display_name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <span className="shrink-0 text-[11px] text-[#7e8da5]">RES: {activeViewport.width} x {activeViewport.height}</span>
             </div>
 
             <div className="flex min-h-0 flex-1 flex-col p-4">
@@ -1542,177 +1667,196 @@ export default function ScenarioEditor({ scenario, onBack }) {
             </div>
           </section>
 
-          <section className="flex min-h-0 flex-col">
-            <div className="flex h-8 shrink-0 items-center justify-end border-b border-[#2a2d34] px-3">
-              <button
-                type="button"
-                onClick={() => setInspectorOpen((current) => !current)}
-                className="inline-flex items-center gap-1 rounded border border-[#3c465c] px-2 py-1 text-[10px] text-[#c7d0dc] hover:bg-[#243047]"
-              >
-                {inspectorOpen ? <PanelRightClose className="h-3 w-3" /> : <PanelRightOpen className="h-3 w-3" />}
-                {inspectorOpen ? 'Ẩn form' : 'Sửa bước'}
-              </button>
-            </div>
+          <section className="flex min-h-0 min-w-0 flex-col overflow-x-hidden bg-[#14161b]">
+            <PanelSectionHeader
+              icon={Info}
+              title="Thông tin kịch bản"
+              onToggle={() => setScenarioInfoOpen((current) => !current)}
+              open={scenarioInfoOpen}
+            />
+            {scenarioInfoOpen && (
+              <div className="shrink-0 border-b border-[#2a2d34] bg-[#15171d] p-3">
+                <ScenarioInfoPanel
+                  description={description}
+                  platform={platform}
+                  targetUrl={targetUrl}
+                  variables={scenarioVariables}
+                  onScenarioChange={updateScenarioDraft}
+                />
+              </div>
+            )}
 
-            <div className={`grid min-h-0 flex-1 ${inspectorOpen ? 'grid-rows-[auto_auto_auto_minmax(0,1fr)]' : 'grid-rows-[auto_minmax(0,1fr)]'}`}>
+            <div className={`grid min-h-0 flex-1 ${inspectorOpen ? 'grid-cols-[40px_minmax(0,1fr)_minmax(260px,300px)]' : 'grid-cols-[40px_minmax(0,1fr)]'}`}>
+              <ActionIconBar onAddStep={addStep} />
+
+              <div className="flex min-h-0 min-w-0 flex-col">
+                <PanelSectionHeader
+                  icon={FolderOpen}
+                  title="List scenario steps"
+                  trailing={(
+                    <div className="flex items-center gap-2">
+                      <span className="text-[#7e8da5]">{steps.length} steps</span>
+                      {!inspectorOpen && (
+                        <button
+                          type="button"
+                          onClick={() => setInspectorOpen(true)}
+                          className="inline-flex items-center gap-1 rounded border border-[#3c465c] px-2 py-0.5 text-[10px] font-normal normal-case text-[#c7d0dc] hover:bg-[#243047]"
+                        >
+                          <PanelRightOpen className="h-3 w-3" />
+                          Sửa bước
+                        </button>
+                      )}
+                    </div>
+                  )}
+                />
+
+                <div className="min-h-0 flex-1 space-y-2 overflow-y-auto p-3">
+                  {steps.length === 0 ? (
+                    <div className="flex h-full flex-col items-center justify-center text-center">
+                      <FolderOpen className="mb-3 h-12 w-12 text-[#4e586b]" />
+                      <p className="text-sm font-semibold text-white">Chưa có bước nào</p>
+                      <p className="mt-1 text-xs text-[#7e8da5]">Bấm Record hoặc icon bên trái để thêm bước.</p>
+                    </div>
+                  ) : (
+                    steps.map((step, idx) => (
+                      <StepCard
+                        key={step.id || idx}
+                        step={step}
+                        index={idx}
+                        isSelected={idx === selectedStepIndex}
+                        onSelect={handleSelectStep}
+                        onDelete={handleDeleteStep}
+                        onUpdate={(updates) => handleUpdateStep(idx, updates)}
+                      />
+                    ))
+                  )}
+                </div>
+              </div>
+
               {inspectorOpen && (
-              <>
-                <div className="border-b border-[#2a2d34] bg-[#15171d] p-3">
-                  <div className="rounded-md border border-[#2a2d34] bg-[#11141b]">
-                  <button
-                    type="button"
-                    onClick={() => setScenarioInfoOpen((current) => !current)}
-                    className="flex h-8 w-full items-center gap-2 border-b border-[#252b36] px-2 text-left text-[11px] font-bold uppercase text-[#8a96a8] hover:bg-[#171c25]"
-                  >
-                    <ChevronRight className={`h-3.5 w-3.5 transition ${scenarioInfoOpen ? 'rotate-90' : ''}`} />
-                    Thông tin kịch bản
-                  </button>
-                  {scenarioInfoOpen && (
-                    <div className="p-3">
-                      <ScenarioInfoPanel
-                        description={description}
-                        platform={platform}
-                        targetUrl={targetUrl}
-                        browserProfileId={browserProfileId}
-                        browserProfiles={browserProfileOptions}
-                        onScenarioChange={updateScenarioDraft}
+                <div className="flex min-h-0 min-w-0 flex-col border-l border-[#2a2d34] bg-[#15171d]">
+                  <PanelSectionHeader
+                    icon={MousePointer2}
+                    title="Sửa bước"
+                    onToggle={() => setStepEditorOpen((current) => !current)}
+                    open={stepEditorOpen}
+                    trailing={(
+                      <div className="flex items-center gap-2">
+                        <span className="max-w-[100px] truncate text-[10px] font-normal normal-case text-[#68758a]">
+                          {selectedStep ? describeStep(selectedStep.action_type) : 'Chưa chọn'}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setInspectorOpen(false)}
+                          className="inline-flex items-center gap-1 rounded border border-[#3c465c] px-2 py-0.5 text-[10px] font-normal normal-case text-[#c7d0dc] hover:bg-[#243047]"
+                        >
+                          <PanelRightClose className="h-3 w-3" />
+                          Ẩn form
+                        </button>
+                      </div>
+                    )}
+                  />
+                  {stepEditorOpen && (
+                    <div className="min-h-0 flex-1 overflow-y-auto p-3">
+                      <StepEditPanel
+                        selectedStep={selectedStep}
+                        variables={scenarioVariables}
+                        onStepChange={(updates) => {
+                          if (selectedStepIndex === null) return;
+                          handleUpdateStep(selectedStepIndex, updates);
+                        }}
                       />
                     </div>
                   )}
-                  </div>
                 </div>
-
-                <div className="border-b border-[#2a2d34] bg-[#15171d] p-3">
-                  <div className="rounded-md border border-[#2a2d34] bg-[#11141b]">
-                  <button
-                    type="button"
-                    onClick={() => setStepEditorOpen((current) => !current)}
-                    className="flex h-8 w-full items-center justify-between border-b border-[#252b36] px-2 text-left hover:bg-[#171c25]"
-                  >
-                    <span className="inline-flex items-center gap-2 text-[11px] font-bold uppercase text-[#8a96a8]">
-                      <ChevronRight className={`h-3.5 w-3.5 transition ${stepEditorOpen ? 'rotate-90' : ''}`} />
-                      Sửa bước
-                    </span>
-                    <span className="text-[10px] text-[#68758a]">{selectedStep ? describeStep(selectedStep.action_type) : 'Chưa chọn bước'}</span>
-                  </button>
-                  {stepEditorOpen && (
-                  <div className="p-3">
-                    <div className="mb-3 flex flex-wrap gap-2">
-                      {['navigate', 'click', 'type', 'wait'].map((actionType) => (
-                        <button key={actionType} type="button" onClick={() => addStep(actionType)} className="btn-secondary h-9 px-3">
-                          <Plus className="h-3.5 w-3.5" />
-                          {actionType === 'navigate' ? 'Đi tới URL' : actionType === 'click' ? 'Click' : actionType === 'type' ? 'Type' : 'Wait'}
-                        </button>
-                      ))}
-                    </div>
-                    <StepEditPanel
-                      selectedStep={selectedStep}
-                      onStepChange={(updates) => {
-                        if (selectedStepIndex === null) return;
-                        handleUpdateStep(selectedStepIndex, updates);
-                      }}
-                    />
-                  </div>
-                  )}
-                  </div>
-                </div>
-              </>
               )}
-
-              <div className="flex h-8 shrink-0 items-center justify-between border-b border-[#2a2d34] px-3 text-[11px] font-bold uppercase text-[#7288ff]">
-                <span className="inline-flex items-center gap-2"><FolderOpen className="h-3.5 w-3.5" />LIST SCENARIO STEPS</span>
-                <span className="text-[#7e8da5]">{steps.length} steps</span>
-              </div>
-
-              <div className="min-h-0 space-y-2 overflow-y-auto p-3">
-                {steps.length === 0 ? (
-                  <div className="flex h-full flex-col items-center justify-center text-center">
-                    <FolderOpen className="mb-3 h-12 w-12 text-[#4e586b]" />
-                    <p className="text-sm font-semibold text-white">Chưa có bước nào</p>
-                    <p className="mt-1 text-xs text-[#7e8da5]">Bấm Record để quay thao tác và đổ dữ liệu vào timeline.</p>
-                  </div>
-                ) : (
-                  steps.map((step, idx) => (
-                    <StepCard
-                      key={step.id || idx}
-                      step={step}
-                      index={idx}
-                      isSelected={idx === selectedStepIndex}
-                      onSelect={handleSelectStep}
-                      onDelete={handleDeleteStep}
-                      onUpdate={(updates) => handleUpdateStep(idx, updates)}
-                    />
-                  ))
-                )}
-              </div>
             </div>
           </section>
         </div>
 
-        <section className="border-t border-[#2a2d34] bg-[#14161b]">
-          <div className="flex h-8 shrink-0 items-center justify-between border-b border-[#2a2d34] px-3 text-[11px] font-bold uppercase text-[#7288ff]">
-            <span className="inline-flex items-center gap-2"><Timer className="h-3.5 w-3.5" />TIMELINE KEYFRAMES</span>
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={handleAutoTrim}
-                disabled={!hasSteps}
-                className="rounded border border-[#3c465c] px-2 py-1 text-[10px] text-[#c7d0dc] hover:bg-[#243047] disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                Auto Trim
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setSelectingTrim((current) => !current);
-                  setPendingTrimRange(null);
-                }}
-                disabled={!hasSteps}
-                className={`rounded border px-2 py-1 text-[10px] disabled:cursor-not-allowed disabled:opacity-40 ${
-                  selectingTrim
-                    ? 'border-[#635bff] bg-[#2a2550] text-[#c8c4ff]'
-                    : 'border-[#3c465c] text-[#c7d0dc] hover:bg-[#243047]'
-                }`}
-              >
-                Chọn vùng xóa
-              </button>
-              {pendingTrimRange && Math.abs(pendingTrimRange.end_ms - pendingTrimRange.start_ms) >= 100 && (
-                <button
-                  type="button"
-                  onClick={handleSavePendingTrim}
-                  className="rounded border border-[#635bff] bg-[#2a2550] px-2 py-1 text-[10px] text-[#c8c4ff] hover:bg-[#342f66]"
-                >
-                  Xóa vùng đã chọn
-                </button>
+        {timelineOpen ? (
+          <section className="min-w-0 overflow-x-hidden border-t border-[#2a2d34] bg-[#14161b]">
+            <PanelSectionHeader
+              icon={Timer}
+              title="Timeline keyframes"
+              trailing={(
+                <div className="max-w-[min(100%,720px)] overflow-x-auto">
+                  <div className="flex w-max items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={handleAutoTrim}
+                      disabled={!hasSteps}
+                      className="rounded border border-[#3c465c] px-2 py-1 text-[10px] font-normal normal-case text-[#c7d0dc] hover:bg-[#243047] disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      Auto Trim
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSelectingTrim((current) => !current);
+                        setPendingTrimRange(null);
+                      }}
+                      disabled={!hasSteps}
+                      className={`rounded border px-2 py-1 text-[10px] font-normal normal-case disabled:cursor-not-allowed disabled:opacity-40 ${
+                        selectingTrim
+                          ? 'border-[#635bff] bg-[#2a2550] text-[#c8c4ff]'
+                          : 'border-[#3c465c] text-[#c7d0dc] hover:bg-[#243047]'
+                      }`}
+                    >
+                      Chọn vùng xóa
+                    </button>
+                    {pendingTrimRange && Math.abs(pendingTrimRange.end_ms - pendingTrimRange.start_ms) >= 100 && (
+                      <button
+                        type="button"
+                        onClick={handleSavePendingTrim}
+                        className="rounded border border-[#635bff] bg-[#2a2550] px-2 py-1 text-[10px] font-normal normal-case text-[#c8c4ff] hover:bg-[#342f66]"
+                      >
+                        Xóa vùng đã chọn
+                      </button>
+                    )}
+                    <span className="whitespace-nowrap text-[10px] font-normal normal-case text-[#7e8da5]">KEYFRAME KIM CƯƠNG = HÀNH ĐỘNG</span>
+                    <button
+                      type="button"
+                      onClick={() => setTimelineOpen(false)}
+                      className="inline-flex items-center gap-1 rounded border border-[#3c465c] px-2 py-1 text-[10px] font-normal normal-case text-[#c7d0dc] hover:bg-[#243047]"
+                    >
+                      <ChevronDown className="h-3 w-3" />
+                      Ẩn timeline
+                    </button>
+                  </div>
+                </div>
               )}
-              <span className="text-[#7e8da5]">KEYFRAME KIM CƯƠNG = HÀNH ĐỘNG</span>
+            />
+            <div className="overflow-x-auto px-4 pb-3 pt-3">
+              <div className="h-24 min-w-[640px]">
+                <Timeline
+                  steps={steps}
+                  currentTime={previewCurrentTime}
+                  totalTime={totalTime || 20000}
+                  onSeek={handleSeek}
+                  selectingTrim={selectingTrim}
+                  pendingTrimRange={pendingTrimRange}
+                  onTrimRangeChange={(range) => setPendingTrimRange(normalizeTrimRanges([range], totalTime || 20000)[0] || null)}
+                />
+              </div>
             </div>
+          </section>
+        ) : (
+          <div className="flex h-8 shrink-0 items-center justify-between border-t border-[#2a2d34] bg-[#14161b] px-3">
+            <span className="inline-flex items-center gap-2 text-[11px] font-bold uppercase text-[#7288ff]">
+              <Timer className="h-3.5 w-3.5" />
+              Timeline keyframes
+            </span>
+            <button
+              type="button"
+              onClick={() => setTimelineOpen(true)}
+              className="inline-flex items-center gap-1 rounded border border-[#3c465c] px-2 py-1 text-[10px] text-[#c7d0dc] hover:bg-[#243047]"
+            >
+              <ChevronRight className="h-3 w-3 rotate-[-90deg]" />
+              Hiện timeline
+            </button>
           </div>
-          <div className="px-4 pb-3 pt-3">
-            <div className="h-24">
-              <Timeline
-                steps={steps}
-                currentTime={previewCurrentTime}
-                totalTime={totalTime || 20000}
-                onSeek={handleSeek}
-                selectingTrim={selectingTrim}
-                pendingTrimRange={pendingTrimRange}
-                onTrimRangeChange={(range) => setPendingTrimRange(normalizeTrimRanges([range], totalTime || 20000)[0] || null)}
-              />
-            </div>
-            <div className="mt-2 flex items-center justify-between text-xs text-[#7e8da5]">
-              <span>
-                {selectingTrim
-                  ? 'Kéo trên timeline để chọn vùng cần xóa, rồi bấm Xóa vùng đã chọn.'
-                  : 'Mẹo: Click vào khoảng trống bất kỳ trên timeline để chọn bước cần sửa.'}
-              </span>
-              <button type="button" className="inline-flex items-center gap-2 text-[#ff9f9f]">
-                <Trash2 className="h-3.5 w-3.5" />
-                Xóa kịch bản
-              </button>
-            </div>
-          </div>
-        </section>
+        )}
       </div>
 
       {/* ===== Record Mode Modal ===== */}
