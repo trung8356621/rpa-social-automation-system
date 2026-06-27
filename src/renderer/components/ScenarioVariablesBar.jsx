@@ -1,5 +1,8 @@
 import React, { useEffect, useState } from 'react';
-import { Braces, Plus, Trash2 } from 'lucide-react';
+import { Braces, Plus, Save, Trash2 } from 'lucide-react';
+import { useTranslation } from '../i18n';
+
+const CREATE_NEW_PROFILE = '__new__';
 
 function emptyRow() {
   return {
@@ -9,40 +12,64 @@ function emptyRow() {
   };
 }
 
+function randomName(prefix) {
+  const token = crypto.randomUUID().replace(/-/g, '').slice(0, 8);
+  return `${prefix}-${token}`;
+}
+
 export default function ScenarioVariablesBar({
   scenarioId,
+  refreshKey = 0,
   onToast,
   onChanged,
 }) {
+  const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const [rows, setRows] = useState([]);
+  const [profiles, setProfiles] = useState([]);
+  const [sampleProfileId, setSampleProfileId] = useState(CREATE_NEW_PROFILE);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [busyAction, setBusyAction] = useState('');
 
   const loadVariables = async () => {
-    if (!scenarioId || !window.electronAPI?.getScenarioVariables) {
+    if (!scenarioId || !window.electronAPI?.getScenarioLocalVariables) {
       setRows([]);
       return;
     }
 
     setLoading(true);
     try {
-      const items = await window.electronAPI.getScenarioVariables(scenarioId);
+      const items = await window.electronAPI.getScenarioLocalVariables(scenarioId);
       const normalized = (Array.isArray(items) ? items : []).map((item) => ({
         ...item,
         key: item.key || item.name || '',
       }));
       setRows(normalized.length ? normalized : []);
     } catch (error) {
-      onToast?.({ type: 'error', message: error.message || 'Không tải được biến' });
+      onToast?.({ type: 'error', message: error.message || t('variables.toast.loadFailed') });
     } finally {
       setLoading(false);
     }
   };
 
+  const loadProfiles = async () => {
+    if (!window.electronAPI?.getVariableProfiles) {
+      setProfiles([]);
+      return;
+    }
+    try {
+      const items = await window.electronAPI.getVariableProfiles();
+      setProfiles(Array.isArray(items) ? items : []);
+    } catch {
+      setProfiles([]);
+    }
+  };
+
   useEffect(() => {
     loadVariables();
-  }, [scenarioId]);
+    loadProfiles();
+  }, [scenarioId, refreshKey]);
 
   const persistRow = async (row) => {
     const key = String(row.key || row.name || '').trim();
@@ -70,7 +97,7 @@ export default function ScenarioVariablesBar({
       setRows((prev) => prev.map((item, idx) => (idx === index ? saved : item)));
       onChanged?.();
     } catch (error) {
-      onToast?.({ type: 'error', message: error.message || 'Lưu biến thất bại' });
+      onToast?.({ type: 'error', message: error.message || t('variables.toast.saveFailed') });
     } finally {
       setSaving(false);
     }
@@ -78,7 +105,8 @@ export default function ScenarioVariablesBar({
 
   const handleDeleteRow = async (index) => {
     const row = rows[index];
-    setRows((prev) => prev.filter((_, idx) => idx !== index));
+    const nextRows = rows.filter((_, idx) => idx !== index);
+    setRows(nextRows);
 
     if (!row?.id) return;
 
@@ -86,7 +114,7 @@ export default function ScenarioVariablesBar({
       await window.electronAPI.deleteScenarioVariable(row.id);
       onChanged?.();
     } catch (error) {
-      onToast?.({ type: 'error', message: error.message || 'Xóa biến thất bại' });
+      onToast?.({ type: 'error', message: error.message || t('variables.toast.deleteFailed') });
       loadVariables();
     }
   };
@@ -100,16 +128,60 @@ export default function ScenarioVariablesBar({
     setRows((prev) => prev.map((row, idx) => (idx === index ? { ...row, ...patch } : row)));
   };
 
+  const handleQuickSaveSample = async () => {
+    const variables = rows
+      .map((row) => ({
+        key: String(row.key || '').trim(),
+        value: row.value ?? '',
+      }))
+      .filter((row) => row.key);
+
+    if (!variables.length) {
+      onToast?.({ type: 'error', message: t('variables.toast.noKeys') });
+      return;
+    }
+
+    setBusyAction('sample');
+    try {
+      let profileId = sampleProfileId;
+
+      if (profileId === CREATE_NEW_PROFILE) {
+        const profile = await window.electronAPI.saveVariableProfileQuick({
+          name: randomName('profile'),
+          keys: variables.map((row) => row.key),
+        });
+        profileId = profile?.id;
+        if (!profileId) {
+          throw new Error(t('variables.toast.profileSaveFailed'));
+        }
+        await loadProfiles();
+      }
+
+      await window.electronAPI.saveVariableProfileSampleQuick({
+        profileId,
+        name: randomName('sample'),
+        variables,
+      });
+
+      onToast?.({ type: 'success', message: t('variables.toast.sampleSaved') });
+      onChanged?.();
+    } catch (error) {
+      onToast?.({ type: 'error', message: error.message || t('variables.toast.sampleSaveFailed') });
+    } finally {
+      setBusyAction('');
+    }
+  };
+
   if (!scenarioId) {
     return (
       <button
         type="button"
         disabled
         className="inline-flex h-9 items-center gap-2 rounded-md border border-[#2f3748] px-3 text-xs text-[#76849b]"
-        title="Lưu kịch bản trước để thêm biến"
+        title={t('variables.saveScenarioFirst')}
       >
         <Braces className="h-4 w-4" />
-        Biến
+        {t('variables.button')}
       </button>
     );
   }
@@ -122,7 +194,7 @@ export default function ScenarioVariablesBar({
         className="inline-flex h-9 items-center gap-2 rounded-md border border-[#2f3748] bg-[#171b26] px-3 text-xs font-medium text-[#c9d4e8] transition hover:bg-[#1f2633]"
       >
         <Braces className="h-4 w-4 text-[#7aa7ff]" />
-        Biến
+        {t('variables.button')}
         <span className="rounded bg-[#242b3a] px-1.5 py-0.5 text-[10px] text-[#9aa7b7]">{rows.length}</span>
       </button>
 
@@ -132,29 +204,51 @@ export default function ScenarioVariablesBar({
             type="button"
             className="fixed inset-0 z-40 cursor-default"
             onClick={() => setOpen(false)}
-            aria-label="Đóng quản lý biến"
+            aria-label={t('variables.closePanel')}
           />
-          <div className="absolute right-0 top-full z-50 mt-2 w-[420px] rounded-xl border border-[#2f3748] bg-[#12151c] p-3 shadow-2xl">
-            <div className="mb-3 flex items-center justify-between">
+          <div className="absolute right-0 top-full z-50 mt-2 w-[480px] rounded-xl border border-[#2f3748] bg-[#12151c] p-3 shadow-2xl">
+            <div className="mb-3 flex items-center justify-between gap-2">
               <div>
-                <p className="text-sm font-semibold text-white">Biến mặc định (khung)</p>
-                <p className="text-[11px] text-[#76849b]">Giá trị fallback khi hồ sơ để trống. Dùng {'{{ten_bien}}'} trong URL và Input.</p>
+                <p className="text-sm font-semibold text-white">{t('variables.panel.title')}</p>
+                <p className="text-[11px] text-[#76849b]">{t('variables.panel.hint')}</p>
               </div>
               <button
                 type="button"
                 onClick={handleAddRow}
-                className="inline-flex h-8 items-center gap-1 rounded-md bg-[#243044] px-2 text-xs text-white hover:bg-[#2d3d56]"
+                className="inline-flex h-8 shrink-0 items-center gap-1 rounded-md bg-[#243044] px-2 text-xs text-white hover:bg-[#2d3d56]"
               >
                 <Plus className="h-3.5 w-3.5" />
-                Thêm
+                {t('common.add')}
+              </button>
+            </div>
+
+            <div className="mb-3 flex items-center gap-2 border-b border-[#2f3748] pb-3">
+              <select
+                value={sampleProfileId}
+                onChange={(event) => setSampleProfileId(event.target.value)}
+                className="select-field h-8 min-w-0 flex-1 text-xs"
+              >
+                <option value={CREATE_NEW_PROFILE}>{t('variables.createNewProfile')}</option>
+                {profiles.map((profile) => (
+                  <option key={profile.id} value={profile.id}>{profile.name}</option>
+                ))}
+              </select>
+              <button
+                type="button"
+                onClick={handleQuickSaveSample}
+                disabled={!!busyAction}
+                className="inline-flex h-8 shrink-0 items-center gap-1 rounded-md border border-[#3a465c] px-2.5 text-xs text-[#c9d4e8] hover:bg-[#1f2633] disabled:opacity-60"
+              >
+                <Save className="h-3.5 w-3.5" />
+                {t('variables.quickSaveSample')}
               </button>
             </div>
 
             {loading ? (
-              <p className="text-xs text-[#76849b]">Đang tải...</p>
+              <p className="text-xs text-[#76849b]">{t('common.loading')}</p>
             ) : rows.length === 0 ? (
               <p className="rounded-lg border border-dashed border-[#2f3748] px-3 py-4 text-center text-xs text-[#76849b]">
-                Chưa có biến khung. Thêm key/value mặc định trước khi tạo hồ sơ dữ liệu.
+                {t('variables.panel.empty')}
               </p>
             ) : (
               <div className="max-h-64 space-y-2 overflow-y-auto pr-1">
@@ -165,20 +259,20 @@ export default function ScenarioVariablesBar({
                       onChange={(event) => updateRow(index, { key: event.target.value })}
                       onBlur={(event) => handleSaveRow(index, { key: event.target.value })}
                       className="input-field h-8 text-xs"
-                      placeholder="key"
+                      placeholder={t('variables.field.key')}
                     />
                     <input
                       value={row.value || ''}
                       onChange={(event) => updateRow(index, { value: event.target.value })}
                       onBlur={(event) => handleSaveRow(index, { value: event.target.value })}
                       className="input-field h-8 text-xs"
-                      placeholder="value"
+                      placeholder={t('variables.field.value')}
                     />
                     <button
                       type="button"
                       onClick={() => handleDeleteRow(index)}
                       className="flex h-8 w-8 items-center justify-center rounded-md text-[#76849b] hover:bg-[#2a1f24] hover:text-[#ff8fa0]"
-                      title="Xóa biến"
+                      title={t('variables.delete')}
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </button>
@@ -188,7 +282,7 @@ export default function ScenarioVariablesBar({
             )}
 
             {saving && (
-              <p className="mt-2 text-[10px] text-[#76849b]">Đang lưu...</p>
+              <p className="mt-2 text-[10px] text-[#76849b]">{t('common.saving')}</p>
             )}
           </div>
         </>

@@ -7,6 +7,12 @@ import DatabaseService from './database/DatabaseService.js';
 import BrowserProfileService from './browser/BrowserProfileService.js';
 import { ExecutorService } from './rpa/ExecutorService.js';
 import { initRecorderService } from './rpa/RecorderService.js';
+import {
+  cleanupScenarioBundleTempDir,
+  readScenarioBundleZip,
+  sanitizeScenarioFileName,
+  writeScenarioBundleZip,
+} from './scenario/ScenarioBundleZip.js';
 
 // __dirname equivalent trong ESM:
 // Trong ES Module, không có __dirname và __filename global.
@@ -194,6 +200,10 @@ function registerDatabaseHandlers() {
     return result.canceled ? null : result.filePaths[0];
   });
 
+  ipcMain.handle('dialog:save-file', async (_event, options = {}) => {
+    return showNativeSaveDialog(options);
+  });
+
   // ===== Scenario Handlers =====
 
   /**
@@ -253,7 +263,15 @@ function registerDatabaseHandlers() {
   });
 
   ipcMain.handle('db:get-scenario-variables', (_event, scenarioId) => {
-    return dbService.getScenarioVariables(scenarioId);
+    return dbService.getScenarioLocalVariables(scenarioId);
+  });
+
+  ipcMain.handle('db:get-scenario-local-variables', (_event, scenarioId) => {
+    return dbService.getScenarioLocalVariables(scenarioId);
+  });
+
+  ipcMain.handle('db:save-scenario-local-variables', (_event, payload) => {
+    return dbService.saveScenarioLocalVariables(payload?.scenarioId, payload?.variables || []);
   });
 
   ipcMain.handle('db:save-scenario-variable', (_event, variable) => {
@@ -264,8 +282,8 @@ function registerDatabaseHandlers() {
     return dbService.deleteScenarioVariable(id);
   });
 
-  ipcMain.handle('db:get-variable-profiles', (_event, scenarioId) => {
-    return dbService.getVariableProfiles(scenarioId);
+  ipcMain.handle('db:get-variable-profiles', () => {
+    return dbService.getVariableProfiles();
   });
 
   ipcMain.handle('db:get-variable-profile', (_event, profileId) => {
@@ -280,12 +298,127 @@ function registerDatabaseHandlers() {
     return dbService.deleteVariableProfile(id);
   });
 
-  ipcMain.handle('db:save-profile-variable-values', (_event, payload) => {
-    return dbService.saveProfileVariableValues(payload?.profileId, payload?.values || []);
+  ipcMain.handle('db:set-scenario-variable-profile', (_event, payload) => {
+    return dbService.setScenarioVariableProfileId(payload?.scenarioId, payload?.profileId || null);
+  });
+
+  ipcMain.handle('db:get-variable-profile-samples', (_event, profileId) => {
+    return dbService.getVariableProfileSamples(profileId || null);
+  });
+
+  ipcMain.handle('db:get-variable-profile-sample', (_event, sampleId) => {
+    return dbService.getVariableProfileSampleById(sampleId);
+  });
+
+  ipcMain.handle('db:save-variable-profile-sample', (_event, sample) => {
+    return dbService.saveVariableProfileSample(sample);
+  });
+
+  ipcMain.handle('db:delete-variable-profile-sample', (_event, id) => {
+    return dbService.deleteVariableProfileSample(id);
+  });
+
+  ipcMain.handle('db:save-variable-profile-quick', (_event, payload) => {
+    return dbService.saveVariableProfileQuick(payload);
+  });
+
+  ipcMain.handle('db:save-variable-profile-sample-quick', (_event, payload) => {
+    return dbService.saveVariableProfileSampleQuick(payload);
+  });
+
+  ipcMain.handle('db:export-scenario-local-variables', async (_event, scenarioId) => {
+    const filePath = await showNativeSaveDialog({
+      defaultPath: 'scenario-variables.json',
+      filters: [{ name: 'JSON', extensions: ['json'] }],
+    });
+    if (!filePath) return { cancelled: true };
+
+    const payload = dbService.exportLocalVariablesPayload(scenarioId);
+    await fs.writeFile(filePath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+    return { cancelled: false, filePath, variables: payload.variables };
+  });
+
+  ipcMain.handle('db:export-scenario', async (_event, scenarioId) => {
+    const scenario = dbService.getScenarioById(scenarioId);
+    const defaultName = `${sanitizeScenarioFileName(scenario?.name)}.scenario.zip`;
+    const filePath = await showNativeSaveDialog({
+      defaultPath: defaultName,
+      filters: [{ name: 'Scenario ZIP', extensions: ['zip'] }],
+    });
+    if (!filePath) return { cancelled: true };
+
+    const bundle = dbService.buildScenarioExportBundle(scenarioId);
+    const assets = Array.isArray(bundle._assets) ? bundle._assets : [];
+    const zipPath = filePath.toLowerCase().endsWith('.zip') ? filePath : `${filePath}.zip`;
+    const { copiedFrames } = await writeScenarioBundleZip(zipPath, bundle, assets);
+
+    return { cancelled: false, filePath: zipPath, copiedFrames };
+  });
+
+  ipcMain.handle('db:import-scenario-local-variables', async (_event, payload) => {
+    const scenarioId = typeof payload === 'string' ? payload : payload?.scenarioId;
+    const presetFilePath = typeof payload === 'object' && payload?.filePath
+      ? String(payload.filePath).trim()
+      : '';
+
+    let filePath = presetFilePath;
+    if (!filePath) {
+      const result = await showNativeOpenDialog({
+        defaultPath: path.join(app.getPath('desktop'), 'scenario-variables.json'),
+        properties: ['openFile'],
+        filters: [{ name: 'JSON', extensions: ['json'] }],
+      });
+      if (result.canceled || !result.filePaths?.[0]) return { cancelled: true };
+      filePath = result.filePaths[0];
+    }
+
+    const raw = await fs.readFile(filePath, 'utf8');
+    const variables = dbService.importScenarioLocalVariables(scenarioId, raw);
+    return { cancelled: false, filePath, variables };
+  });
+
+  ipcMain.handle('db:import-scenario', async () => {
+    const result = await showNativeOpenDialog({
+      defaultPath: path.join(app.getPath('desktop'), 'scenario.scenario.zip'),
+      properties: ['openFile'],
+      filters: [
+        { name: 'Scenario ZIP', extensions: ['zip'] },
+        { name: 'Legacy JSON bundle', extensions: ['json'] },
+      ],
+    });
+    if (result.canceled || !result.filePaths?.[0]) return { cancelled: true };
+
+    const filePath = result.filePaths[0];
+    let tempDir = null;
+
+    try {
+      let raw;
+      let assetsDir = '';
+
+      if (filePath.toLowerCase().endsWith('.zip')) {
+        const extracted = await readScenarioBundleZip(filePath, app.getPath('temp'));
+        raw = extracted.raw;
+        assetsDir = extracted.assetsDir;
+        tempDir = extracted.assetsDir;
+      } else {
+        raw = await fs.readFile(filePath, 'utf8');
+        assetsDir = resolveScenarioAssetsDir(filePath);
+      }
+
+      const scenario = dbService.importScenarioBundle(raw, assetsDir);
+      return { cancelled: false, filePath, scenario };
+    } catch (error) {
+      if (error.message === 'VARIABLES_ONLY_FILE') {
+        throw new Error('File chi chua bien (local_variables). Hay dung Import trong panel Variables, hoac chon file .scenario.zip da export day du.');
+      }
+      throw error;
+    } finally {
+      await cleanupScenarioBundleTempDir(tempDir);
+    }
   });
 
   ipcMain.handle('db:build-resolved-variables', (_event, payload) => {
-    return dbService.buildResolvedVariables(payload?.scenarioId, payload?.profileId || null);
+    return dbService.buildResolvedVariables(payload?.scenarioId, payload?.sampleId || null);
   });
 
   ipcMain.handle('scenario:start-recording', async (_event, payload) => {
@@ -357,6 +490,7 @@ function registerDatabaseHandlers() {
     const scenarioId = typeof payload === 'string' ? payload : payload?.scenarioId;
     const browserProfileId = typeof payload === 'object' ? payload?.browserProfileId || null : null;
     const variableProfileId = typeof payload === 'object' ? payload?.variableProfileId || null : null;
+    const sampleId = typeof payload === 'object' ? payload?.sampleId || null : null;
     const headless = typeof payload === 'object' ? Boolean(payload?.headless) : false;
     if (!scenarioId) {
       console.error('[Main] Thiếu scenarioId khi chạy kịch bản');
@@ -382,7 +516,7 @@ function registerDatabaseHandlers() {
     executor.startScenario(scenarioId, {
       executionId,
       browserProfileId,
-      variableProfileId,
+      sampleId,
       headless,
     })
       .then((result) => console.log(`[Main] Thực thi ${executionId} hoàn tất:`, result))
@@ -394,17 +528,35 @@ function registerDatabaseHandlers() {
 function withDefaultSettings(settings) {
   return {
     ...settings,
+    'app.language': settings['app.language'] === 'en' ? 'en' : 'vi',
     'browser.userDataDir':
       settings['browser.userDataDir'] || path.join(app.getPath('userData'), 'browser-data'),
     'execution.browserCloseDelayMs': Number(settings['execution.browserCloseDelayMs']) || 5000,
   };
 }
 
+function resolveScenarioAssetsDir(jsonFilePath) {
+  const dir = path.dirname(jsonFilePath);
+  const base = path.basename(jsonFilePath).replace(/\.scenario\.json$/i, '').replace(/\.json$/i, '');
+  return path.join(dir, `${base}.scenario.assets`);
+}
+
 async function showNativeOpenDialog(options) {
   const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
-  return parent
-    ? dialog.showOpenDialog(parent, options)
-    : dialog.showOpenDialog(options);
+  if (parent) {
+    parent.focus();
+    return dialog.showOpenDialog(parent, options);
+  }
+  return dialog.showOpenDialog(options);
+}
+
+async function showNativeSaveDialog(options = {}) {
+  const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
+  const result = parent
+    ? await dialog.showSaveDialog(parent, options)
+    : await dialog.showSaveDialog(options);
+  if (result.canceled || !result.filePath) return null;
+  return result.filePath;
 }
 
 async function readAllowedFrameAsDataUrl(filePath) {

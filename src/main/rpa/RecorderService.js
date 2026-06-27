@@ -1,4 +1,6 @@
 import crypto from 'node:crypto';
+import { ensureRememberMeChecked, isCheckboxAlreadyChecked, resolveGuestSessionDir } from '../browser/BrowserSessionPaths.js';
+import { resolveScenarioTargetUrl, resolveVariableTemplate } from './VariableResolver.js';
 import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -61,12 +63,15 @@ class RecorderService {
     const sourceScenario = scenario || existingScenario || {};
     const settings = this.dbService.getSettings();
     const effectiveViewport = this._getViewportFromSettings(settings, viewport);
+    const rawTargetUrl = targetUrl || sourceScenario?.target_url || 'about:blank';
+    const variableMap = this.dbService.buildVariableMap(scenarioId, null);
+    const resolvedTargetUrl = resolveScenarioTargetUrl(rawTargetUrl, variableMap);
     const safeScenario = {
       id: scenarioId,
       name: sourceScenario?.name || 'Kich ban moi',
       description: sourceScenario?.description || '',
       platform: sourceScenario?.platform || 'custom',
-      target_url: targetUrl || sourceScenario?.target_url || 'about:blank',
+      target_url: resolvedTargetUrl,
       recorded_width: effectiveViewport.width,
       recorded_height: effectiveViewport.height,
       device_pixel_ratio: sourceScenario?.device_pixel_ratio || 1,
@@ -144,10 +149,11 @@ class RecorderService {
       await this.page.evaluateOnNewDocument(this._getInjectionScript());
 
       // Chromium restores cookies natively from userDataDir — just navigate to the target.
-      await this.page.goto(safeScenario.target_url, {
+      await this.page.goto(resolvedTargetUrl, {
         waitUntil: 'domcontentloaded',
         timeout: 60000,
       });
+      await ensureRememberMeChecked(this.page);
 
       // Reset timing anchors to post-load so step time_offset is relative to page-ready,
       // not to browser launch. This prevents the first step from carrying a large load delay.
@@ -259,15 +265,8 @@ class RecorderService {
     // Luon dung profiles/<scenarioId> de session duoc giu lai qua cac lan mo.
     const settings = this.dbService.getSettings();
     const effectiveViewport = this._getViewportFromSettings(settings, viewport);
-    const configuredUserDataDir = settings?.['browser.userDataDir'];
-    const dirId = scenarioId || 'manual';
-    let userDataDir;
-    if (configuredUserDataDir) {
-      userDataDir = path.join(configuredUserDataDir, 'profiles', dirId);
-    } else {
-      userDataDir = path.join(this.appDataPath, 'cache', 'recording-profiles', dirId);
-    }
-    await fs.mkdir(userDataDir, { recursive: true });
+    const browserDataRoot = settings?.['browser.userDataDir'] || path.join(this.appDataPath, 'browser-data');
+    const userDataDir = resolveGuestSessionDir(browserDataRoot, scenarioId || 'manual');
 
     const browser = await puppeteer.launch({
       headless: false,
@@ -319,6 +318,7 @@ class RecorderService {
     const effectiveViewport = this._getViewportFromSettings(settings, viewport);
     const effectiveImportProfileId = importProfileId || scenario.browser_profile_id || null;
     const userDataDir = await this._resolveRecordingUserDataDir(scenarioId, effectiveImportProfileId);
+    const variableMap = this.dbService.buildVariableMap(scenarioId, null);
 
     // Mo browser va phat lai tung buoc
     const browser = await puppeteer.launch({
@@ -344,7 +344,10 @@ class RecorderService {
       await this._releaseBrowserTopMost(browser);
 
       // Dieu huong den target_url cua scenario truoc khi phat lai step
-      const initialUrl = scenario.target_url || 'about:blank';
+      const initialUrl = resolveScenarioTargetUrl(
+        targetUrl || scenario.target_url || 'about:blank',
+        variableMap,
+      );
       console.log(`[Recorder] Dieu huong den URL ban dau: ${initialUrl}`);
       await page.goto(initialUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {
         console.warn(`[Recorder] Khong the mo URL ban dau: ${initialUrl}`);
@@ -364,15 +367,19 @@ class RecorderService {
         console.log(`[Recorder] Phat lai buoc: ${action_type} | selector="${selector}"`);
 
         if (action_type === 'navigate') {
-          const url = stepUrl || scenario.target_url || 'about:blank';
+          const url = resolveScenarioTargetUrl(
+            stepUrl || scenario.target_url || 'about:blank',
+            variableMap,
+          );
           console.log(`[Recorder] Navigate den: ${url}`);
           await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((err) => {
             console.warn(`[Recorder] Navigate that bai: ${err.message}`);
           });
         } else if (action_type === 'click') {
-          await this._replayClick(page, anchor, selector, effectiveViewport);
+          await this._replayClick(page, anchor, selector, effectiveViewport, config);
         } else if (action_type === 'input' || action_type === 'type') {
-          await this._replayType(page, anchor, selector, config.text || '', effectiveViewport, config.delay || 50);
+          const text = resolveVariableTemplate(config.text || '', variableMap);
+          await this._replayType(page, anchor, selector, text, effectiveViewport, config.delay || 50);
         } else if (action_type === 'scroll') {
           const scrollX = anchor.scroll_x ?? config.scrollX ?? 0;
           const scrollY = anchor.scroll_y ?? config.scrollY ?? 0;
@@ -445,7 +452,7 @@ class RecorderService {
     }
   }
 
-  async _replayClick(page, anchor = {}, selector = '', viewport = DEFAULT_VIEWPORT) {
+  async _replayClick(page, anchor = {}, selector = '', viewport = DEFAULT_VIEWPORT, config = {}) {
     const selectors = [
       selector,
       anchor.selector_value,
@@ -454,6 +461,15 @@ class RecorderService {
       anchor.ariaLabel ? `[aria-label="${anchor.ariaLabel}"]` : '',
       anchor.placeholder ? `[placeholder="${anchor.placeholder}"]` : '',
     ].filter(Boolean);
+
+    if (config.skip_if_checked) {
+      const alreadyChecked = await isCheckboxAlreadyChecked(page, {
+        selectors,
+        coords: anchor.relative_coords,
+        viewport,
+      });
+      if (alreadyChecked) return;
+    }
 
     for (const item of selectors) {
       try {
@@ -473,6 +489,15 @@ class RecorderService {
 
     const coords = anchor.relative_coords;
     if (coords?.x !== undefined && coords?.y !== undefined) {
+      if (config.skip_if_checked) {
+        const alreadyChecked = await isCheckboxAlreadyChecked(page, {
+          selectors: [],
+          coords,
+          viewport,
+        });
+        if (alreadyChecked) return;
+      }
+
       const x = Math.round((coords.x / 100) * viewport.width);
       const y = Math.round((coords.y / 100) * viewport.height);
       await page.mouse.move(x, y, { steps: 5 }).catch(() => {});
@@ -627,49 +652,123 @@ class RecorderService {
     this.framesDir = storageFramesDir;
   }
 
-  // Public method: render video tu frames da chup, tra ve path + url
+  async _resolveExportFrames(scenarioId) {
+    const scenario = this.dbService.getScenarioById(scenarioId);
+    if (!scenario) {
+      return { scenario: null, frames: [], durationMs: 0, cacheDir: '' };
+    }
+
+    const manifestFrames = [];
+    for (const frame of scenario.preview_frames || []) {
+      if (!frame.path) continue;
+      try {
+        await fs.access(frame.path);
+        manifestFrames.push({
+          fileName: frame.name || path.basename(frame.path),
+          filePath: frame.path,
+          timestamp: Number(frame.time) || 0,
+        });
+      } catch {
+        console.warn(`[Recorder] Frame khong ton tai khi xuat ban: ${frame.path}`);
+      }
+    }
+    manifestFrames.sort((a, b) => a.timestamp - b.timestamp);
+
+    if (manifestFrames.length) {
+      const durationMs = scenario.preview_duration_ms != null
+        ? Number(scenario.preview_duration_ms)
+        : Math.max(...manifestFrames.map((frame) => frame.timestamp));
+      const cacheDir = scenario.preview_manifest_path
+        ? path.dirname(scenario.preview_manifest_path)
+        : this._getScenarioStorageDir(scenarioId);
+      return { scenario, frames: manifestFrames, durationMs, cacheDir };
+    }
+
+    if (this.frames.length) {
+      const sortedFrames = [...this.frames].sort((a, b) => a.timestamp - b.timestamp);
+      const durationMs = sortedFrames.length
+        ? Math.max(
+          sortedFrames[sortedFrames.length - 1].timestamp,
+          sortedFrames.length * 33,
+        )
+        : 0;
+      return {
+        scenario,
+        frames: sortedFrames,
+        durationMs,
+        cacheDir: this.cacheDir || this._getScenarioStorageDir(scenarioId),
+      };
+    }
+
+    const diskFramesDir = path.join(this._getScenarioStorageDir(scenarioId), 'frames');
+    try {
+      const files = await fs.readdir(diskFramesDir);
+      const pngFiles = files
+        .filter((file) => file.endsWith('.png'))
+        .sort()
+        .map((file, index) => ({
+          fileName: file,
+          filePath: path.join(diskFramesDir, file),
+          timestamp: index * 33,
+        }));
+      if (pngFiles.length) {
+        return {
+          scenario,
+          frames: pngFiles,
+          durationMs: pngFiles.length * 33,
+          cacheDir: path.dirname(diskFramesDir),
+        };
+      }
+    } catch {
+      // fall through
+    }
+
+    return { scenario, frames: [], durationMs: 0, cacheDir: '' };
+  }
+
+  // Public method: render video tu manifest da chinh sua (hoac frames fallback), tra ve path + url
   async renderVideo(scenarioId) {
     if (this.isRecording) {
       return { success: false, error: 'Dang trong qua trinh record. Hay stop truoc khi xuat ban.' };
     }
 
-    // Lay duration tu manifest hoac tinh tu so frame / 30 FPS
-    const frameCount = this.frames.length;
-    if (!frameCount) {
-      // Thu doc tu cacheDir neu co
-      const diskFramesDir = path.join(this._getScenarioStorageDir(scenarioId), 'frames');
-      try {
-        const files = await fs.readdir(diskFramesDir);
-        if (!files.length) {
-          return { success: false, error: 'Khong co frame nao de xuat ban video.' };
-        }
-        // Neu service da reset, van co the render tu disk
-        return this._renderVideoFromDisk(scenarioId, diskFramesDir, files);
-      } catch {
-        return { success: false, error: 'Khong co frame nao de xuat ban video.' };
+    const { scenario, frames, durationMs, cacheDir } = await this._resolveExportFrames(scenarioId);
+    if (!scenario) {
+      return { success: false, error: 'Khong tim thay kich ban.' };
+    }
+    if (!frames.length) {
+      return { success: false, error: 'Khong co frame nao de xuat ban video.' };
+    }
+
+    const savedFrames = this.frames;
+    const savedCacheDir = this.cacheDir;
+    const savedFramesDir = this.framesDir;
+
+    try {
+      this.frames = frames;
+      this.cacheDir = cacheDir;
+      this.framesDir = path.join(cacheDir, 'frames');
+
+      const result = await this._renderPreviewVideo(durationMs);
+      if (!result) {
+        return { success: false, error: this.previewWarning || 'Khong the tao video.' };
       }
-    }
 
-    const durationMs = frameCount * 33; // ~33ms/frame (30 FPS)
-    const result = await this._renderPreviewVideo(durationMs);
-    if (!result) {
-      return { success: false, error: this.previewWarning || 'Khong the tao video.' };
-    }
-
-    // Cap nhat preview_path trong DB
-    const scenario = this.dbService.getScenarioById(scenarioId);
-    if (scenario) {
       this.dbService.saveScenario(
         { ...scenario, preview_path: result.filePath },
         scenario.steps || [],
       );
-    }
 
-    return {
-      success: true,
-      filePath: result.filePath,
-      fileUrl: result.fileUrl,
-    };
+      return {
+        success: true,
+        filePath: result.filePath,
+        fileUrl: result.fileUrl,
+      };
+    } finally {
+      this.frames = savedFrames;
+      this.cacheDir = savedCacheDir;
+      this.framesDir = savedFramesDir;
+    }
   }
 
   async _writePreviewManifest(durationMs) {
@@ -688,47 +787,6 @@ class RecorderService {
 
     await fs.writeFile(manifestPath, JSON.stringify(manifest, null, 2), 'utf8').catch(() => {});
     return manifestPath;
-  }
-
-  async _renderVideoFromDisk(scenarioId, framesDir, files) {
-    const pngFiles = files
-      .filter((f) => f.endsWith('.png'))
-      .sort()
-      .map((f) => ({
-        fileName: f,
-        filePath: path.join(framesDir, f),
-        timestamp: 0, // khong quan tam thu tu
-      }));
-
-    if (!pngFiles.length) return { success: false, error: 'Khong co file PNG nao.' };
-
-    // Restore cacheDir cho _renderPreviewVideo su dung
-    const cachedDir = path.dirname(framesDir); // .../cache/scenarios/<id>
-    this.cacheDir = cachedDir;
-    this.frames = pngFiles;
-    const durationMs = pngFiles.length * 33;
-    const result = await this._renderPreviewVideo(durationMs);
-
-    if (!result) {
-      this.frames = [];
-      return { success: false, error: this.previewWarning || 'Khong the tao video.' };
-    }
-
-    // Cap nhat DB
-    const scenario = this.dbService.getScenarioById(scenarioId);
-    if (scenario) {
-      this.dbService.saveScenario(
-        { ...scenario, preview_path: result.filePath },
-        scenario.steps || [],
-      );
-    }
-
-    this.frames = [];
-    return {
-      success: true,
-      filePath: result.filePath,
-      fileUrl: result.fileUrl,
-    };
   }
 
   async _renderPreviewVideo(durationMs) {
@@ -798,14 +856,32 @@ class RecorderService {
       await fs.access(outputPath);
     };
 
-    // === Phuong an 2: execFile raw ffmpeg neu fluent-ffmpeg fail ===
+    // === Phuong an 2: concat demuxer bang execFile neu fluent-ffmpeg fail ===
     const tryExecFileFfmpeg = async () => {
-      console.log('[Recorder] Thu phuong an 2: execFile raw ffmpeg');
-      // Dung -framerate fixed thay vi concat de tranh loi demuxer
-      const frameGlob = path.join(this.framesDir, 'frame_%08d.png');
+      console.log('[Recorder] Thu phuong an 2: execFile raw ffmpeg (concat demuxer)');
+      const concatPath = path.join(this.cacheDir, 'frames-exec.txt');
+      const sortedFrames = [...this.frames].sort((a, b) => a.timestamp - b.timestamp);
+      const lines = [];
+
+      for (let index = 0; index < sortedFrames.length; index += 1) {
+        const frame = sortedFrames[index];
+        const nextFrame = sortedFrames[index + 1];
+        const duration = nextFrame
+          ? Math.max(0.04, (nextFrame.timestamp - frame.timestamp) / 1000)
+          : Math.max(0.2, (durationMs - frame.timestamp) / 1000);
+
+        const escaped = escapeConcatPath(frame.filePath);
+        lines.push(`file '${escaped}'`);
+        lines.push(`duration ${duration.toFixed(3)}`);
+      }
+      const lastEscaped = escapeConcatPath(sortedFrames[sortedFrames.length - 1].filePath);
+      lines.push(`file '${lastEscaped}'`);
+
+      await fs.writeFile(concatPath, lines.join('\n'), 'utf8');
       const args = [
-        '-framerate', '10',
-        '-i', frameGlob,
+        '-f', 'concat',
+        '-safe', '0',
+        '-i', concatPath,
         '-c:v', 'libx264',
         '-pix_fmt', 'yuv420p',
         '-movflags', '+faststart',
@@ -979,9 +1055,7 @@ class RecorderService {
       return legacyDir;
     }
 
-    const guestSessionDir = path.join(guestDir, scenarioId, crypto.randomUUID());
-    await fs.rm(guestSessionDir, { recursive: true, force: true }).catch(() => {});
-    await fs.mkdir(guestSessionDir, { recursive: true });
+    const guestSessionDir = resolveGuestSessionDir(browserDataRoot, scenarioId);
     return guestSessionDir;
   }
 

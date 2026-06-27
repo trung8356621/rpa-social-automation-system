@@ -52,6 +52,9 @@ This repository is a local-first Electron + React + SQLite RPA application for s
 ## Renderer And UI
 
 - Use Redux Toolkit slices for shared state and async local data flows.
+- **Internationalization:** bilingual UI (`vi` / `en`) via `src/renderer/i18n/locales/*.js` and `useTranslation()`.
+  - Setting key: `app.language`. Add every new user-facing string to both locale files.
+  - Do not hardcode Vietnamese-only or English-only labels in JSX.
 - Put reusable UI in `src/renderer/components/**`.
 - Put large screens in `src/renderer/pages/**` or `src/renderer/views/**`.
 - Use `lucide-react` for icons.
@@ -80,5 +83,5 @@ This repository is a local-first Electron + React + SQLite RPA application for s
 - Keep preload `.cjs` as CommonJS.
 - Keep changes focused on the requested behavior.
 - Add short comments only for non-obvious behavior.
-- Preserve existing Vietnamese domain wording where present.
+- Preserve existing Vietnamese domain wording when touching legacy text; new strings must use i18n keys in both languages.
 - Before finishing, run the smallest relevant check and report skipped checks.

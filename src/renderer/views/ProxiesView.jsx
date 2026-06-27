@@ -16,6 +16,7 @@ import {
   RefreshCw,
 } from 'lucide-react';
 import { fetchProxies, saveProxy, deleteProxy } from '../slices/proxySlice';
+import { useLanguage, useTranslation } from '../i18n';
 
 const PROTOCOLS = ['http', 'https', 'socks5', 'socks4'];
 
@@ -31,6 +32,9 @@ const emptyForm = {
 
 export default function ProxiesView() {
   const dispatch = useDispatch();
+  const { t } = useTranslation();
+  const language = useLanguage();
+  const dateLocale = language === 'en' ? 'en-US' : 'vi-VN';
   const { items: proxies, loading, error } = useSelector((state) => state.proxies);
 
   const [showForm, setShowForm] = useState(false);
@@ -67,7 +71,7 @@ export default function ProxiesView() {
 
   // Xóa proxy
   const handleDelete = (id) => {
-    if (window.confirm('Bạn có chắc chắn muốn xóa proxy này?')) {
+    if (window.confirm(t('proxies.confirm.delete'))) {
       dispatch(deleteProxy(id));
     }
   };
@@ -76,7 +80,7 @@ export default function ProxiesView() {
   const handleSubmit = async (e) => {
     e.preventDefault();
     if (!form.name || !form.ip || !form.port) {
-      alert('Vui lòng điền đầy đủ: Tên, IP và Port');
+      alert(t('proxies.validation.requiredFields'));
       return;
     }
     setSaving(true);
@@ -114,17 +118,17 @@ export default function ProxiesView() {
         <div>
           <h1 className="text-2xl font-bold text-white flex items-center gap-3">
             <Shield className="w-7 h-7 text-emerald-400" />
-            Quản lý Proxy
+            {t('proxies.title')}
           </h1>
           <p className="text-sm text-slate-400 mt-1">
-            Quản lý danh sách proxy dùng cho tự động hóa trình duyệt
+            {t('proxies.subtitle')}
           </p>
         </div>
         <div className="flex items-center gap-3">
           <button
             onClick={() => dispatch(fetchProxies())}
             className="p-2 text-slate-400 hover:text-white hover:bg-slate-700 rounded-lg transition-colors"
-            title="Làm mới"
+            title={t('common.refresh')}
           >
             <RefreshCw className={`w-5 h-5 ${loading ? 'animate-spin' : ''}`} />
           </button>
@@ -133,7 +137,7 @@ export default function ProxiesView() {
             className="flex items-center gap-2 px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-sm font-medium transition-all shadow-lg shadow-emerald-600/20"
           >
             <Plus className="w-4 h-4" />
-            Thêm proxy
+            {t('proxies.add')}
           </button>
         </div>
       </div>
@@ -147,7 +151,7 @@ export default function ProxiesView() {
             onClick={() => dispatch(fetchProxies())}
             className="ml-auto text-red-200 hover:text-white underline"
           >
-            Thử lại
+            {t('common.refresh')}
           </button>
         </div>
       )}
@@ -161,12 +165,12 @@ export default function ProxiesView() {
                 {editingId ? (
                   <>
                     <Pencil className="w-4 h-4 text-amber-400" />
-                    Chỉnh sửa proxy
+                    {t('proxies.form.editTitle')}
                   </>
                 ) : (
                   <>
                     <Plus className="w-4 h-4 text-emerald-400" />
-                    Thêm proxy mới
+                    {t('proxies.form.addTitle')}
                   </>
                 )}
               </h2>
@@ -175,21 +179,21 @@ export default function ProxiesView() {
                 {/* Tên */}
                 <div>
                   <label className="block text-xs font-medium text-slate-400 mb-1">
-                    Tên proxy <span className="text-red-400">*</span>
+                    {t('proxies.form.name')}
                   </label>
                   <input
                     type="text"
                     value={form.name}
                     onChange={(e) => setForm({ ...form, name: e.target.value })}
                     className="w-full bg-slate-900/80 border border-slate-600 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 focus:border-emerald-500 transition-all"
-                    placeholder="Proxy chính, Proxy phụ..."
+                    placeholder={t('proxies.form.namePlaceholder')}
                   />
                 </div>
 
                 {/* Protocol */}
                 <div>
                   <label className="block text-xs font-medium text-slate-400 mb-1">
-                    Giao thức
+                    {t('proxies.form.protocol')}
                   </label>
                   <select
                     value={form.protocol}
@@ -208,19 +212,19 @@ export default function ProxiesView() {
                 <div className="grid grid-cols-3 gap-3">
                   <div className="col-span-2">
                     <label className="block text-xs font-medium text-slate-400 mb-1">
-                      IP / Host <span className="text-red-400">*</span>
+                      {t('proxies.form.ip')}
                     </label>
                     <input
                       type="text"
                       value={form.ip}
                       onChange={(e) => setForm({ ...form, ip: e.target.value })}
                       className="w-full bg-slate-900/80 border border-slate-600 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 focus:border-emerald-500 transition-all"
-                      placeholder="192.168.1.1"
+                      placeholder={t('proxies.form.ipPlaceholder')}
                     />
                   </div>
                   <div>
                     <label className="block text-xs font-medium text-slate-400 mb-1">
-                      Port <span className="text-red-400">*</span>
+                      {t('proxies.form.port')}
                     </label>
                     <input
                       type="number"
@@ -229,7 +233,7 @@ export default function ProxiesView() {
                       value={form.port}
                       onChange={(e) => setForm({ ...form, port: e.target.value })}
                       className="w-full bg-slate-900/80 border border-slate-600 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 focus:border-emerald-500 transition-all"
-                      placeholder="8080"
+                      placeholder={t('proxies.form.portPlaceholder')}
                     />
                   </div>
                 </div>
@@ -238,26 +242,26 @@ export default function ProxiesView() {
                 <div className="grid grid-cols-2 gap-3">
                   <div>
                     <label className="block text-xs font-medium text-slate-400 mb-1">
-                      Tên đăng nhập
+                      {t('proxies.form.username')}
                     </label>
                     <input
                       type="text"
                       value={form.username}
                       onChange={(e) => setForm({ ...form, username: e.target.value })}
                       className="w-full bg-slate-900/80 border border-slate-600 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 focus:border-emerald-500 transition-all"
-                      placeholder="(tùy chọn)"
+                      placeholder={t('common.optional')}
                     />
                   </div>
                   <div>
                     <label className="block text-xs font-medium text-slate-400 mb-1">
-                      Mật khẩu
+                      {t('proxies.form.password')}
                     </label>
                     <input
                       type="password"
                       value={form.password}
                       onChange={(e) => setForm({ ...form, password: e.target.value })}
                       className="w-full bg-slate-900/80 border border-slate-600 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 focus:border-emerald-500 transition-all"
-                      placeholder="(tùy chọn)"
+                      placeholder={t('common.optional')}
                     />
                   </div>
                 </div>
@@ -265,16 +269,16 @@ export default function ProxiesView() {
                 {/* Status */}
                 <div>
                   <label className="block text-xs font-medium text-slate-400 mb-1">
-                    Trạng thái
+                    {t('common.status')}
                   </label>
                   <select
                     value={form.status}
                     onChange={(e) => setForm({ ...form, status: e.target.value })}
                     className="w-full bg-slate-900/80 border border-slate-600 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:ring-2 focus:ring-emerald-500/50 focus:border-emerald-500 transition-all"
                   >
-                    <option value="active">Hoạt động</option>
-                    <option value="inactive">Không hoạt động</option>
-                    <option value="error">Lỗi</option>
+                    <option value="active">{t('status.active')}</option>
+                    <option value="inactive">{t('status.inactive')}</option>
+                    <option value="error">{t('status.error')}</option>
                   </select>
                 </div>
 
@@ -290,14 +294,14 @@ export default function ProxiesView() {
                     ) : (
                       <Save className="w-4 h-4" />
                     )}
-                    {saving ? 'Đang lưu...' : 'Lưu'}
+                    {saving ? t('common.saving') : t('common.save')}
                   </button>
                   <button
                     type="button"
                     onClick={handleCancel}
                     className="px-4 py-2.5 bg-slate-700 hover:bg-slate-600 text-slate-300 rounded-xl text-sm font-medium transition-all"
                   >
-                    Hủy
+                    {t('common.cancel')}
                   </button>
                 </div>
               </form>
@@ -314,8 +318,8 @@ export default function ProxiesView() {
           ) : proxies.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-48 text-slate-500">
               <Globe className="w-12 h-12 mb-3 opacity-40" />
-              <p className="text-sm">Chưa có proxy nào</p>
-              <p className="text-xs mt-1">Nhấn "Thêm proxy" để bắt đầu</p>
+              <p className="text-sm">{t('proxies.emptyTitle')}</p>
+              <p className="text-xs mt-1">{t('proxies.emptyText')}</p>
             </div>
           ) : (
             <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
@@ -364,10 +368,10 @@ export default function ProxiesView() {
                         <WifiOff className="w-3 h-3" />
                       )}
                       {proxy.status === 'active'
-                        ? 'Hoạt động'
+                        ? t('status.active')
                         : proxy.status === 'error'
-                          ? 'Lỗi'
-                          : 'Tắt'}
+                          ? t('status.error')
+                          : t('status.inactiveShort')}
                     </span>
                   </div>
 
@@ -375,14 +379,14 @@ export default function ProxiesView() {
                   <div className="text-xs text-slate-500 space-y-1 mb-4">
                     {proxy.username && (
                       <p>
-                        Tài khoản:{' '}
+                        {t('proxies.card.account')}{' '}
                         <span className="text-slate-400">{proxy.username}</span>
                       </p>
                     )}
                     <p>
-                      Cập nhật:{' '}
+                      {t('proxies.card.updated')}{' '}
                       <span className="text-slate-400">
-                        {new Date(proxy.updated_at).toLocaleString('vi-VN')}
+                        {new Date(proxy.updated_at).toLocaleString(dateLocale)}
                       </span>
                     </p>
                   </div>
@@ -394,14 +398,14 @@ export default function ProxiesView() {
                       className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 rounded-lg text-xs font-medium transition-all"
                     >
                       <Pencil className="w-3.5 h-3.5" />
-                      Sửa
+                      {t('common.edit')}
                     </button>
                     <button
                       onClick={() => handleDelete(proxy.id)}
                       className="flex items-center gap-1.5 px-3 py-1.5 bg-red-500/10 hover:bg-red-500/20 text-red-400 rounded-lg text-xs font-medium transition-all"
                     >
                       <Trash2 className="w-3.5 h-3.5" />
-                      Xóa
+                      {t('common.delete')}
                     </button>
                   </div>
                 </div>

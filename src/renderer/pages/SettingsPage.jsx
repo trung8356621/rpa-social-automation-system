@@ -1,9 +1,10 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useDispatch, useSelector } from 'react-redux';
 import {
   AlertCircle,
   Braces,
   FolderOpen,
+  Globe2,
   Loader2,
   Monitor,
   Save,
@@ -11,16 +12,19 @@ import {
 import { fetchSettings, saveSettings, updateSetting } from '../slices/settingsSlice';
 import { showToast } from '../slices/uiSlice';
 import { pickDirectoryWithInput } from '../utils/filePicker';
-
-const tabs = [
-  { id: 'browser', label: 'Trình duyệt', icon: Monitor },
-  { id: 'automation', label: 'Tự động hóa', icon: Braces },
-];
+import { SUPPORTED_LANGUAGES, useTranslation } from '../i18n';
 
 export default function SettingsPage() {
   const dispatch = useDispatch();
+  const { t } = useTranslation();
   const { values, loading, saving, saved, error } = useSelector((state) => state.settings);
-  const [activeTab, setActiveTab] = useState('browser');
+  const [activeTab, setActiveTab] = useState('general');
+
+  const tabs = useMemo(() => ([
+    { id: 'general', label: t('settings.tabs.general'), icon: Globe2 },
+    { id: 'browser', label: t('settings.tabs.browser'), icon: Monitor },
+    { id: 'automation', label: t('settings.tabs.automation'), icon: Braces },
+  ]), [t]);
 
   useEffect(() => {
     dispatch(fetchSettings());
@@ -28,9 +32,9 @@ export default function SettingsPage() {
 
   useEffect(() => {
     if (saved) {
-      dispatch(showToast({ type: 'success', message: 'Đã lưu cài đặt' }));
+      dispatch(showToast({ type: 'success', message: t('settings.toast.saved') }));
     }
-  }, [dispatch, saved]);
+  }, [dispatch, saved, t]);
 
   const setValue = (key, value) => {
     dispatch(updateSetting({ key, value }));
@@ -39,7 +43,7 @@ export default function SettingsPage() {
   const handleSave = async () => {
     const result = await dispatch(saveSettings(values));
     if (result.meta.requestStatus === 'rejected') {
-      dispatch(showToast({ type: 'error', message: result.payload || 'Lưu cài đặt thất bại' }));
+      dispatch(showToast({ type: 'error', message: result.payload || t('settings.toast.saveFailed') }));
     }
   };
 
@@ -49,10 +53,13 @@ export default function SettingsPage() {
       if (directory) {
         setValue('browser.userDataDir', directory);
       }
-    } catch (error) {
+    } catch (pickerError) {
       const directory = await pickDirectoryWithInput();
       if (directory) setValue('browser.userDataDir', directory);
-      else dispatch(showToast({ type: 'error', message: error.message || 'Không mở được hộp chọn folder' }));
+      else dispatch(showToast({
+        type: 'error',
+        message: pickerError.message || t('common.errors.folderPickerFailed'),
+      }));
     }
   };
 
@@ -60,12 +67,12 @@ export default function SettingsPage() {
     <div className="page-shell">
       <div className="page-header">
         <div>
-          <h1 className="page-title">Cài đặt</h1>
-          <p className="page-subtitle">Cấu hình trình duyệt và hành vi tự động hóa.</p>
+          <h1 className="page-title">{t('settings.title')}</h1>
+          <p className="page-subtitle">{t('settings.subtitle')}</p>
         </div>
         <button type="button" onClick={handleSave} disabled={saving || loading} className="btn-primary">
           {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-          {saving ? 'Đang lưu...' : 'Lưu cài đặt'}
+          {saving ? t('settings.saving') : t('settings.save')}
         </button>
       </div>
 
@@ -107,11 +114,33 @@ export default function SettingsPage() {
             </div>
           ) : (
             <>
+              {activeTab === 'general' && (
+                <div className="space-y-5">
+                  <h2 className="flex items-center gap-2 text-base font-semibold text-white">
+                    <Globe2 className="h-5 w-5 text-[#7db4ff]" />
+                    {t('settings.tabs.general')}
+                  </h2>
+
+                  <Field label={t('settings.language.label')}>
+                    <select
+                      value={values['app.language'] || 'vi'}
+                      onChange={(event) => setValue('app.language', event.target.value)}
+                      className="select-field max-w-xs"
+                    >
+                      {SUPPORTED_LANGUAGES.map((lang) => (
+                        <option key={lang.code} value={lang.code}>{lang.label}</option>
+                      ))}
+                    </select>
+                    <p className="mt-1 text-xs text-[#6f7d90]">{t('settings.language.hint')}</p>
+                  </Field>
+                </div>
+              )}
+
               {activeTab === 'browser' && (
                 <div className="space-y-5">
                   <h2 className="flex items-center gap-2 text-base font-semibold text-white">
                     <Monitor className="h-5 w-5 text-[#7db4ff]" />
-                    Cấu hình trình duyệt
+                    {t('settings.browser.title')}
                   </h2>
 
                   <label className="flex items-center gap-3 text-sm text-[#c7d0dc]">
@@ -121,11 +150,11 @@ export default function SettingsPage() {
                       onChange={(event) => setValue('browser.headless', event.target.checked)}
                       className="h-4 w-4 accent-[#2f80ed]"
                     />
-                    Chạy ẩn (headless mode)
+                    {t('settings.browser.headless')}
                   </label>
 
                   <div className="grid grid-cols-2 gap-4">
-                    <Field label="Chiều rộng viewport">
+                    <Field label={t('settings.browser.viewportWidth')}>
                       <input
                         type="number"
                         min="800"
@@ -135,7 +164,7 @@ export default function SettingsPage() {
                         className="input-field"
                       />
                     </Field>
-                    <Field label="Chiều cao viewport">
+                    <Field label={t('settings.browser.viewportHeight')}>
                       <input
                         type="number"
                         min="600"
@@ -147,22 +176,20 @@ export default function SettingsPage() {
                     </Field>
                   </div>
 
-                  <Field label="Thư mục dữ liệu người dùng mặc định">
+                  <Field label={t('settings.browser.userDataDir')}>
                     <div className="flex gap-2">
                       <input
                         type="text"
                         value={values['browser.userDataDir']}
                         onChange={(event) => setValue('browser.userDataDir', event.target.value)}
                         className="input-field"
-                        placeholder="Để trống để dùng theo browser profile đã chọn"
+                        placeholder={t('settings.browser.userDataDirPlaceholder')}
                       />
                       <button type="button" onClick={chooseUserDataDir} className="icon-button bg-[#243244]">
                         <FolderOpen className="h-4 w-4" />
                       </button>
                     </div>
-                    <p className="mt-1 text-xs text-[#6f7d90]">
-                      Tùy chọn này được lưu trong SQLite; browser profile scan được vẫn ưu tiên dùng thư mục riêng của nó.
-                    </p>
+                    <p className="mt-1 text-xs text-[#6f7d90]">{t('settings.browser.userDataDirHint')}</p>
                   </Field>
                 </div>
               )}
@@ -171,11 +198,11 @@ export default function SettingsPage() {
                 <div className="space-y-5">
                   <h2 className="flex items-center gap-2 text-base font-semibold text-white">
                     <Braces className="h-5 w-5 text-[#7db4ff]" />
-                    Cấu hình tự động hóa
+                    {t('settings.automation.title')}
                   </h2>
 
                   <div className="grid grid-cols-2 gap-4">
-                    <Field label="Chờ trước mỗi bước (ms)">
+                    <Field label={t('settings.automation.waitBefore')}>
                       <input
                         type="number"
                         min="0"
@@ -185,7 +212,7 @@ export default function SettingsPage() {
                         className="input-field"
                       />
                     </Field>
-                    <Field label="Chờ sau mỗi bước (ms)">
+                    <Field label={t('settings.automation.waitAfter')}>
                       <input
                         type="number"
                         min="0"
@@ -197,7 +224,7 @@ export default function SettingsPage() {
                     </Field>
                   </div>
 
-                  <Field label="Số lần thử lại tối đa">
+                  <Field label={t('settings.automation.maxRetries')}>
                     <input
                       type="number"
                       min="0"
@@ -208,7 +235,7 @@ export default function SettingsPage() {
                     />
                   </Field>
 
-                  <Field label="Chờ trước khi đóng browser sau thực thi (ms)">
+                  <Field label={t('settings.automation.browserCloseDelay')}>
                     <input
                       type="number"
                       min="1000"
@@ -221,9 +248,7 @@ export default function SettingsPage() {
                       )}
                       className="input-field max-w-xs"
                     />
-                    <p className="mt-1 text-xs text-[#6f7d90]">
-                      Chromium cần thời gian ghi cookie/session vào profile. Mặc định 5000ms.
-                    </p>
+                    <p className="mt-1 text-xs text-[#6f7d90]">{t('settings.automation.browserCloseDelayHint')}</p>
                   </Field>
 
                   <label className="flex items-center gap-3 text-sm text-[#c7d0dc]">
@@ -233,7 +258,7 @@ export default function SettingsPage() {
                       onChange={(event) => setValue('automation.screenshotOnError', event.target.checked)}
                       className="h-4 w-4 accent-[#2f80ed]"
                     />
-                    Tự động chụp màn hình khi có lỗi
+                    {t('settings.automation.screenshotOnError')}
                   </label>
                 </div>
               )}

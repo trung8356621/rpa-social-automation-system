@@ -3,6 +3,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import puppeteer from 'puppeteer';
+import { resolveGuestSessionDir, resolveSessionStartUrl } from './BrowserSessionPaths.js';
+import { resolveScenarioTargetUrl } from '../rpa/VariableResolver.js';
 
 const BROWSER_DEFINITIONS = [
   {
@@ -151,7 +153,7 @@ class BrowserProfileService {
     };
   }
 
-  resolveSessionUserDataDir(scenarioId, browserProfileId) {
+  resolveSessionUserDataDir(scenarioId, browserProfileId, variableProfileId = null) {
     const settings = this.dbService.getSettings();
     const browserDataRoot = settings['browser.userDataDir'] || path.join(this.appDataPath, 'browser-data');
 
@@ -168,24 +170,11 @@ class BrowserProfileService {
       throw new Error('Chọn kịch bản để dùng guest session');
     }
 
-    const sessionDir = path.join(browserDataRoot, 'guest', 'sessions', scenarioId);
-    fs.mkdirSync(path.join(sessionDir, 'Default'), { recursive: true });
-    return sessionDir;
+    return resolveGuestSessionDir(browserDataRoot, scenarioId, variableProfileId);
   }
 
   resolveSessionStartUrl(startUrl) {
-    const url = String(startUrl || '').trim();
-    if (!url) return null;
-
-    try {
-      const parsed = new URL(url);
-      if (parsed.pathname.includes('wp-login.php')) {
-        return `${parsed.origin}/wp-admin/`;
-      }
-      return url;
-    } catch {
-      return url;
-    }
+    return resolveSessionStartUrl(startUrl);
   }
 
   async waitForProfileUnlock(userDataDir, maxWaitMs = 30000) {
@@ -246,7 +235,13 @@ class BrowserProfileService {
   async openBrowserSession({ scenarioId, browserProfileId = null, startUrl = null }) {
     const userDataDir = this.resolveSessionUserDataDir(scenarioId, browserProfileId);
     await this.waitForProfileUnlock(userDataDir);
-    const effectiveStartUrl = this.resolveSessionStartUrl(startUrl);
+    let effectiveStartUrl = startUrl;
+    if (scenarioId && startUrl) {
+      const variableMap = this.dbService.buildVariableMap(scenarioId, null);
+      effectiveStartUrl = resolveScenarioTargetUrl(startUrl, variableMap);
+    } else {
+      effectiveStartUrl = this.resolveSessionStartUrl(startUrl);
+    }
     const result = await this._launchPuppeteerWithProfile(userDataDir, effectiveStartUrl);
     return {
       ...result,

@@ -8,11 +8,12 @@ import {
 } from '../slices/scenarioSlice';
 import { setCurrentPage, showToast } from '../slices/uiSlice';
 import ScenarioEditor from '../components/ScenarioEditor';
-import { Clock, Edit3, FileText, Globe, Play, Plus, Search, Trash2, X } from 'lucide-react';
+import { useTranslation } from '../i18n';
+import { Clock, Edit3, FileText, Globe, Play, Plus, Search, Trash2, Upload, X } from 'lucide-react';
 
-const createDraftScenario = () => ({
+const createDraftScenario = (t) => ({
   id: null,
-  name: 'Kịch bản mới',
+  name: t('scenarios.defaultName'),
   description: '',
   platform: 'facebook',
   target_url: 'https://www.facebook.com',
@@ -24,9 +25,12 @@ const createDraftScenario = () => ({
 
 export default function ScenariosPage() {
   const dispatch = useDispatch();
+  const { t, language } = useTranslation();
+  const dateLocale = language === 'en' ? 'en-US' : 'vi-VN';
   const { items: scenarios, loading, currentScenario } = useSelector((state) => state.scenarios);
   const [searchQuery, setSearchQuery] = useState('');
   const [deleteConfirm, setDeleteConfirm] = useState(null);
+  const [importing, setImporting] = useState(false);
 
   useEffect(() => {
     dispatch(fetchScenarios());
@@ -51,17 +55,36 @@ export default function ScenariosPage() {
     }
   }, [dispatch]);
 
+  const handleImportScenario = useCallback(async () => {
+    setImporting(true);
+    try {
+      const result = await window.electronAPI.importScenario();
+      if (result?.cancelled) return;
+      if (!result?.scenario?.id) {
+        dispatch(showToast({ type: 'error', message: t('scenarios.toast.importFailed') }));
+        return;
+      }
+      await dispatch(fetchScenarios());
+      dispatch(fetchScenarioDetails(result.scenario.id));
+      dispatch(showToast({ type: 'success', message: t('scenarios.toast.imported') }));
+    } catch (error) {
+      dispatch(showToast({ type: 'error', message: error.message || t('scenarios.toast.importFailed') }));
+    } finally {
+      setImporting(false);
+    }
+  }, [dispatch, t]);
+
   const handleDelete = useCallback(async () => {
     if (!deleteConfirm) return;
 
     const result = await dispatch(deleteScenario(deleteConfirm));
     if (result.meta.requestStatus === 'fulfilled') {
-      dispatch(showToast({ type: 'success', message: 'Đã xóa kịch bản' }));
+      dispatch(showToast({ type: 'success', message: t('scenarios.toast.deleted') }));
     } else {
-      dispatch(showToast({ type: 'error', message: result.payload || 'Xóa kịch bản thất bại' }));
+      dispatch(showToast({ type: 'error', message: result.payload || t('scenarios.toast.deleteFailed') }));
     }
     setDeleteConfirm(null);
-  }, [deleteConfirm, dispatch]);
+  }, [deleteConfirm, dispatch, t]);
 
   if (currentScenario) {
     return <ScenarioEditor scenario={currentScenario} onBack={() => dispatch(setCurrentScenario(null))} />;
@@ -71,13 +94,24 @@ export default function ScenariosPage() {
     <div className="page-shell">
       <div className="page-header">
         <div>
-          <h1 className="page-title">Kịch bản</h1>
-          <p className="page-subtitle">Quản lý luồng tự động hóa dùng Puppeteer trên browser Chromium.</p>
+          <h1 className="page-title">{t('scenarios.title')}</h1>
+          <p className="page-subtitle">{t('scenarios.subtitle')}</p>
         </div>
-        <button type="button" onClick={() => openEditor(createDraftScenario())} className="btn-primary">
-          <Plus className="h-4 w-4" />
-          Tạo kịch bản
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={handleImportScenario}
+            disabled={importing}
+            className="btn-secondary"
+          >
+            <Upload className="h-4 w-4" />
+            {importing ? t('common.loading') : t('scenarios.import')}
+          </button>
+          <button type="button" onClick={() => openEditor(createDraftScenario(t))} className="btn-primary">
+            <Plus className="h-4 w-4" />
+            {t('scenarios.create')}
+          </button>
+        </div>
       </div>
 
       <div className="panel mb-5 p-4">
@@ -88,35 +122,35 @@ export default function ScenariosPage() {
             value={searchQuery}
             onChange={(event) => setSearchQuery(event.target.value)}
             className="input-field pl-10"
-            placeholder="Tìm theo tên, mô tả, nền tảng, URL hoặc ID..."
+            placeholder={t('scenarios.searchPlaceholder')}
           />
         </div>
       </div>
 
       {loading ? (
-        <div className="panel flex items-center justify-center py-16 text-sm text-[#9aa7b7]">Đang tải kịch bản...</div>
+        <div className="panel flex items-center justify-center py-16 text-sm text-[#9aa7b7]">{t('scenarios.loading')}</div>
       ) : filteredScenarios.length === 0 ? (
         <div className="panel flex flex-col items-center justify-center py-16 text-center">
           <FileText className="mb-3 h-12 w-12 text-[#6f7d90]" />
           <p className="text-sm font-semibold text-white">
-            {searchQuery ? 'Không tìm thấy kịch bản phù hợp' : 'Chưa có kịch bản nào'}
+            {searchQuery ? t('scenarios.emptySearch') : t('scenarios.emptyTitle')}
           </p>
-          <p className="mt-1 text-sm text-[#9aa7b7]">Tạo kịch bản mới để bắt đầu dựng timeline tự động hóa.</p>
+          <p className="mt-1 text-sm text-[#9aa7b7]">{t('scenarios.emptyText')}</p>
           {!searchQuery && (
-            <button type="button" onClick={() => openEditor(createDraftScenario())} className="btn-primary mt-4">
+            <button type="button" onClick={() => openEditor(createDraftScenario(t))} className="btn-primary mt-4">
               <Plus className="h-4 w-4" />
-              Tạo kịch bản
+              {t('scenarios.create')}
             </button>
           )}
         </div>
       ) : (
         <div className="panel w-full overflow-hidden">
           <div className="grid grid-cols-[minmax(280px,1.35fr)_minmax(260px,1fr)_120px_90px_170px_120px] border-b border-[#2e3b4e] px-4 py-3 text-xs font-semibold uppercase tracking-wide text-[#7e8da5]">
-            <span>Kịch bản</span>
-            <span>URL</span>
-            <span>Nền tảng</span>
-            <span>Bước</span>
-            <span>Cập nhật</span>
+            <span>{t('scenarios.title')}</span>
+            <span>{t('scenarios.table.url')}</span>
+            <span>{t('scenarios.table.platform')}</span>
+            <span>{t('scenarios.table.steps')}</span>
+            <span>{t('scenarios.table.updated')}</span>
             <span className="text-right"></span>
           </div>
 
@@ -139,7 +173,7 @@ export default function ScenariosPage() {
                 </button>
 
                 <div className="min-w-0">
-                  <p className="truncate text-sm text-[#c7d0dc]">{scenario.target_url || scenario.description || 'Chưa có URL'}</p>
+                  <p className="truncate text-sm text-[#c7d0dc]">{scenario.target_url || scenario.description || t('common.noUrl')}</p>
                   {scenario.description && scenario.target_url && (
                     <p className="mt-0.5 truncate text-xs text-[#7e8da5]">{scenario.description}</p>
                   )}
@@ -154,11 +188,11 @@ export default function ScenariosPage() {
 
                 <span className="inline-flex items-center gap-1 text-xs text-[#9aa7b7]">
                   <Clock className="h-3.5 w-3.5" />
-                  {scenario.updated_at ? new Date(scenario.updated_at).toLocaleString('vi-VN') : 'Chưa cập nhật'}
+                  {scenario.updated_at ? new Date(scenario.updated_at).toLocaleString(dateLocale) : t('common.notUpdated')}
                 </span>
 
                 <div className="flex justify-end gap-2">
-                  <button type="button" onClick={() => openEditor(scenario)} className="icon-button" title="Chỉnh sửa">
+                  <button type="button" onClick={() => openEditor(scenario)} className="icon-button" title={t('common.edit')}>
                     <Edit3 className="h-4 w-4" />
                   </button>
                   <button
@@ -168,7 +202,7 @@ export default function ScenariosPage() {
                       dispatch(setCurrentPage('executions'));
                     }}
                     className="icon-button text-[#8ddfc7]"
-                    title="Chạy"
+                    title={t('common.run')}
                   >
                     <Play className="h-4 w-4" />
                   </button>
@@ -176,7 +210,7 @@ export default function ScenariosPage() {
                     type="button"
                     onClick={() => setDeleteConfirm(scenario.id)}
                     className="icon-button text-[#ffb4b4]"
-                    title="Xóa"
+                    title={t('common.delete')}
                   >
                     <Trash2 className="h-4 w-4" />
                   </button>
@@ -188,16 +222,16 @@ export default function ScenariosPage() {
       )}
 
       {deleteConfirm && (
-        <Modal title="Xóa kịch bản" onClose={() => setDeleteConfirm(null)}>
+        <Modal title={t('scenarios.deleteModal.title')} onClose={() => setDeleteConfirm(null)}>
           <p className="text-sm text-[#c7d0dc]">
-            Kịch bản và các bước liên quan sẽ bị xóa. Thao tác này không thể hoàn tác.
+            {t('scenarios.deleteModal.body')}
           </p>
           <div className="mt-6 flex justify-end gap-3">
             <button type="button" onClick={() => setDeleteConfirm(null)} className="btn-secondary">
-              Hủy
+              {t('common.cancel')}
             </button>
             <button type="button" onClick={handleDelete} className="btn-danger">
-              Xóa
+              {t('common.delete')}
             </button>
           </div>
         </Modal>

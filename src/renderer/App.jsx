@@ -2,6 +2,7 @@ import React, { useEffect } from 'react';
 import { useSelector, useDispatch } from 'react-redux';
 import { updateExecutionStatus } from './slices/executionSlice';
 import { fetchLocalScenarios } from './slices/scenarioSlice';
+import { fetchSettings } from './slices/settingsSlice';
 import Sidebar from './components/Sidebar';
 import Toast from './components/Toast';
 import DashboardPage from './pages/DashboardPage';
@@ -58,10 +59,19 @@ function useAutoRefreshScenarios() {
   }, [dispatch]);
 }
 
+function useBootstrapApp() {
+  const dispatch = useDispatch();
+
+  useEffect(() => {
+    dispatch(fetchSettings());
+  }, [dispatch]);
+}
+
 export default function App() {
   const { currentPage } = useSelector((state) => state.ui);
 
   // Kích hoạt các hooks
+  useBootstrapApp();
   useExecutionListener();
   useAutoRefreshScenarios();
 

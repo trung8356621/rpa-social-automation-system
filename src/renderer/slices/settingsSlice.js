@@ -1,6 +1,7 @@
 import { createAsyncThunk, createSlice } from '@reduxjs/toolkit';
 
 export const defaultSettings = {
+  'app.language': 'vi',
   'browser.headless': false,
   'browser.viewportWidth': 1280,
   'browser.viewportHeight': 800,

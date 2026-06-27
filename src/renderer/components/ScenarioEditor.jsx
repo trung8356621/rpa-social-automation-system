@@ -7,6 +7,7 @@ import {
   ChevronRight,
   CircleDot,
   Code2,
+  Download,
   ExternalLink,
   Eye,
   FileDown,
@@ -30,9 +31,11 @@ import {
   X,
 } from 'lucide-react';
 import { setCurrentPage, showToast } from '../slices/uiSlice';
+import { fetchScenarios } from '../slices/scenarioSlice';
+import { useTranslation } from '../i18n/index.jsx';
 import VariableInput from './VariableInput';
 import ScenarioVariablesBar from './ScenarioVariablesBar';
-import DataProfileSelect, { readStoredDataProfileId } from './DataProfileSelect';
+import DataProfileSelect from './DataProfileSelect';
 import { normalizeActionType } from '../utils/variables';
 
 const DEFAULT_ACTION_DELAY_MS = 300;
@@ -68,23 +71,24 @@ function PanelSectionHeader({ icon: Icon, title, trailing, onToggle, open }) {
   );
 }
 
-const ACTION_BUTTONS = [
-  { actionType: 'navigate', icon: ExternalLink, label: 'Đi tới URL' },
-  { actionType: 'click', icon: MousePointer2, label: 'Click' },
-  { actionType: 'input', icon: Keyboard, label: 'Input' },
-  { actionType: 'wait', icon: Timer, label: 'Wait' },
+const ACTION_BUTTON_KEYS = [
+  { actionType: 'navigate', icon: ExternalLink, labelKey: 'scenarioEditor.actions.navigate' },
+  { actionType: 'click', icon: MousePointer2, labelKey: 'scenarioEditor.actions.click' },
+  { actionType: 'input', icon: Keyboard, labelKey: 'scenarioEditor.actions.input' },
+  { actionType: 'wait', icon: Timer, labelKey: 'scenarioEditor.actions.wait' },
 ];
 
 function ActionIconBar({ onAddStep }) {
+  const { t } = useTranslation();
   return (
     <div className="flex w-10 shrink-0 flex-col items-center gap-1 border-r border-[#2a2d34] bg-[#15171d] py-2">
-      {ACTION_BUTTONS.map(({ actionType, icon: ActionIcon, label }) => (
+      {ACTION_BUTTON_KEYS.map(({ actionType, icon: ActionIcon, labelKey }) => (
         <button
           key={actionType}
           type="button"
           onClick={() => onAddStep(actionType)}
           className="flex h-9 w-9 items-center justify-center rounded text-[#9aa7b7] transition hover:bg-[#1c2130] hover:text-white"
-          title={label}
+          title={t(labelKey)}
         >
           <ActionIcon className="h-4 w-4" />
         </button>
@@ -115,7 +119,7 @@ function Field({ label, value, className = '' }) {
 
 const defaultConfig = {
   navigate: { url: '' },
-  click: { selector: '' },
+  click: { selector: '', skip_if_checked: false },
   input: { selector: '', text: '' },
   type: { selector: '', text: '' },
   wait: { duration: 2000 },
@@ -385,23 +389,13 @@ function formatSeconds(totalMs) {
   return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}.${String(Math.floor(millis / 100)).padStart(1, '0')}`;
 }
 
-function describeStep(actionType, config) {
+function describeStep(actionType, config, t) {
   const descriptions = {
-    navigate: 'Điều hướng đến trang web',
-    click: 'Click vào phần tử trên trang',
-    input: 'Nhập văn bản vào ô input',
-    type: 'Nhập văn bản vào ô input',
-    wait: 'Chờ trong một khoảng thời gian',
-    waitForElement: 'Chờ phần tử xuất hiện',
-    screenshot: 'Chụp màn hình',
-    scroll: 'Cuộn trang',
-    extractText: 'Trích xuất văn bản',
-    submit: 'Gửi form',
-    login: 'Đăng nhập',
-    facebookPost: 'Đăng bài Facebook',
-    like: 'Tương tác Like',
-    comment: 'Viết bình luận',
-    customScript: 'Chạy JavaScript tùy chỉnh',
+    navigate: t('scenarioEditor.stepDescriptions.navigate'),
+    click: t('scenarioEditor.stepDescriptions.click'),
+    input: t('scenarioEditor.stepDescriptions.input'),
+    type: t('scenarioEditor.stepDescriptions.type'),
+    wait: t('scenarioEditor.stepDescriptions.wait'),
   };
   return descriptions[actionType] || actionType || 'Unknown';
 }
@@ -448,6 +442,7 @@ function drawImageContain(ctx, img, canvasWidth, canvasHeight) {
 }
 
 function StepCard({ step, index, isSelected, onSelect, onDelete, onUpdate }) {
+  const { t } = useTranslation();
   const config = step.action_config || {};
   const Icon = getAction(step.action_type);
   const time = getStepTime(step, []);
@@ -471,7 +466,7 @@ function StepCard({ step, index, isSelected, onSelect, onDelete, onUpdate }) {
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
           <span className="truncate text-xs font-medium text-white">
-            {describeStep(step.action_type, config)}
+            {describeStep(step.action_type, config, t)}
           </span>
           <span className="shrink-0 text-[10px] text-[#76849b]">{formatSeconds(time)}</span>
         </div>
@@ -481,7 +476,10 @@ function StepCard({ step, index, isSelected, onSelect, onDelete, onUpdate }) {
         )}
 
         {step.action_type === 'click' && selector && (
-          <div className="mt-0.5 truncate text-[10px] text-[#9aa7b7]">{selector}</div>
+          <div className="mt-0.5 truncate text-[10px] text-[#9aa7b7]">
+            {selector}
+            {config.skip_if_checked ? t('scenarioEditor.skipIfCheckedBadge') : ''}
+          </div>
         )}
 
         {(['input', 'type'].includes(step.action_type)) && (
@@ -513,10 +511,11 @@ function ScenarioInfoPanel({
   variables,
   onScenarioChange,
 }) {
+  const { t } = useTranslation();
   return (
     <div className="grid grid-cols-2 gap-3">
       <label className="block">
-        <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">Nền tảng</span>
+        <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">{t('scenarioEditor.info.platform')}</span>
         <select
           value={platform}
           onChange={(event) => onScenarioChange({ nextPlatform: event.target.value })}
@@ -527,27 +526,27 @@ function ScenarioInfoPanel({
           <option value="tiktok">TikTok</option>
           <option value="youtube">YouTube</option>
           <option value="linkedin">LinkedIn</option>
-          <option value="custom">Tùy chỉnh</option>
+          <option value="custom">{t('scenarioEditor.platform.custom')}</option>
         </select>
       </label>
 
       <label className="block">
-        <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">URL chính</span>
+        <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">{t('scenarioEditor.info.targetUrl')}</span>
         <VariableInput
           value={targetUrl || ''}
           onChange={(value) => onScenarioChange({ nextTargetUrl: value })}
           variables={variables}
-          placeholder="https://... hoặc {{variable}}"
+          placeholder={t('scenarioEditor.info.urlPlaceholder')}
         />
       </label>
 
       <label className="col-span-2 block">
-        <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">Mô tả</span>
+        <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">{t('scenarioEditor.info.description')}</span>
         <textarea
           value={description || ''}
           onChange={(event) => onScenarioChange({ nextDescription: event.target.value })}
           className="textarea-field min-h-[70px]"
-          placeholder="Ghi chú kịch bản..."
+          placeholder={t('scenarioEditor.info.descriptionPlaceholder')}
         />
       </label>
     </div>
@@ -559,6 +558,7 @@ function StepEditPanel({
   variables,
   onStepChange,
 }) {
+  const { t } = useTranslation();
   const config = selectedStep?.action_config || {};
 
   const updateActionConfig = (patch) => {
@@ -591,7 +591,7 @@ function StepEditPanel({
         {selectedStep ? (
           <>
             <label className="block">
-              <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">Loại bước</span>
+              <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">{t('scenarioEditor.step.type')}</span>
               <select
                 value={normalizeActionType(selectedStep.action_type)}
                 onChange={(event) => {
@@ -607,10 +607,10 @@ function StepEditPanel({
                 }}
                 className="select-field h-9"
               >
-                <option value="navigate">Đi tới URL</option>
-                <option value="click">Click</option>
-                <option value="input">Input</option>
-                <option value="wait">Wait</option>
+                <option value="navigate">{t('scenarioEditor.actions.navigate')}</option>
+                <option value="click">{t('scenarioEditor.actions.click')}</option>
+                <option value="input">{t('scenarioEditor.actions.input')}</option>
+                <option value="wait">{t('scenarioEditor.actions.wait')}</option>
               </select>
             </label>
 
@@ -623,21 +623,21 @@ function StepEditPanel({
                   value={config.url || ''}
                   onChange={(value) => updateSelector(value)}
                   variables={variables}
-                  placeholder="https://example.com hoặc {{variable}}"
+                  placeholder={t('scenarioEditor.step.urlOrVariable')}
                 />
               ) : (
                 <input
                   value={config.selector || selectedStep.target_anchor?.selector_value || ''}
                   onChange={(event) => updateSelector(event.target.value)}
                   className="input-field h-9"
-                  placeholder="CSS selector, aria label hoặc text"
+                  placeholder={t('scenarioEditor.step.selectorPlaceholder')}
                 />
               )}
             </label>
 
             {(['input', 'type'].includes(selectedStep.action_type)) && (
               <label className="col-span-2 block">
-                <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">Text nhập</span>
+                <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">{t('scenarioEditor.step.text')}</span>
                 <VariableInput
                   value={config.text || ''}
                   onChange={(value) => updateActionConfig({ text: value })}
@@ -647,9 +647,28 @@ function StepEditPanel({
               </label>
             )}
 
+            {selectedStep.action_type === 'click' && (
+              <label className="col-span-2 flex cursor-pointer items-start gap-2 rounded-lg border border-[#2a3144] bg-[#101217] px-3 py-2.5">
+                <input
+                  type="checkbox"
+                  checked={Boolean(config.skip_if_checked)}
+                  onChange={(event) => updateActionConfig({ skip_if_checked: event.target.checked })}
+                  className="mt-0.5 h-4 w-4 shrink-0 accent-[#2f80ed]"
+                />
+                <span className="min-w-0">
+                  <span className="block text-xs font-semibold text-[#dce5f2]">
+                    {t('scenarioEditor.skipIfChecked')}
+                  </span>
+                  <span className="mt-0.5 block text-[11px] leading-relaxed text-[#8b97aa]">
+                    {t('scenarioEditor.skipIfCheckedHint')}
+                  </span>
+                </span>
+              </label>
+            )}
+
             {selectedStep.action_type === 'wait' && (
               <label className="block">
-                <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">Thời gian chờ</span>
+                <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">{t('scenarioEditor.step.waitDuration')}</span>
                 <input
                   type="number"
                   value={config.duration || selectedStep.delay_ms || DEFAULT_ACTION_DELAY_MS}
@@ -661,7 +680,7 @@ function StepEditPanel({
           </>
         ) : (
           <div className="col-span-2 rounded border border-[#2a2d34] bg-[#101217] px-3 py-4 text-sm text-[#8b97aa]">
-            Chọn một bước trong danh sách để chỉnh sửa chi tiết.
+            {t('scenarioEditor.step.selectPrompt')}
           </div>
         )}
       </div>
@@ -678,6 +697,7 @@ function Timeline({
   pendingTrimRange = null,
   onTrimRangeChange,
 }) {
+  const { t } = useTranslation();
   const timelineRef = useRef(null);
   const [dragStartTime, setDragStartTime] = useState(null);
   const maxTime = totalTime || steps.reduce((sum, s) => sum + (s.delay_ms || DEFAULT_ACTION_DELAY_MS), 0) || 10000;
@@ -773,7 +793,7 @@ function Timeline({
               className="absolute top-1/2 h-4 w-4 -translate-x-1/2 -translate-y-1/2 rotate-45 border border-[#7e8da5] bg-[#20242c] data-[active=true]:border-[#ffd2d2] data-[active=true]:bg-[#ff3b59]"
               style={{ left: `${left}%` }}
               data-active={Math.abs(displayTime - currentTime) < Math.max(120, step.delay_ms || DEFAULT_ACTION_DELAY_MS)}
-              title={`${describeStep(step.action_type)} - ${formatSeconds(displayTime)}`}
+              title={`${describeStep(step.action_type, {}, t)} - ${formatSeconds(displayTime)}`}
             />
           );
         })}
@@ -796,6 +816,7 @@ function Timeline({
 
 export default function ScenarioEditor({ scenario, onBack }) {
   const dispatch = useDispatch();
+  const { t } = useTranslation();
 
   // ======== State ========
   const [name, setName] = useState(scenario?.name || '');
@@ -825,6 +846,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
   const [recordStatus, setRecordStatus] = useState(null);
   const [saving, setSaving] = useState(false);
   const [publishing, setPublishing] = useState(false);
+  const [variablesTransferBusy, setVariablesTransferBusy] = useState(false);
   const [settings, setSettings] = useState({});
   const [browserProfileId, setBrowserProfileId] = useState(scenario?.browser_profile_id || '');
   const [browserProfileOptions, setBrowserProfileOptions] = useState([]);
@@ -836,7 +858,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
   const [scenarioVariables, setScenarioVariables] = useState([]);
   const [variablesRefreshKey, setVariablesRefreshKey] = useState(0);
   const [profilesRefreshKey, setProfilesRefreshKey] = useState(0);
-  const [activeDataProfileId, setActiveDataProfileId] = useState('');
+  const [activeVariableProfileId, setActiveVariableProfileId] = useState('');
   const undoStackRef = useRef([]);
   const redoStackRef = useRef([]);
   const isApplyingHistoryRef = useRef(false);
@@ -873,13 +895,21 @@ export default function ScenarioEditor({ scenario, onBack }) {
     loadScenarioVariables(currentScenarioId);
   }, [currentScenarioId, variablesRefreshKey, loadScenarioVariables]);
 
-  useEffect(() => {
-    if (!currentScenarioId) {
-      setActiveDataProfileId('');
-      return;
+  const handleVariableProfileChange = useCallback(async (profileId) => {
+    setActiveVariableProfileId(profileId);
+    if (!currentScenarioId || !window.electronAPI?.setScenarioVariableProfile) return;
+
+    try {
+      await window.electronAPI.setScenarioVariableProfile({
+        scenarioId: currentScenarioId,
+        profileId: profileId || null,
+      });
+      setVariablesRefreshKey((value) => value + 1);
+      setProfilesRefreshKey((value) => value + 1);
+    } catch (error) {
+      dispatch(showToast({ type: 'error', message: error.message || 'Không áp dụng được hồ sơ biến' }));
     }
-    setActiveDataProfileId(readStoredDataProfileId(currentScenarioId));
-  }, [currentScenarioId]);
+  }, [currentScenarioId, dispatch]);
 
   // ======== Derived State ========
   const hasSteps = steps.length > 0;
@@ -1053,6 +1083,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
         setPlatform(s.platform || 'custom');
         setTargetUrl(s.target_url || '');
         setBrowserProfileId(s.browser_profile_id || '');
+        setActiveVariableProfileId(s.variable_profile_id || '');
       }
       if (s?.preview_path) {
         setScenarioPreviewPath(s.preview_path);
@@ -1068,6 +1099,12 @@ export default function ScenarioEditor({ scenario, onBack }) {
       clearUndoHistory();
     }).catch(() => {});
   }, [clearUndoHistory, currentScenarioId]);
+
+  useEffect(() => {
+    if (!currentScenarioId) {
+      setActiveVariableProfileId('');
+    }
+  }, [currentScenarioId]);
 
   useEffect(() => {
     const missingPaths = [
@@ -1176,6 +1213,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
         platform: scenarioDraftRef.current.platform || platform,
         target_url: scenarioDraftRef.current.targetUrl || '',
         browser_profile_id: scenarioDraftRef.current.browserProfileId || null,
+        variable_profile_id: activeVariableProfileId || null,
         recorded_width: activeViewport.width,
         recorded_height: activeViewport.height,
         preview_trim_ranges: [],
@@ -1196,7 +1234,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
     } finally {
       setSaving(false);
     }
-  }, [currentScenarioId, name, platform, activeViewport, steps, manifestFrames, manifestDuration, scenarioManifestPath, dispatch]);
+  }, [currentScenarioId, name, platform, activeViewport, steps, manifestFrames, manifestDuration, scenarioManifestPath, activeVariableProfileId, dispatch]);
 
   const resolveRecordImportProfileId = useCallback(() => {
     const selected = scenarioDraftRef.current.browserProfileId || browserProfileId;
@@ -1376,32 +1414,82 @@ export default function ScenarioEditor({ scenario, onBack }) {
     }
   }, [activeViewport, dispatch, persist, platform, resolveRecordImportProfileId, targetUrl]);
 
-  const handlePublish = useCallback(async () => {
-    if (!currentScenarioId) {
-      const saved = await persist();
-      if (!saved?.id) {
-        dispatch(showToast({ type: 'error', message: 'Lưu kịch bản trước khi xuất bản' }));
+  const ensureScenarioId = useCallback(async () => {
+    if (currentScenarioId) return currentScenarioId;
+    const saved = await persist();
+    return saved?.id || null;
+  }, [currentScenarioId, persist]);
+
+  const handleExportScenario = useCallback(async () => {
+    setVariablesTransferBusy(true);
+    try {
+      const id = await ensureScenarioId();
+      if (!id) {
+        dispatch(showToast({ type: 'error', message: t('scenarios.editor.saveBeforeExport') }));
         return;
       }
+      const result = await window.electronAPI.exportScenario(id);
+      if (result?.cancelled) return;
+      dispatch(showToast({
+        type: 'success',
+        message: t('scenarios.editor.toast.exported', { frames: result?.copiedFrames ?? 0 }),
+      }));
+    } catch (error) {
+      dispatch(showToast({ type: 'error', message: error.message || t('scenarios.editor.toast.exportFailed') }));
+    } finally {
+      setVariablesTransferBusy(false);
     }
-    const id = currentScenarioId;
+  }, [dispatch, ensureScenarioId, t]);
+
+  const handleImportScenario = useCallback(async () => {
+    setVariablesTransferBusy(true);
+    try {
+      const result = await window.electronAPI.importScenario();
+      if (result?.cancelled) return;
+      if (!result?.scenario?.id) {
+        dispatch(showToast({ type: 'error', message: t('scenarios.editor.toast.importFailed') }));
+        return;
+      }
+      setFrameDataUrls({});
+      frameLoadFailedRef.current = new Set();
+      setCurrentScenarioId(result.scenario.id);
+      setVariablesRefreshKey((value) => value + 1);
+      dispatch(fetchScenarios());
+      dispatch(showToast({ type: 'success', message: t('scenarios.editor.toast.imported') }));
+    } catch (error) {
+      dispatch(showToast({ type: 'error', message: error.message || t('scenarios.editor.toast.importFailed') }));
+    } finally {
+      setVariablesTransferBusy(false);
+    }
+  }, [dispatch, t]);
+
+  const handlePublish = useCallback(async () => {
+    let id = currentScenarioId;
+    if (!id) {
+      const saved = await persist();
+      if (!saved?.id) {
+        dispatch(showToast({ type: 'error', message: t('scenarios.editor.saveBeforePublish') }));
+        return;
+      }
+      id = saved.id;
+    }
     setPublishing(true);
-    dispatch(showToast({ type: 'info', message: 'Đang render video từ các frame screenshot...' }));
+    dispatch(showToast({ type: 'info', message: t('scenarios.editor.publishingVideo') }));
     try {
       const result = await window.electronAPI.renderScenarioVideo(id);
       if (result.success) {
         setScenarioPreviewPath(result.filePath);
         setScenarioPreviewUrl(result.fileUrl);
-        dispatch(showToast({ type: 'success', message: 'Xuất bản video thành công!' }));
+        dispatch(showToast({ type: 'success', message: t('scenarios.editor.publishSuccess') }));
       } else {
-        dispatch(showToast({ type: 'error', message: result.error || 'Không thể xuất bản video' }));
+        dispatch(showToast({ type: 'error', message: result.error || t('scenarios.editor.publishFailed') }));
       }
     } catch (error) {
-      dispatch(showToast({ type: 'error', message: error.message || 'Lỗi khi xuất bản video' }));
+      dispatch(showToast({ type: 'error', message: error.message || t('scenarios.editor.publishFailed') }));
     } finally {
       setPublishing(false);
     }
-  }, [currentScenarioId, dispatch, persist]);
+  }, [currentScenarioId, dispatch, persist, t]);
 
   const addStep = useCallback((actionType) => {
     pushUndoSnapshot();
@@ -1466,6 +1554,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
         platform: scenarioDraftRef.current.platform || platform,
         target_url: scenarioDraftRef.current.targetUrl || '',
         browser_profile_id: scenarioDraftRef.current.browserProfileId || null,
+        variable_profile_id: activeVariableProfileId || null,
         recorded_width: activeViewport.width,
         recorded_height: activeViewport.height,
         preview_path: scenarioPreviewPath,
@@ -1563,23 +1652,40 @@ export default function ScenarioEditor({ scenario, onBack }) {
 
         <div className="flex items-center gap-2">
           <DataProfileSelect
-            scenarioId={currentScenarioId}
-            value={activeDataProfileId}
-            onChange={setActiveDataProfileId}
+            value={activeVariableProfileId}
+            onChange={handleVariableProfileChange}
             refreshKey={profilesRefreshKey + variablesRefreshKey}
             className="select-field h-9 min-w-[150px] max-w-[180px] text-xs"
           />
           <ScenarioVariablesBar
             scenarioId={currentScenarioId}
+            refreshKey={variablesRefreshKey}
             onToast={(payload) => dispatch(showToast(payload))}
             onChanged={() => {
               setVariablesRefreshKey((value) => value + 1);
               setProfilesRefreshKey((value) => value + 1);
             }}
           />
-          <IconOnly icon={FileDown} label="Xuất file" />
-          <IconOnly icon={Upload} label={publishing ? 'Đang xuất...' : 'Xuất bản'} onClick={handlePublish} disabled={recording || !hasSteps || publishing} />
-          <IconOnly icon={Share2} label="Chia sẻ" />
+          <button
+            type="button"
+            onClick={handleImportScenario}
+            disabled={variablesTransferBusy || recording}
+            title={t('scenarios.editor.importHint')}
+            className="inline-flex h-9 items-center gap-1.5 rounded-md px-2.5 text-xs font-medium text-[#b8c5d6] ring-1 ring-[#3b4252] hover:bg-[#242833] disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            <Upload className="h-3.5 w-3.5" />
+            {t('scenarios.editor.import')}
+          </button>
+          <button
+            type="button"
+            onClick={handleExportScenario}
+            disabled={variablesTransferBusy || recording}
+            title={t('scenarios.editor.exportHint')}
+            className="inline-flex h-9 items-center gap-1.5 rounded-md px-2.5 text-xs font-medium text-[#b8c5d6] ring-1 ring-[#3b4252] hover:bg-[#242833] disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            <Download className="h-3.5 w-3.5" />
+            {t('scenarios.editor.export')}
+          </button>
           <button
             type="button"
             onClick={handleRecordClick}
@@ -1595,7 +1701,16 @@ export default function ScenarioEditor({ scenario, onBack }) {
           </button>
           <button type="button" onClick={persist} disabled={saving} className="btn-primary h-9">
             <Save className="h-4 w-4" />
-            {saving ? 'Đang lưu' : 'Lưu kịch bản'}
+            {saving ? t('scenarios.editor.saving') : t('scenarios.editor.save')}
+          </button>
+          <button
+            type="button"
+            onClick={handlePublish}
+            disabled={recording || !hasSteps || publishing}
+            className="inline-flex h-9 items-center gap-2 rounded-md bg-[#16804a] px-3 text-sm font-semibold text-white ring-1 ring-[#1f9c5c] hover:bg-[#1a9353] disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            <Upload className="h-4 w-4" />
+            {publishing ? t('scenarios.editor.publishing') : t('scenarios.editor.publish')}
           </button>
           <button type="button" onClick={onBack} className="icon-button" title="Đóng">
             <X className="h-4 w-4" />
@@ -1670,7 +1785,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
           <section className="flex min-h-0 min-w-0 flex-col overflow-x-hidden bg-[#14161b]">
             <PanelSectionHeader
               icon={Info}
-              title="Thông tin kịch bản"
+              title={t('scenarioEditor.info.title')}
               onToggle={() => setScenarioInfoOpen((current) => !current)}
               open={scenarioInfoOpen}
             />
@@ -1703,7 +1818,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
                           className="inline-flex items-center gap-1 rounded border border-[#3c465c] px-2 py-0.5 text-[10px] font-normal normal-case text-[#c7d0dc] hover:bg-[#243047]"
                         >
                           <PanelRightOpen className="h-3 w-3" />
-                          Sửa bước
+                          {t('scenarioEditor.step.editTitle')}
                         </button>
                       )}
                     </div>
@@ -1737,13 +1852,13 @@ export default function ScenarioEditor({ scenario, onBack }) {
                 <div className="flex min-h-0 min-w-0 flex-col border-l border-[#2a2d34] bg-[#15171d]">
                   <PanelSectionHeader
                     icon={MousePointer2}
-                    title="Sửa bước"
+                    title={t('scenarioEditor.step.editTitle')}
                     onToggle={() => setStepEditorOpen((current) => !current)}
                     open={stepEditorOpen}
                     trailing={(
                       <div className="flex items-center gap-2">
                         <span className="max-w-[100px] truncate text-[10px] font-normal normal-case text-[#68758a]">
-                          {selectedStep ? describeStep(selectedStep.action_type) : 'Chưa chọn'}
+                          {selectedStep ? describeStep(selectedStep.action_type, {}, t) : t('scenarioEditor.step.noneSelected')}
                         </span>
                         <button
                           type="button"
@@ -1751,7 +1866,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
                           className="inline-flex items-center gap-1 rounded border border-[#3c465c] px-2 py-0.5 text-[10px] font-normal normal-case text-[#c7d0dc] hover:bg-[#243047]"
                         >
                           <PanelRightClose className="h-3 w-3" />
-                          Ẩn form
+                          {t('scenarioEditor.step.hideForm')}
                         </button>
                       </div>
                     )}

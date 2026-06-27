@@ -50,6 +50,11 @@ Follow these rules when editing or generating code in this repository.
 
 - Keep React UI code under `src/renderer/**`.
 - Use Redux Toolkit slices for shared app state and async flows.
+- **Internationalization (i18n):** UI supports Vietnamese (`vi`) and English (`en`).
+  - Locale files: `src/renderer/i18n/locales/vi.js` and `en.js`.
+  - Use `useTranslation()` from `src/renderer/i18n` in components; never hardcode new user-facing strings in one language only.
+  - Store language in setting `app.language`; default is `vi`.
+  - Use `{param}` placeholders in locale strings for dynamic values.
 - Keep page-level screens in `src/renderer/pages/**` or `src/renderer/views/**`.
 - Keep reusable UI in `src/renderer/components/**`.
 - Use `lucide-react` icons when an icon is needed.
@@ -80,7 +85,7 @@ Follow these rules when editing or generating code in this repository.
 - The repository uses ESM for `.js` files and CommonJS only for preload `.cjs`.
 - Prefer small service methods and clear IPC boundaries over large renderer-side logic.
 - Keep comments useful and short. Add comments only when behavior is non-obvious.
-- Preserve existing Vietnamese domain naming and user-facing text where present.
+- Preserve existing Vietnamese domain wording where present when editing legacy copy; new UI strings must go through i18n locale files in both `vi` and `en`.
 - Do not introduce unrelated refactors while making focused changes.
 
 ## Verification Checklist

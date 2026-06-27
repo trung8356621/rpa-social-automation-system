@@ -5,6 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer';
 import { resolveVariableTemplate } from './VariableResolver.js';
+import { ensureRememberMeChecked, isCheckboxAlreadyChecked, resolveGuestSessionDir, resolveSessionStartUrl } from '../browser/BrowserSessionPaths.js';
 
 const DEFAULT_ACTION_DELAY_MS = 300;
 const DEFAULT_BROWSER_CLOSE_DELAY_MS = 5000;
@@ -34,7 +35,7 @@ class ExecutorService {
     this.isRunning = false;
     this.currentScenario = null;
     this._activeUserDataDir = null;
-    this._currentVariableProfileId = null;
+    this._currentSampleId = null;
     this._variableMap = null;
     this._releaseDirLock = null;
   }
@@ -48,16 +49,10 @@ class ExecutorService {
     const executionId = options.executionId || crypto.randomUUID();
     const startTime = Date.now();
     this._currentBrowserProfileId = options.browserProfileId ?? null;
-    this._currentVariableProfileId = options.variableProfileId
-      ? String(options.variableProfileId).trim() || null
+    this._currentSampleId = options.sampleId
+      ? String(options.sampleId).trim() || null
       : null;
     this._variableMap = null;
-
-    let variableProfileName = null;
-    if (this._currentVariableProfileId) {
-      const profile = this.dbService.getVariableProfileById(this._currentVariableProfileId);
-      variableProfileName = profile?.name || null;
-    }
 
     try {
       const scenario = this.dbService.getScenarioById(scenarioId);
@@ -68,17 +63,25 @@ class ExecutorService {
         throw new Error('[Executor] Kich ban chua co buoc nao. Hay Record truoc khi Play.');
       }
 
+      let variableSampleName = null;
+      let variableProfileId = null;
+      let variableProfileName = null;
+
+      if (this._currentSampleId) {
+        const sample = this.dbService.getVariableProfileSampleById(this._currentSampleId);
+        variableSampleName = sample?.name || null;
+        variableProfileId = sample?.profile_id || null;
+        variableProfileName = sample?.profile_name || null;
+      }
+
       this.currentScenario = scenario;
       this._executionStartedAt = new Date().toISOString();
       this._failedStepIndex = null;
 
-      if (this._currentVariableProfileId) {
-        this._variableMap = this.dbService.buildVariableMap(
-          scenarioId,
-          this._currentVariableProfileId,
-        );
+      this._variableMap = this.dbService.buildVariableMap(scenarioId, this._currentSampleId);
+      if (this._currentSampleId) {
         console.log(
-          `[Executor] Data profile "${variableProfileName || this._currentVariableProfileId}" `
+          `[Executor] Sample "${variableSampleName || this._currentSampleId}" `
           + `(${this._variableMap.size} bien)`,
         );
       }
@@ -96,8 +99,10 @@ class ExecutorService {
         scenario_id: scenarioId,
         scenario_name: scenario.name,
         browser_profile_id: this._currentBrowserProfileId,
-        variable_profile_id: this._currentVariableProfileId,
+        variable_profile_id: variableProfileId,
         variable_profile_name: variableProfileName,
+        variable_sample_id: this._currentSampleId,
+        variable_sample_name: variableSampleName,
         status: 'running',
         total_steps: scenario.steps.length,
         started_at: this._executionStartedAt,
@@ -232,7 +237,11 @@ class ExecutorService {
     }
 
     const browserProfileId = options.browserProfileId ?? null;
-    const userDataDir = await this._resolveExecutionUserDataDir(scenario.id, browserProfileId);
+    const userDataDir = await this._resolveExecutionUserDataDir(
+      scenario.id,
+      browserProfileId,
+      this._currentSampleId,
+    );
     this._activeUserDataDir = userDataDir;
 
     // Serialize browser launches against the same userDataDir. Without this,
@@ -288,13 +297,16 @@ class ExecutorService {
     });
 
     // Chromium's userDataDir persists all cookies natively — no JSON restore needed.
-    // Always navigate to the resolved start URL after launching.
-    const startUrl = this._resolveStartUrl(scenario);
+    // Prefer wp-admin when target is wp-login so an existing session is reused.
+    let startUrl = this._resolveStartUrl(scenario);
     if (startUrl) {
+      startUrl = this.browserProfileService?.resolveSessionStartUrl(startUrl)
+        || resolveSessionStartUrl(startUrl);
       await this.page.goto(startUrl, {
         waitUntil: 'domcontentloaded',
         timeout: 60000,
       });
+      await ensureRememberMeChecked(this.page);
       await this._sleep(400);
     }
   }
@@ -312,9 +324,13 @@ class ExecutorService {
     return url ? this._resolveVariables(url) : null;
   }
 
-  async _resolveExecutionUserDataDir(scenarioId, browserProfileId) {
+  async _resolveExecutionUserDataDir(scenarioId, browserProfileId, sampleId = null) {
     if (this.browserProfileService) {
-      return this.browserProfileService.resolveSessionUserDataDir(scenarioId, browserProfileId);
+      return this.browserProfileService.resolveSessionUserDataDir(
+        scenarioId,
+        browserProfileId,
+        sampleId,
+      );
     }
 
     const settings = this.dbService.getSettings();
@@ -330,9 +346,7 @@ class ExecutorService {
       throw new Error('Không tìm thấy thư mục profile browser trong app');
     }
 
-    const sessionDir = path.join(browserDataRoot, 'guest', 'sessions', scenarioId);
-    await fsp.mkdir(path.join(sessionDir, 'Default'), { recursive: true });
-    return sessionDir;
+    return resolveGuestSessionDir(browserDataRoot, scenarioId, sampleId);
   }
 
   async _executeStep(step, stepIndex) {
@@ -379,10 +393,13 @@ class ExecutorService {
       waitUntil: 'domcontentloaded',
       timeout: 60000,
     });
+    await ensureRememberMeChecked(this.page);
     await this._sleep(400);
   }
 
   async _executeClick(step) {
+    await ensureRememberMeChecked(this.page);
+
     const anchor = step.target_anchor || {};
     const config = anchor.action_config || {};
     const selector = this._resolveSelector(anchor, config);
@@ -392,6 +409,16 @@ class ExecutorService {
     };
 
     const selectors = this._collectSelectors(anchor, config, selector);
+
+    if (config.skip_if_checked) {
+      const alreadyChecked = await isCheckboxAlreadyChecked(this.page, {
+        selectors,
+        coords: anchor.relative_coords,
+        viewport,
+      });
+      if (alreadyChecked) return;
+    }
+
     for (const item of selectors) {
       try {
         await this.page.waitForSelector(item, { timeout: 5000, visible: true });
@@ -405,6 +432,15 @@ class ExecutorService {
 
     const coords = anchor.relative_coords;
     if (coords?.x !== undefined && coords?.y !== undefined) {
+      if (config.skip_if_checked) {
+        const alreadyChecked = await isCheckboxAlreadyChecked(this.page, {
+          selectors: [],
+          coords,
+          viewport,
+        });
+        if (alreadyChecked) return;
+      }
+
       const x = Math.round((coords.x / 100) * viewport.width);
       const y = Math.round((coords.y / 100) * viewport.height);
       await this.page.mouse.move(x, y, { steps: 5 });
@@ -417,6 +453,8 @@ class ExecutorService {
   }
 
   async _executeType(step) {
+    await ensureRememberMeChecked(this.page);
+
     const anchor = step.target_anchor || {};
     const config = anchor.action_config || {};
     const text = this._resolveVariables(config.text || step.key || '');
@@ -506,7 +544,7 @@ class ExecutorService {
     if (!this._variableMap) {
       this._variableMap = this.dbService.buildVariableMap(
         this.currentScenario.id,
-        this._currentVariableProfileId,
+        this._currentSampleId,
       );
     }
 

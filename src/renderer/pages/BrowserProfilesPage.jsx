@@ -25,6 +25,7 @@ import {
 } from '../slices/browserProfileSlice';
 import { showToast } from '../slices/uiSlice';
 import { pickDirectoryWithInput, pickFileWithInput } from '../utils/filePicker';
+import { useLanguage, useTranslation } from '../i18n';
 
 const emptyForm = {
   browser_key: 'chrome',
@@ -39,6 +40,7 @@ const emptyForm = {
 
 export default function BrowserProfilesPage() {
   const dispatch = useDispatch();
+  const { t } = useTranslation();
   const { items, loading, scanning, opening, saving, deleting, lastScan, error } = useSelector(
     (state) => state.browserProfiles,
   );
@@ -93,16 +95,16 @@ export default function BrowserProfilesPage() {
       }));
       dispatch(fetchBrowserProfiles());
     } else {
-      dispatch(showToast({ type: 'error', message: result.payload || 'Quét browser thất bại' }));
+      dispatch(showToast({ type: 'error', message: result.payload || t('browserProfiles.toast.scanFailed') }));
     }
   };
 
   const handleOpen = async (id) => {
     const result = await dispatch(openBrowserProfile(id));
     if (result.meta.requestStatus === 'fulfilled') {
-      dispatch(showToast({ type: 'success', message: 'Đã mở browser profile' }));
+      dispatch(showToast({ type: 'success', message: t('browserProfiles.toast.opened') }));
     } else {
-      dispatch(showToast({ type: 'error', message: result.payload || 'Không mở được browser' }));
+      dispatch(showToast({ type: 'error', message: result.payload || t('browserProfiles.toast.openFailed') }));
     }
   };
 
@@ -115,11 +117,11 @@ export default function BrowserProfilesPage() {
       await dispatch(fetchBrowserProfiles());
       dispatch(showToast({
         type: 'success',
-        message: result.message || `Đã import data từ ${profile.display_name}`,
+        message: result.message || t('browserProfiles.toast.imported', { name: profile.display_name }),
       }));
       setActiveTab('app');
     } catch (err) {
-      dispatch(showToast({ type: 'error', message: err.message || 'Import browser profile thất bại' }));
+      dispatch(showToast({ type: 'error', message: err.message || t('browserProfiles.toast.importFailed') }));
     } finally {
       setImportingId('');
     }
@@ -130,9 +132,9 @@ export default function BrowserProfilesPage() {
       const result = await window.electronAPI.setActiveImportProfile(profileId);
       setActiveImportProfileId(profileId);
       setActiveImportPath(result.importRoot || '');
-      dispatch(showToast({ type: 'success', message: 'Đã chọn profile này khi Record' }));
+      dispatch(showToast({ type: 'success', message: t('browserProfiles.toast.setActiveForRecord') }));
     } catch (err) {
-      dispatch(showToast({ type: 'error', message: err.message || 'Không chọn được profile' }));
+      dispatch(showToast({ type: 'error', message: err.message || t('browserProfiles.toast.setActiveFailed') }));
     }
   };
 
@@ -146,11 +148,11 @@ export default function BrowserProfilesPage() {
     try {
       const result = await window.electronAPI.createBlankBrowserProfile(blankProfileName);
       await dispatch(fetchBrowserProfiles());
-      dispatch(showToast({ type: 'success', message: result.message || 'Đã tạo profile trống' }));
+      dispatch(showToast({ type: 'success', message: result.message || t('browserProfiles.toast.blankCreated') }));
       setShowBlankModal(false);
       setActiveTab('app');
     } catch (err) {
-      dispatch(showToast({ type: 'error', message: err.message || 'Tạo profile trống thất bại' }));
+      dispatch(showToast({ type: 'error', message: err.message || t('browserProfiles.toast.blankCreateFailed') }));
     } finally {
       setCreatingBlank(false);
     }
@@ -158,7 +160,7 @@ export default function BrowserProfilesPage() {
 
   const handleDeleteAppProfile = async (profile) => {
     const label = profile.display_name || profile.id;
-    if (!window.confirm(`Xóa "${label}" khỏi app?`)) return;
+    if (!window.confirm(t('browserProfiles.confirm.deleteFromApp', { label }))) return;
 
     setRemovingId(profile.id);
     try {
@@ -169,9 +171,9 @@ export default function BrowserProfilesPage() {
       }
       await dispatch(fetchBrowserProfiles());
       loadRecordingProfiles();
-      dispatch(showToast({ type: 'success', message: 'Đã xóa profile' }));
+      dispatch(showToast({ type: 'success', message: t('browserProfiles.toast.deleted') }));
     } catch (err) {
-      dispatch(showToast({ type: 'error', message: err.message || 'Xóa profile thất bại' }));
+      dispatch(showToast({ type: 'error', message: err.message || t('browserProfiles.toast.deleteFailed') }));
     } finally {
       setRemovingId('');
     }
@@ -185,19 +187,19 @@ export default function BrowserProfilesPage() {
   const handleOpenAppProfile = async (profile) => {
     try {
       await window.electronAPI.openAppBrowserProfile(profile);
-      dispatch(showToast({ type: 'success', message: 'Đã mở browser profile' }));
+      dispatch(showToast({ type: 'success', message: t('browserProfiles.toast.opened') }));
     } catch (err) {
-      dispatch(showToast({ type: 'error', message: err.message || 'Không mở được browser' }));
+      dispatch(showToast({ type: 'error', message: err.message || t('browserProfiles.toast.openFailed') }));
     }
   };
 
   const handleDelete = async (id) => {
-    if (!window.confirm('Xóa browser profile này? Tài khoản đang gán sẽ được bỏ liên kết.')) return;
+    if (!window.confirm(t('browserProfiles.confirm.deleteMachine'))) return;
     const result = await dispatch(deleteBrowserProfile(id));
     if (result.meta.requestStatus === 'fulfilled') {
-      dispatch(showToast({ type: 'success', message: 'Đã xóa browser profile' }));
+      dispatch(showToast({ type: 'success', message: t('browserProfiles.toast.machineDeleted') }));
     } else {
-      dispatch(showToast({ type: 'error', message: result.payload || 'Xóa thất bại' }));
+      dispatch(showToast({ type: 'error', message: result.payload || t('common.deleteFailed') }));
     }
   };
 
@@ -206,11 +208,11 @@ export default function BrowserProfilesPage() {
     const displayName = form.display_name || `${form.browser_name} - ${form.profile_name}`;
     const result = await dispatch(saveBrowserProfile({ ...form, display_name: displayName, source: 'manual' }));
     if (result.meta.requestStatus === 'fulfilled') {
-      dispatch(showToast({ type: 'success', message: 'Đã thêm browser profile' }));
+      dispatch(showToast({ type: 'success', message: t('browserProfiles.toast.added') }));
       setShowForm(false);
       setForm({ ...emptyForm });
     } else {
-      dispatch(showToast({ type: 'error', message: result.payload || 'Lưu browser profile thất bại' }));
+      dispatch(showToast({ type: 'error', message: result.payload || t('browserProfiles.toast.saveFailed') }));
     }
   };
 
@@ -222,7 +224,7 @@ export default function BrowserProfilesPage() {
     } catch (error) {
       const file = await pickFileWithInput({ accept: '.exe' });
       if (file) setForm((current) => ({ ...current, executable_path: file }));
-      else dispatch(showToast({ type: 'error', message: error.message || 'Không mở được hộp chọn file' }));
+      else dispatch(showToast({ type: 'error', message: error.message || t('common.errors.filePickerFailed') }));
     }
   };
 
@@ -233,7 +235,7 @@ export default function BrowserProfilesPage() {
     } catch (error) {
       const directory = await pickDirectoryWithInput();
       if (directory) setForm((current) => ({ ...current, user_data_dir: directory }));
-      else dispatch(showToast({ type: 'error', message: error.message || 'Không mở được hộp chọn folder' }));
+      else dispatch(showToast({ type: 'error', message: error.message || t('common.errors.folderPickerFailed') }));
     }
   };
 
@@ -249,27 +251,27 @@ export default function BrowserProfilesPage() {
         <div>
           <h1 className="page-title flex items-center gap-3">
             <Globe className="h-7 w-7 text-[#7db4ff]" />
-            Browser
+            {t('browserProfiles.title')}
           </h1>
           <p className="page-subtitle">
-            Quét profile Chromium trên máy, import vào thư mục imports, rồi chọn profile dùng khi Record.
+            {t('browserProfiles.subtitle')}
           </p>
         </div>
         <div className="flex items-center gap-3">
           <button type="button" onClick={refreshAll} className="btn-secondary">
             <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
-            Làm mới
+            {t('common.refresh')}
           </button>
           {activeTab === 'machine' && (
             <button type="button" onClick={handleScan} disabled={scanning} className="btn-secondary">
               {scanning ? <Loader2 className="h-4 w-4 animate-spin" /> : <ScanLine className="h-4 w-4" />}
-              Quét browser
+              {t('browserProfiles.scan')}
             </button>
           )}
           {activeTab === 'machine' && (
             <button type="button" onClick={() => setShowForm(true)} className="btn-primary">
               <Plus className="h-4 w-4" />
-              Thêm thủ công
+              {t('browserProfiles.addManual')}
             </button>
           )}
         </div>
@@ -284,7 +286,8 @@ export default function BrowserProfilesPage() {
 
       {activeImportPath && (
         <div className="mb-5 rounded-lg border border-emerald-600/40 bg-emerald-900/20 p-3 text-sm text-emerald-100">
-          Profile đang dùng khi Record: <span className="font-mono text-emerald-200">{activeImportPath}</span>
+          {t('browserProfiles.activeRecordProfile')}{' '}
+          <span className="font-mono text-emerald-200">{activeImportPath}</span>
         </div>
       )}
 
@@ -292,19 +295,19 @@ export default function BrowserProfilesPage() {
         <TabButton
           active={activeTab === 'machine'}
           onClick={() => setActiveTab('machine')}
-          label={`Trên máy (${machineProfiles.length})`}
+          label={t('browserProfiles.tabs.machine', { count: machineProfiles.length })}
         />
         <TabButton
           active={activeTab === 'app'}
           onClick={() => setActiveTab('app')}
-          label={`Trong app (${importedProfiles.length + recordingProfiles.length})`}
+          label={t('browserProfiles.tabs.app', { count: importedProfiles.length + recordingProfiles.length })}
         />
       </div>
 
       {showForm && activeTab === 'machine' && (
         <section className="card mb-6 p-5">
           <div className="mb-4 flex items-center justify-between">
-            <h2 className="text-base font-semibold text-white">Thêm browser profile thủ công</h2>
+            <h2 className="text-base font-semibold text-white">{t('browserProfiles.form.title')}</h2>
             <button type="button" className="icon-button" onClick={() => setShowForm(false)}>
               <X className="h-4 w-4" />
             </button>
@@ -330,19 +333,19 @@ export default function BrowserProfilesPage() {
               <input value={form.profile_name} onChange={(event) => setForm({ ...form, profile_name: event.target.value })} className="input-field" required />
             </Field>
             <Field label="Display name">
-              <input value={form.display_name} onChange={(event) => setForm({ ...form, display_name: event.target.value })} className="input-field" placeholder="Để trống sẽ tự ghép Browser - Profile" />
+              <input value={form.display_name} onChange={(event) => setForm({ ...form, display_name: event.target.value })} className="input-field" placeholder={t('browserProfiles.form.displayNamePlaceholder')} />
             </Field>
-            <Field label="Trạng thái">
+            <Field label={t('common.status')}>
               <select value={form.status} onChange={(event) => setForm({ ...form, status: event.target.value })} className="select-field">
-                <option value="active">Hoạt động</option>
-                <option value="inactive">Tắt</option>
+                <option value="active">{t('status.active')}</option>
+                <option value="inactive">{t('status.inactiveShort')}</option>
               </select>
             </Field>
             <div className="flex justify-end gap-3 lg:col-span-2">
-              <button type="button" onClick={() => setShowForm(false)} className="btn-secondary">Hủy</button>
+              <button type="button" onClick={() => setShowForm(false)} className="btn-secondary">{t('common.cancel')}</button>
               <button type="submit" disabled={saving} className="btn-primary">
                 {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-                Lưu browser profile
+                {t('browserProfiles.form.save')}
               </button>
             </div>
           </form>
@@ -382,28 +385,28 @@ export default function BrowserProfilesPage() {
         <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/60 px-4">
           <div className="w-full max-w-md rounded-lg border border-[#344054] bg-[#1c2535] p-5 shadow-2xl">
             <div className="mb-4 flex items-center justify-between">
-              <h2 className="text-base font-semibold text-white">Tạo profile trống</h2>
+              <h2 className="text-base font-semibold text-white">{t('browserProfiles.blank.create')}</h2>
               <button type="button" className="icon-button" onClick={() => setShowBlankModal(false)}>
                 <X className="h-4 w-4" />
               </button>
             </div>
             <label className="block">
-              <span className="mb-1 block text-sm text-[#b7c4d8]">Tên profile</span>
+              <span className="mb-1 block text-sm text-[#b7c4d8]">{t('browserProfiles.blank.nameLabel')}</span>
               <input
                 value={blankProfileName}
                 onChange={(event) => setBlankProfileName(event.target.value)}
                 className="input-field"
-                placeholder="Để trống sẽ tự đặt tên"
+                placeholder={t('browserProfiles.blank.namePlaceholder')}
                 autoFocus
               />
             </label>
             <div className="mt-5 flex justify-end gap-3">
               <button type="button" onClick={() => setShowBlankModal(false)} className="btn-secondary">
-                Hủy
+                {t('common.cancel')}
               </button>
               <button type="button" onClick={confirmCreateBlankProfile} disabled={creatingBlank} className="btn-primary">
                 {creatingBlank ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-                Tạo
+                {t('common.create')}
               </button>
             </div>
           </div>
@@ -439,6 +442,10 @@ function MachineProfilesList({
   onOpen,
   onDelete,
 }) {
+  const { t } = useTranslation();
+  const language = useLanguage();
+  const dateLocale = language === 'en' ? 'en-US' : 'vi-VN';
+
   if (loading && profiles.length === 0) {
     return (
       <div className="panel flex h-48 items-center justify-center">
@@ -451,9 +458,9 @@ function MachineProfilesList({
     return (
       <div className="panel flex h-64 flex-col items-center justify-center text-center">
         <Globe className="mb-3 h-12 w-12 text-[#6f7d90]" />
-        <p className="text-sm font-semibold text-white">Chưa có profile trên máy</p>
+        <p className="text-sm font-semibold text-white">{t('browserProfiles.machine.emptyTitle')}</p>
         <p className="mt-1 max-w-md text-sm text-[#9aa7b7]">
-          Bấm &quot;Quét browser&quot; để tìm Chrome, Edge, Brave, Cốc Cốc rồi chọn Import.
+          {t('browserProfiles.machine.emptyText')}
         </p>
       </div>
     );
@@ -473,7 +480,7 @@ function MachineProfilesList({
           <div className="mb-4 space-y-2 text-xs text-[#9aa7b7]">
             <Detail label="Executable" value={profile.executable_path} />
             <Detail label="User data" value={profile.user_data_dir} />
-            <Detail label="Scanned" value={profile.last_scanned_at ? new Date(profile.last_scanned_at).toLocaleString('vi-VN') : 'Thủ công'} />
+            <Detail label="Scanned" value={profile.last_scanned_at ? new Date(profile.last_scanned_at).toLocaleString(dateLocale) : t('browserProfiles.detail.manual')} />
           </div>
           <div className="flex gap-2">
             <button
@@ -483,15 +490,15 @@ function MachineProfilesList({
               className="btn-primary flex-1"
             >
               {importingId === profile.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
-              Import
+              {t('browserProfiles.actions.import')}
             </button>
             <button type="button" onClick={() => onOpen(profile.id)} disabled={opening} className="btn-secondary">
               <ExternalLink className="h-4 w-4" />
-              Mở thử
+              {t('browserProfiles.actions.testOpen')}
             </button>
             <button type="button" onClick={() => onDelete(profile.id)} disabled={deleting} className="btn-danger">
               <Trash2 className="h-4 w-4" />
-              Xóa
+              {t('common.delete')}
             </button>
           </div>
         </article>
@@ -513,20 +520,24 @@ function AppProfilesList({
   onDelete,
   onRemoveImported,
 }) {
+  const { t } = useTranslation();
+  const language = useLanguage();
+  const dateLocale = language === 'en' ? 'en-US' : 'vi-VN';
+
   if (importedProfiles.length === 0 && recordingProfiles.length === 0) {
     return (
       <div className="space-y-4">
         <div className="flex justify-end">
           <button type="button" onClick={onCreateBlank} disabled={creatingBlank} className="btn-primary">
             {creatingBlank ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-            Tạo profile trống
+            {t('browserProfiles.blank.create')}
           </button>
         </div>
         <div className="panel flex h-64 flex-col items-center justify-center text-center">
           <Monitor className="mb-3 h-12 w-12 text-[#6f7d90]" />
-          <p className="text-sm font-semibold text-white">Chưa có profile trong app</p>
+          <p className="text-sm font-semibold text-white">{t('browserProfiles.app.emptyTitle')}</p>
           <p className="mt-1 max-w-md text-sm text-[#9aa7b7]">
-            Import từ tab &quot;Trên máy&quot; hoặc tạo profile trống mới.
+            {t('browserProfiles.app.emptyText')}
           </p>
         </div>
       </div>
@@ -538,13 +549,13 @@ function AppProfilesList({
       <div className="flex justify-end">
         <button type="button" onClick={onCreateBlank} disabled={creatingBlank} className="btn-primary">
           {creatingBlank ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-          Tạo profile trống
+          {t('browserProfiles.blank.create')}
         </button>
       </div>
       {importedProfiles.length > 0 && (
         <section>
           <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-[#76849b]">
-            Đã import ({importedProfiles.length})
+            {t('browserProfiles.app.importedSection', { count: importedProfiles.length })}
           </h2>
           <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
             {importedProfiles.map((profile) => {
@@ -557,26 +568,26 @@ function AppProfilesList({
                       <p className="mt-1 text-sm text-[#9aa7b7]">{profile.browser_name} / {profile.profile_dir_name}</p>
                     </div>
                     <span className={`badge ${isActive ? 'border-emerald-500/50 text-emerald-300' : ''}`}>
-                      {isActive ? 'Đang dùng' : 'imported'}
+                      {isActive ? t('browserProfiles.badge.active') : t('browserProfiles.badge.imported')}
                     </span>
                   </div>
                   <div className="mb-4 space-y-2 text-xs text-[#9aa7b7]">
                     <Detail label="Import path" value={profile.import_path} />
                     <Detail
                       label="Imported"
-                      value={profile.imported_at ? new Date(profile.imported_at).toLocaleString('vi-VN') : '-'}
+                      value={profile.imported_at ? new Date(profile.imported_at).toLocaleString(dateLocale) : '-'}
                     />
                   </div>
                   <div className="flex gap-2">
                     {!isActive && (
                       <button type="button" onClick={() => onSetActive(profile.id)} className="btn-primary flex-1">
                         <CheckCircle2 className="h-4 w-4" />
-                        Dùng khi Record
+                        {t('browserProfiles.actions.useForRecord')}
                       </button>
                     )}
                     <button type="button" onClick={() => onOpen(profile)} disabled={opening} className="btn-secondary">
                       <ExternalLink className="h-4 w-4" />
-                      Mở thử
+                      {t('browserProfiles.actions.testOpen')}
                     </button>
                     <button
                       type="button"
@@ -585,7 +596,7 @@ function AppProfilesList({
                       className="btn-danger"
                     >
                       {removingId === profile.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
-                      Xóa
+                      {t('common.delete')}
                     </button>
                   </div>
                 </article>
@@ -598,7 +609,7 @@ function AppProfilesList({
       {recordingProfiles.length > 0 && (
         <section>
           <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-[#76849b]">
-            Profile ghi từ Record ({recordingProfiles.length})
+            {t('browserProfiles.app.recordingSection', { count: recordingProfiles.length })}
           </h2>
           <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
             {recordingProfiles.map((profile) => (
@@ -606,15 +617,15 @@ function AppProfilesList({
                 <div className="mb-4 flex items-start justify-between gap-3">
                   <div className="min-w-0">
                     <h2 className="truncate text-base font-semibold text-white">{profile.display_name}</h2>
-                    <p className="mt-1 text-sm text-[#9aa7b7]">Tạo tự động khi ghi kịch bản</p>
+                    <p className="mt-1 text-sm text-[#9aa7b7]">{t('browserProfiles.recording.autoCreated')}</p>
                   </div>
-                  <span className="badge">record</span>
+                  <span className="badge">{t('browserProfiles.badge.record')}</span>
                 </div>
-                <Detail label="Path" value={profile.import_path} />
+                <Detail label={t('browserProfiles.detail.path')} value={profile.import_path} />
                 <div className="mt-4 flex gap-2">
                   <button type="button" onClick={() => onOpen(profile)} disabled={opening} className="btn-secondary flex-1">
                     <ExternalLink className="h-4 w-4" />
-                    Mở thử
+                    {t('browserProfiles.actions.testOpen')}
                   </button>
                   <button
                     type="button"
@@ -623,7 +634,7 @@ function AppProfilesList({
                     className="btn-danger"
                   >
                     {removingId === profile.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
-                    Xóa
+                    {t('common.delete')}
                   </button>
                 </div>
               </article>

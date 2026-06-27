@@ -3,6 +3,7 @@ import { useDispatch, useSelector } from 'react-redux';
 import { fetchScenarios } from '../slices/scenarioSlice';
 import { fetchAllExecutions } from '../slices/executionSlice';
 import { setCurrentPage } from '../slices/uiSlice';
+import { useTranslation } from '../i18n';
 import {
   AlertTriangle,
   CheckCircle2,
@@ -15,6 +16,8 @@ import {
 
 export default function DashboardPage() {
   const dispatch = useDispatch();
+  const { t, language } = useTranslation();
+  const dateLocale = language === 'en' ? 'en-US' : 'vi-VN';
   const { items: scenarios, loading: scenariosLoading } = useSelector((state) => state.scenarios);
   const { items: executions, loading: executionsLoading } = useSelector((state) => state.executions);
 
@@ -31,30 +34,30 @@ export default function DashboardPage() {
 
   const stats = [
     {
-      label: 'Kịch bản',
+      label: t('dashboard.stats.scenarios.label'),
       value: scenariosLoading ? '...' : scenarios.length,
-      detail: 'Tổng số kịch bản đã tạo',
+      detail: t('dashboard.stats.scenarios.detail'),
       icon: ScrollText,
       tone: 'text-[#7db4ff]',
     },
     {
-      label: 'Lượt chạy',
+      label: t('dashboard.stats.runs.label'),
       value: executionsLoading ? '...' : executions.length,
-      detail: `${running} đang chạy`,
+      detail: t('dashboard.stats.runs.detailRunning', { running }),
       icon: PlayCircle,
       tone: 'text-[#8ddfc7]',
     },
     {
-      label: 'Thành công',
+      label: t('dashboard.stats.success.label'),
       value: `${successRate}%`,
-      detail: `${completed} thành công, ${failed} lỗi`,
+      detail: t('dashboard.stats.success.detail', { completed, failed }),
       icon: CheckCircle2,
       tone: successRate >= 70 ? 'text-[#8ddfc7]' : 'text-[#f1c16b]',
     },
     {
-      label: 'Lần chạy cuối',
-      value: lastRun ? new Date(lastRun).toLocaleDateString('vi-VN') : 'Chưa có',
-      detail: lastRun ? new Date(lastRun).toLocaleTimeString('vi-VN') : 'Chưa ghi nhận lịch sử',
+      label: t('dashboard.stats.lastRun.label'),
+      value: lastRun ? new Date(lastRun).toLocaleDateString(dateLocale) : t('common.none'),
+      detail: lastRun ? new Date(lastRun).toLocaleTimeString(dateLocale) : t('dashboard.stats.lastRun.noHistory'),
       icon: Clock,
       tone: 'text-[#c7d0dc]',
     },
@@ -67,12 +70,12 @@ export default function DashboardPage() {
     <div className="page-shell">
       <div className="page-header">
         <div>
-          <h1 className="page-title">Tổng quan</h1>
-          <p className="page-subtitle">Theo dõi kịch bản, lượt chạy và trạng thái hệ thống.</p>
+          <h1 className="page-title">{t('dashboard.title')}</h1>
+          <p className="page-subtitle">{t('dashboard.subtitle')}</p>
         </div>
         <button type="button" onClick={() => dispatch(setCurrentPage('scenarios'))} className="btn-primary">
           <Plus className="h-4 w-4" />
-          Tạo kịch bản
+          {t('dashboard.createScenario')}
         </button>
       </div>
 
@@ -99,16 +102,20 @@ export default function DashboardPage() {
       <div className="mt-6 grid grid-cols-1 gap-6 xl:grid-cols-2">
         <section className="card overflow-hidden">
           <div className="flex items-center justify-between border-b border-[#2e3b4e] px-5 py-4">
-            <h2 className="text-base font-semibold text-white">Kịch bản gần đây</h2>
+            <h2 className="text-base font-semibold text-white">{t('dashboard.recentScenarios.title')}</h2>
             <button type="button" onClick={() => dispatch(setCurrentPage('scenarios'))} className="btn-ghost h-8 px-2">
-              Xem tất cả
+              {t('common.viewAll')}
               <ExternalLink className="h-4 w-4" />
             </button>
           </div>
 
           <div className="divide-y divide-[#2e3b4e]">
             {recentScenarios.length === 0 ? (
-              <EmptyState icon={ScrollText} title="Chưa có kịch bản" text="Tạo kịch bản đầu tiên để bắt đầu tự động hóa." />
+              <EmptyState
+                icon={ScrollText}
+                title={t('dashboard.recentScenarios.emptyTitle')}
+                text={t('dashboard.recentScenarios.emptyText')}
+              />
             ) : (
               recentScenarios.map((scenario) => (
                 <button
@@ -120,10 +127,10 @@ export default function DashboardPage() {
                   <div className="min-w-0">
                     <p className="truncate text-sm font-semibold text-white">{scenario.name}</p>
                     <p className="mt-1 truncate text-xs text-[#9aa7b7]">
-                      {scenario.target_url || scenario.platform || 'Chưa có URL'}
+                      {scenario.target_url || scenario.platform || t('common.noUrl')}
                     </p>
                   </div>
-                  <span className="badge">{scenario.steps?.length || 0} bước</span>
+                  <span className="badge">{t('common.stepsCount', { count: scenario.steps?.length || 0 })}</span>
                 </button>
               ))
             )}
@@ -132,30 +139,37 @@ export default function DashboardPage() {
 
         <section className="card overflow-hidden">
           <div className="flex items-center justify-between border-b border-[#2e3b4e] px-5 py-4">
-            <h2 className="text-base font-semibold text-white">Lịch sử gần đây</h2>
+            <h2 className="text-base font-semibold text-white">{t('dashboard.recentExecutions.title')}</h2>
             <button type="button" onClick={() => dispatch(setCurrentPage('history'))} className="btn-ghost h-8 px-2">
-              Xem lịch sử
+              {t('dashboard.recentExecutions.viewHistory')}
               <ExternalLink className="h-4 w-4" />
             </button>
           </div>
 
           <div className="divide-y divide-[#2e3b4e]">
             {recentExecutions.length === 0 ? (
-              <EmptyState icon={PlayCircle} title="Chưa có lượt chạy" text="Chạy một kịch bản để xem trạng thái tại đây." />
+              <EmptyState
+                icon={PlayCircle}
+                title={t('dashboard.recentExecutions.emptyTitle')}
+                text={t('dashboard.recentExecutions.emptyText')}
+              />
             ) : (
               recentExecutions.map((execution) => (
                 <div key={execution.id} className="flex items-center justify-between gap-4 px-5 py-4">
                   <div className="flex min-w-0 items-center gap-3">
                     <StatusIcon status={execution.status} />
                     <div className="min-w-0">
-                      <p className="truncate text-sm font-semibold text-white">{execution.scenario_name || 'Không xác định'}</p>
+                      <p className="truncate text-sm font-semibold text-white">{execution.scenario_name || t('common.unknown')}</p>
                       <p className="mt-1 text-xs text-[#9aa7b7]">
-                        {execution.started_at ? new Date(execution.started_at).toLocaleString('vi-VN') : 'Chưa có thời gian'}
+                        {execution.started_at ? new Date(execution.started_at).toLocaleString(dateLocale) : t('common.noTime')}
                       </p>
                     </div>
                   </div>
                   <span className="text-xs text-[#9aa7b7]">
-                    {execution.completed_steps || 0}/{execution.total_steps || 0} bước
+                    {t('common.stepsProgress', {
+                      completed: execution.completed_steps || 0,
+                      total: execution.total_steps || 0,
+                    })}
                   </span>
                 </div>
               ))

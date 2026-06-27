@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useDispatch, useSelector } from 'react-redux';
 import { setCurrentPage } from '../slices/uiSlice';
+import { useTranslation } from '../i18n';
 import {
   Bot,
   Database,
@@ -13,14 +14,14 @@ import {
   Shield,
 } from 'lucide-react';
 
-const navItems = [
-  { id: 'dashboard', label: 'Tổng quan', icon: LayoutDashboard },
-  { id: 'proxies', label: 'Proxy', icon: Shield },
-  { id: 'browserProfiles', label: 'Browser', icon: Globe },
-  { id: 'dataProfiles', label: 'Hồ sơ', icon: Database },
-  { id: 'scenarios', label: 'Kịch bản', icon: ScrollText },
-  { id: 'executions', label: 'Thực thi', icon: PlayCircle },
-  { id: 'settings', label: 'Cài đặt', icon: Settings },
+const navItemDefs = [
+  { id: 'dashboard', icon: LayoutDashboard, labelKey: 'nav.dashboard' },
+  { id: 'proxies', icon: Shield, labelKey: 'nav.proxies' },
+  { id: 'browserProfiles', icon: Globe, labelKey: 'nav.browserProfiles' },
+  { id: 'dataProfiles', icon: Database, labelKey: 'nav.dataProfiles' },
+  { id: 'scenarios', icon: ScrollText, labelKey: 'nav.scenarios' },
+  { id: 'executions', icon: PlayCircle, labelKey: 'nav.executions' },
+  { id: 'settings', icon: Settings, labelKey: 'nav.settings' },
 ];
 
 function NavItem({ item, isActive, onClick, onMouseEnter, onMouseLeave, onFocus, onBlur }) {
@@ -63,8 +64,14 @@ function SidebarTooltip({ tip }) {
 
 export default function Sidebar() {
   const dispatch = useDispatch();
+  const { t } = useTranslation();
   const { currentPage } = useSelector((state) => state.ui);
   const [hoverTip, setHoverTip] = useState(null);
+
+  const navItems = navItemDefs.map((item) => ({
+    ...item,
+    label: t(item.labelKey),
+  }));
 
   const showTip = (event, label) => {
     const rect = event.currentTarget.getBoundingClientRect();
@@ -84,7 +91,7 @@ export default function Sidebar() {
           <div className="flex h-16 items-center justify-center border-b border-[#2e3b4e]">
             <div
               className="flex h-10 w-10 items-center justify-center rounded-lg bg-[#2f80ed] text-white"
-              onMouseEnter={(event) => showTip(event, 'RPA Social')}
+              onMouseEnter={(event) => showTip(event, t('app.brandName'))}
               onMouseLeave={hideTip}
             >
               <Bot className="h-5 w-5" />

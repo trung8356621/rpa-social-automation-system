@@ -3,6 +3,7 @@ import { useDispatch, useSelector } from 'react-redux';
 import { fetchScenarios } from '../slices/scenarioSlice';
 import { runScenario, fetchAllExecutions, fetchExecutionDetail, clearCurrentExecution, clearAllExecutions } from '../slices/executionSlice';
 import { showToast, openModal, closeModal } from '../slices/uiSlice';
+import { useTranslation } from '../i18n';
 import {
   Play,
   Globe,
@@ -33,15 +34,17 @@ function ProgressBar({ completed, total }) {
 
 export default function ExecutionsPage() {
   const dispatch = useDispatch();
+  const { t, language } = useTranslation();
+  const dateLocale = language === 'en' ? 'en-US' : 'vi-VN';
   const { items: scenarios } = useSelector((state) => state.scenarios);
   const { items: executions, runningExecutions = {}, loading: execLoading, currentExecution, liveStatus } = useSelector((state) => state.executions);
   const modalOpen = useSelector((state) => state.ui.modalOpen);
 
   const [selectedScenarioId, setSelectedScenarioId] = useState(null);
   const [selectedBrowserProfileId, setSelectedBrowserProfileId] = useState('');
-  const [selectedVariableProfileId, setSelectedVariableProfileId] = useState('');
-  const [variableProfileOptions, setVariableProfileOptions] = useState([]);
-  const [profilesLoading, setProfilesLoading] = useState(false);
+  const [selectedSampleId, setSelectedSampleId] = useState('');
+  const [sampleOptions, setSampleOptions] = useState([]);
+  const [samplesLoading, setSamplesLoading] = useState(false);
   const [browserProfileOptions, setBrowserProfileOptions] = useState([]);
   const [openingBrowser, setOpeningBrowser] = useState(false);
   const [clearingHistory, setClearingHistory] = useState(false);
@@ -66,37 +69,33 @@ export default function ExecutionsPage() {
     const scenario = scenarios.find((item) => item.id === selectedScenarioId);
     if (!scenario) return;
     setSelectedBrowserProfileId(scenario.browser_profile_id || '');
+    setSelectedSampleId('');
   }, [selectedScenarioId, scenarios]);
 
   useEffect(() => {
-    if (!selectedScenarioId || !window.electronAPI?.getVariableProfiles) {
-      setVariableProfileOptions([]);
-      setSelectedVariableProfileId('');
+    if (!window.electronAPI?.getVariableProfileSamples) {
+      setSampleOptions([]);
       return undefined;
     }
 
     let cancelled = false;
-    setProfilesLoading(true);
+    setSamplesLoading(true);
 
-    window.electronAPI.getVariableProfiles(selectedScenarioId)
+    const selectedScenario = scenarios.find((item) => item.id === selectedScenarioId);
+    const profileFilter = selectedScenario?.variable_profile_id || null;
+
+    window.electronAPI.getVariableProfileSamples(profileFilter)
       .then((items) => {
         if (cancelled) return;
-        const next = Array.isArray(items) ? items : [];
-        setVariableProfileOptions(next);
-        setSelectedVariableProfileId((current) => (
-          current && next.some((item) => item.id === current) ? current : ''
-        ));
+        setSampleOptions(Array.isArray(items) ? items : []);
       })
       .catch(() => {
-        if (!cancelled) {
-          setVariableProfileOptions([]);
-          setSelectedVariableProfileId('');
-        }
+        if (!cancelled) setSampleOptions([]);
       })
-      .finally(() => { if (!cancelled) setProfilesLoading(false); });
+      .finally(() => { if (!cancelled) setSamplesLoading(false); });
 
     return () => { cancelled = true; };
-  }, [selectedScenarioId]);
+  }, [selectedScenarioId, scenarios]);
 
   useEffect(() => {
     if (!liveStatus?.type) return;
@@ -105,15 +104,18 @@ export default function ExecutionsPage() {
     lastNotifyRef.current = notifyKey;
 
     if (liveStatus.type === 'execution:failed') {
-      dispatch(showToast({ type: 'error', message: liveStatus.error || 'Thực thi thất bại' }));
+      dispatch(showToast({ type: 'error', message: liveStatus.error || t('executions.toast.failed') }));
     }
     if (liveStatus.type === 'execution:completed') {
-      dispatch(showToast({ type: 'success', message: `Hoàn thành: ${liveStatus.scenarioName || 'kịch bản'}` }));
+      dispatch(showToast({
+        type: 'success',
+        message: t('executions.toast.completed', { name: liveStatus.scenarioName || t('scenarios.title') }),
+      }));
     }
     if (liveStatus.type === 'execution:closing') {
-      dispatch(showToast({ type: 'info', message: liveStatus.message || 'Đang đóng browser...' }));
+      dispatch(showToast({ type: 'info', message: liveStatus.message || t('executions.toast.closingBrowser') }));
     }
-  }, [dispatch, liveStatus]);
+  }, [dispatch, liveStatus, t]);
 
   const handleHeadlessChange = (e) => {
     const val = e.target.checked;
@@ -126,7 +128,7 @@ export default function ExecutionsPage() {
     if (!selectedBrowserProfileId) {
       dispatch(showToast({
         type: 'error',
-        message: 'Chọn profile browser để chạy. Guest chỉ dùng khi cấu hình trong kịch bản.',
+        message: t('executions.toast.selectProfileToRun'),
       }));
       return;
     }
@@ -134,13 +136,13 @@ export default function ExecutionsPage() {
     const result = await dispatch(runScenario({
       scenarioId: selectedScenarioId,
       browserProfileId,
-      variableProfileId: selectedVariableProfileId || null,
+      sampleId: selectedSampleId || null,
       headless,
     }));
     if (result.meta.requestStatus === 'fulfilled') {
-      dispatch(showToast({ type: 'info', message: 'Đã gửi lệnh thực thi' }));
+      dispatch(showToast({ type: 'info', message: t('executions.toast.commandSent') }));
     } else {
-      dispatch(showToast({ type: 'error', message: result.payload || 'Chạy thất bại' }));
+      dispatch(showToast({ type: 'error', message: result.payload || t('executions.toast.runFailed') }));
     }
   };
 
@@ -148,11 +150,11 @@ export default function ExecutionsPage() {
 
   const handleOpenBrowser = async () => {
     if (!openBrowserSessionApi) {
-      dispatch(showToast({ type: 'error', message: 'Khởi động lại ứng dụng để cập nhật preload' }));
+      dispatch(showToast({ type: 'error', message: t('executions.toast.restartApp') }));
       return;
     }
     if (!selectedBrowserProfileId) {
-      dispatch(showToast({ type: 'error', message: 'Chọn profile browser để mở trình duyệt' }));
+      dispatch(showToast({ type: 'error', message: t('executions.toast.selectProfileToOpen') }));
       return;
     }
     const scenario = scenarios.find((item) => item.id === selectedScenarioId);
@@ -161,9 +163,9 @@ export default function ExecutionsPage() {
     try {
       await openBrowserSessionApi({ scenarioId: selectedScenarioId || null, browserProfileId, startUrl: scenario?.target_url || null });
       const profileLabel = browserProfileOptions.find((item) => item.id === browserProfileId)?.display_name || 'profile app';
-      dispatch(showToast({ type: 'success', message: `Đã mở browser (${profileLabel})` }));
+      dispatch(showToast({ type: 'success', message: t('executions.toast.browserOpened', { profile: profileLabel }) }));
     } catch (err) {
-      dispatch(showToast({ type: 'error', message: err.message || 'Không mở được browser' }));
+      dispatch(showToast({ type: 'error', message: err.message || t('executions.toast.browserOpenFailed') }));
     } finally {
       setOpeningBrowser(false);
     }
@@ -182,7 +184,7 @@ export default function ExecutionsPage() {
   const handleClearHistory = async () => {
     if (!executions.length) return;
     const confirmed = window.confirm(
-      `Xóa toàn bộ ${executions.length} bản ghi lịch sử thực thi? Hành động này không thể hoàn tác.`,
+      t('executions.confirm.clearHistory', { count: executions.length }),
     );
     if (!confirmed) return;
     setClearingHistory(true);
@@ -191,16 +193,19 @@ export default function ExecutionsPage() {
     if (result.meta.requestStatus === 'fulfilled') {
       dispatch(closeModal());
       dispatch(clearCurrentExecution());
-      dispatch(showToast({ type: 'success', message: `Đã xóa ${result.payload?.deleted ?? 0} bản ghi lịch sử` }));
+      dispatch(showToast({
+        type: 'success',
+        message: t('executions.toast.historyCleared', { count: result.payload?.deleted ?? 0 }),
+      }));
     } else {
-      dispatch(showToast({ type: 'error', message: result.payload || 'Không xóa được lịch sử' }));
+      dispatch(showToast({ type: 'error', message: result.payload || t('executions.toast.clearHistoryFailed') }));
     }
   };
 
   const formatDateTime = (value) => {
-    if (!value) return '—';
+    if (!value) return t('common.na');
     const date = new Date(value);
-    return Number.isNaN(date.getTime()) ? '—' : date.toLocaleString('vi-VN');
+    return Number.isNaN(date.getTime()) ? t('common.na') : date.toLocaleString(dateLocale);
   };
 
   const statsTotal = executions.length;
@@ -212,8 +217,8 @@ export default function ExecutionsPage() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-white">Thực thi</h1>
-          <p className="text-sm text-slate-400 mt-1">Chạy kịch bản tự động hóa</p>
+          <h1 className="text-2xl font-bold text-white">{t('executions.title')}</h1>
+          <p className="text-sm text-slate-400 mt-1">{t('executions.subtitle')}</p>
         </div>
         <div className="flex flex-col items-end gap-1">
           <div className="flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-800/50 px-3 py-2">
@@ -223,7 +228,7 @@ export default function ExecutionsPage() {
               onChange={(e) => setSelectedBrowserProfileId(e.target.value)}
               className="select-field min-w-[200px] border-0 bg-transparent py-1 text-sm"
             >
-              <option value="">Chọn profile browser...</option>
+              <option value="">{t('executions.selectBrowserProfile')}</option>
               {browserProfileOptions.map((profile) => (
                 <option key={profile.id} value={profile.id}>{profile.display_name}</option>
               ))}
@@ -233,30 +238,30 @@ export default function ExecutionsPage() {
               onClick={handleOpenBrowser}
               disabled={openingBrowser}
               className="flex h-9 w-9 items-center justify-center rounded-lg bg-blue-600 text-white transition-colors hover:bg-blue-500 disabled:cursor-not-allowed disabled:bg-blue-800"
-              title="Mở trình duyệt (cùng profile đã chạy)"
+              title={t('executions.openBrowserTitle')}
             >
               {openingBrowser ? <Loader2 className="h-4 w-4 animate-spin" /> : <ExternalLink className="h-4 w-4" />}
             </button>
           </div>
           <p className="max-w-[280px] text-right text-xs text-slate-500">
-            Bắt buộc chọn profile app. Guest chỉ cấu hình trong kịch bản khi ghi.
+            {t('executions.browserProfileHint')}
           </p>
         </div>
       </div>
 
       {/* Run Scenario Section */}
       <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-5">
-        <h2 className="text-lg font-semibold text-white mb-4">Chạy kịch bản</h2>
+        <h2 className="text-lg font-semibold text-white mb-4">{t('executions.runSection.title')}</h2>
         <div className="flex flex-wrap items-center gap-3">
           <select
             value={selectedScenarioId || ''}
             onChange={(e) => {
               setSelectedScenarioId(e.target.value || null);
-              setSelectedVariableProfileId('');
+              setSelectedSampleId('');
             }}
             className="select-field max-w-md min-w-[220px]"
           >
-            <option value="">Chọn kịch bản...</option>
+            <option value="">{t('executions.selectScenario')}</option>
             {scenarios.map((s) => (
               <option key={s.id} value={s.id}>{s.name} ({s.platform})</option>
             ))}
@@ -264,14 +269,16 @@ export default function ExecutionsPage() {
 
           {selectedScenarioId && (
             <select
-              value={selectedVariableProfileId}
-              onChange={(e) => setSelectedVariableProfileId(e.target.value)}
-              disabled={profilesLoading}
-              className="select-field max-w-md min-w-[200px]"
+              value={selectedSampleId}
+              onChange={(e) => setSelectedSampleId(e.target.value)}
+              disabled={samplesLoading}
+              className="select-field max-w-md min-w-[220px]"
             >
-              <option value="">(Giá trị mặc định)</option>
-              {variableProfileOptions.map((profile) => (
-                <option key={profile.id} value={profile.id}>{profile.name}</option>
+              <option value="">{t('executions.defaultSample')}</option>
+              {sampleOptions.map((sample) => (
+                <option key={sample.id} value={sample.id}>
+                  {sample.profile_name ? `${sample.profile_name} / ${sample.name}` : sample.name}
+                </option>
               ))}
             </select>
           )}
@@ -285,7 +292,7 @@ export default function ExecutionsPage() {
               className="w-4 h-4 accent-blue-500"
             />
             <EyeOff className="w-3.5 h-3.5 text-slate-400" />
-            Headless
+            {t('executions.headless')}
           </label>
 
           <button
@@ -294,14 +301,14 @@ export default function ExecutionsPage() {
             className="flex items-center gap-2 px-5 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-700 disabled:text-slate-500 text-white rounded-xl text-sm font-medium transition-all"
           >
             <Play className="w-4 h-4" />
-            Chạy
+            {t('common.run')}
           </button>
         </div>
 
         {runningCount > 0 && (
           <div className="mt-3 flex items-center gap-2 text-sm text-yellow-400">
             <Loader2 className="w-4 h-4 animate-spin" />
-            {runningCount} kịch bản đang chạy song song...
+            {t('executions.runningParallel', { count: runningCount })}
           </div>
         )}
       </div>
@@ -311,15 +318,15 @@ export default function ExecutionsPage() {
         <div className="grid grid-cols-3 gap-4">
           <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-4">
             <p className="text-2xl font-bold text-emerald-400">{statsSuccess}</p>
-            <p className="text-sm text-slate-400">Thành công</p>
+            <p className="text-sm text-slate-400">{t('status.success')}</p>
           </div>
           <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-4">
             <p className="text-2xl font-bold text-red-400">{statsFailed}</p>
-            <p className="text-sm text-slate-400">Thất bại</p>
+            <p className="text-sm text-slate-400">{t('status.failed')}</p>
           </div>
           <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-4">
             <p className="text-2xl font-bold text-yellow-400">{runningCount}</p>
-            <p className="text-sm text-slate-400">Đang chạy</p>
+            <p className="text-sm text-slate-400">{t('status.running')}</p>
           </div>
         </div>
       )}
@@ -327,17 +334,17 @@ export default function ExecutionsPage() {
       {/* Execution History */}
       <div>
         <div className="flex items-center justify-between mb-4">
-          <h2 className="text-lg font-semibold text-white">Lịch sử thực thi gần đây</h2>
+          <h2 className="text-lg font-semibold text-white">{t('executions.history.title')}</h2>
           {executions.length > 0 && (
             <button
               type="button"
               onClick={handleClearHistory}
               disabled={clearingHistory || execLoading}
               className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-300 bg-slate-700/60 hover:bg-slate-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg transition-colors"
-              title="Xóa toàn bộ lịch sử"
+              title={t('executions.history.clearTitle')}
             >
               {clearingHistory ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
-              Xóa lịch sử
+              {t('executions.history.clear')}
             </button>
           )}
         </div>
@@ -354,9 +361,9 @@ export default function ExecutionsPage() {
                   <Loader2 className="w-5 h-5 text-yellow-400 animate-spin shrink-0" />
                   <div className="flex-1 min-w-0">
                     <p className="text-sm font-medium text-slate-200">
-                      {exec.scenario_name || 'N/A'}
+                      {exec.scenario_name || t('common.na')}
                       <span className="ml-2 text-xs font-normal text-yellow-400 bg-yellow-900/30 px-1.5 py-0.5 rounded">
-                        đang chạy
+                        {t('status.runningBadge')}
                       </span>
                     </p>
                     <p className="text-xs text-slate-500">{formatDateTime(exec.started_at)}</p>
@@ -364,7 +371,10 @@ export default function ExecutionsPage() {
                   </div>
                 </div>
                 <p className="text-xs text-slate-400 ml-4 shrink-0">
-                  {exec.completed_steps ?? 0}/{exec.total_steps ?? '?'} bước
+                  {t('common.stepsProgress', {
+                    completed: exec.completed_steps ?? 0,
+                    total: exec.total_steps ?? '?',
+                  })}
                 </p>
               </div>
             </div>
@@ -374,13 +384,13 @@ export default function ExecutionsPage() {
           {execLoading ? (
             <div className="text-center py-8 text-slate-400">
               <Loader2 className="w-6 h-6 animate-spin mx-auto mb-2" />
-              <p className="text-sm">Đang tải...</p>
+              <p className="text-sm">{t('common.loading')}</p>
             </div>
           ) : executions.length === 0 && runningCount === 0 ? (
             <div className="text-center py-12 bg-slate-800/30 border border-slate-700/50 rounded-xl">
               <Terminal className="w-12 h-12 mx-auto text-slate-600 mb-3" />
-              <p className="text-slate-400 text-sm">Chưa có lịch sử thực thi</p>
-              <p className="text-slate-600 text-xs mt-1">Chọn kịch bản và nhấn "Chạy" để bắt đầu</p>
+              <p className="text-slate-400 text-sm">{t('executions.history.emptyTitle')}</p>
+              <p className="text-slate-600 text-xs mt-1">{t('executions.history.emptyText')}</p>
             </div>
           ) : (
             executions.map((exec) => {
@@ -401,8 +411,13 @@ export default function ExecutionsPage() {
                           : <Clock className="w-5 h-5 text-slate-500 shrink-0" />}
                       <div>
                         <p className="text-sm font-medium text-slate-200">
-                          {exec.scenario_name || 'N/A'}
-                          {exec.variable_profile_name && (
+                          {exec.scenario_name || t('common.na')}
+                          {exec.variable_sample_name && (
+                            <span className="ml-2 text-xs font-normal text-emerald-400 bg-emerald-900/30 px-1.5 py-0.5 rounded">
+                              {exec.variable_sample_name}
+                            </span>
+                          )}
+                          {!exec.variable_sample_name && exec.variable_profile_name && (
                             <span className="ml-2 text-xs font-normal text-blue-400 bg-blue-900/30 px-1.5 py-0.5 rounded">
                               {exec.variable_profile_name}
                             </span>
@@ -417,7 +432,10 @@ export default function ExecutionsPage() {
                     <div className="flex items-center gap-4">
                       <div className="text-right">
                         <p className="text-xs text-slate-400">
-                          {exec.completed_steps}/{exec.total_steps} bước
+                          {t('common.stepsProgress', {
+                            completed: exec.completed_steps,
+                            total: exec.total_steps,
+                          })}
                         </p>
                         {exec.error_message && (
                           <p className="text-xs text-red-400 max-w-[200px] truncate" title={exec.error_message}>
@@ -441,7 +459,7 @@ export default function ExecutionsPage() {
           <div className="bg-slate-800 border border-slate-700 rounded-2xl w-full max-w-2xl mx-4 shadow-2xl max-h-[80vh] overflow-y-auto">
             <div className="p-6 border-b border-slate-700">
               <div className="flex items-center justify-between mb-2">
-                <h2 className="text-lg font-semibold text-white">Chi tiết thực thi</h2>
+                <h2 className="text-lg font-semibold text-white">{t('executions.detail.title')}</h2>
                 <button
                   type="button"
                   onClick={closeExecutionDetail}
@@ -456,8 +474,8 @@ export default function ExecutionsPage() {
                     : currentExecution.status === 'failed' ? 'bg-red-600/20 text-red-400'
                       : 'bg-yellow-600/20 text-yellow-400'
                 }`}>
-                  {currentExecution.status === 'completed' ? 'Hoàn thành'
-                    : currentExecution.status === 'failed' ? 'Thất bại' : 'Đang chạy'}
+                  {currentExecution.status === 'completed' ? t('status.completed')
+                    : currentExecution.status === 'failed' ? t('status.failed') : t('status.running')}
                 </span>
                 <span className="text-slate-400">{formatDateTime(currentExecution.started_at)}</span>
               </div>
@@ -501,7 +519,7 @@ export default function ExecutionsPage() {
                   </div>
                 );
               }) : (
-                <p className="text-sm text-slate-400">Không có chi tiết từng bước cho lần chạy này.</p>
+                <p className="text-sm text-slate-400">{t('executions.detail.noSteps')}</p>
               )}
             </div>
           </div>
