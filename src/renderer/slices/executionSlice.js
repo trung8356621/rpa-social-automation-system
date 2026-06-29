@@ -15,13 +15,13 @@ import { createSlice, createAsyncThunk } from '@reduxjs/toolkit';
  */
 export const startLocalCampaign = createAsyncThunk(
   'executions/startLocal',
-  async ({ scenarioId, browserProfileId = null, sampleId = null, headless = false }, { rejectWithValue }) => {
+  async ({ scenarioId, browserProfileId = null, sampleId = null, headless = false, viewport = null }, { rejectWithValue }) => {
     try {
       if (!scenarioId) {
         throw new Error('Thiếu kịch bản cần chạy');
       }
-      window.electronAPI.startLocalCampaign({ scenarioId, browserProfileId, sampleId, headless });
-      return { id: scenarioId, browserProfileId, sampleId, status: 'triggered' };
+      window.electronAPI.startLocalCampaign({ scenarioId, browserProfileId, sampleId, headless, viewport });
+      return { id: scenarioId, browserProfileId, sampleId, viewport, status: 'triggered' };
     } catch (error) {
       return rejectWithValue(error.message);
     }

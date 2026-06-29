@@ -37,6 +37,7 @@ class ExecutorService {
     this._activeUserDataDir = null;
     this._currentSampleId = null;
     this._variableMap = null;
+    this._executionViewport = null;
     this._releaseDirLock = null;
   }
 
@@ -109,6 +110,10 @@ class ExecutorService {
       });
 
       await this._launchBrowser(scenario, options);
+
+      if (normalizeScenarioType(scenario.scenario_type) !== 'prepare') {
+        await this._ensureSessionReady(scenario, executionId);
+      }
 
       for (let index = 0; index < scenario.steps.length; index += 1) {
         if (!this.isRunning) break;
@@ -222,14 +227,28 @@ class ExecutorService {
       await this._cleanupBrowser();
       this.isRunning = false;
       this.currentScenario = null;
+      this._executionViewport = null;
     }
   }
 
   async _launchBrowser(scenario, options) {
-    const viewport = options.viewport || {
+    const recordedViewport = {
       width: scenario.recorded_width || 1280,
       height: scenario.recorded_height || 720,
     };
+    const viewport = normalizeExecutionViewport(options.viewport) || recordedViewport;
+    this._executionViewport = viewport;
+
+    if (
+      viewport.width !== recordedViewport.width
+      || viewport.height !== recordedViewport.height
+    ) {
+      console.log(
+        `[Executor] Viewport ${viewport.width}x${viewport.height} `
+        + `(recorded ${recordedViewport.width}x${recordedViewport.height}) — `
+        + 'relative_coords scaled to execution viewport',
+      );
+    }
 
     const errorsDir = path.join(this.cacheRoot, 'errors');
     if (!fs.existsSync(errorsDir)) {
@@ -324,6 +343,130 @@ class ExecutorService {
     return url ? this._resolveVariables(url) : null;
   }
 
+  async _navigateToScenarioStart(scenario) {
+    const startUrl = this._resolveStartUrl(scenario);
+    if (!startUrl || !this.page || this.page.isClosed()) return;
+
+    await this.page.goto(startUrl, {
+      waitUntil: 'domcontentloaded',
+      timeout: 60000,
+    });
+    await ensureRememberMeChecked(this.page);
+    await this._sleep(400);
+  }
+
+  async _ensureSessionReady(scenario, executionId) {
+    const ready = await this._isDomReady(scenario);
+    if (ready) return;
+
+    const parentId = String(scenario.parent_id || '').trim();
+    if (!parentId) {
+      throw new Error('[Executor] DOM chua san sang. Hay gan parent_id (kich ban prepare/login) cho kich ban nay.');
+    }
+
+    console.log(`[Executor] DOM chua san sang — chay kich ban parent: ${parentId}`);
+    await this._runParentScenario(parentId, executionId);
+    await this._navigateToScenarioStart(scenario);
+
+    const readyAfterParent = await this._isDomReady(scenario);
+    if (!readyAfterParent) {
+      throw new Error('[Executor] DOM van chua san sang sau khi chay kich ban parent.');
+    }
+  }
+
+  async _runParentScenario(parentId, executionId) {
+    const parent = this.dbService.getScenarioById(parentId);
+    if (!parent) {
+      throw new Error(`[Executor] Khong tim thay kich ban parent: ${parentId}`);
+    }
+    if (!parent.steps?.length) {
+      throw new Error('[Executor] Kich ban parent chua co buoc nao.');
+    }
+
+    const previousScenario = this.currentScenario;
+    const previousVariableMap = this._variableMap;
+
+    this.currentScenario = parent;
+    this._variableMap = this.dbService.buildVariableMap(parentId, this._currentSampleId);
+
+    this._sendTelemetry({
+      type: 'parent:started',
+      executionId,
+      parentScenarioId: parentId,
+      parentScenarioName: parent.name,
+      totalSteps: parent.steps.length,
+      timestamp: new Date().toISOString(),
+    });
+
+    try {
+      for (let index = 0; index < parent.steps.length; index += 1) {
+        if (!this.isRunning) break;
+        await this._executeStep(parent.steps[index], index + 1);
+      }
+    } finally {
+      this.currentScenario = previousScenario;
+      this._variableMap = previousVariableMap;
+    }
+
+    this._sendTelemetry({
+      type: 'parent:completed',
+      executionId,
+      parentScenarioId: parentId,
+      parentScenarioName: parent.name,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  _resolveDomCheckAnchor(scenario) {
+    const explicit = scenario?.dom_check_anchor;
+    if (explicit && typeof explicit === 'object' && Object.keys(explicit).length > 0) {
+      return explicit;
+    }
+
+    const firstActionStep = (scenario?.steps || []).find(
+      (step) => !['navigate', 'wait'].includes(step.action_type),
+    );
+    return firstActionStep?.target_anchor || null;
+  }
+
+  async _isDomReady(scenario) {
+    const anchor = this._resolveDomCheckAnchor(scenario);
+    if (!anchor) return true;
+    if (!this.page || this.page.isClosed()) return false;
+
+    const config = anchor.action_config || {};
+    const selector = this._resolveSelector(anchor, config);
+    const selectors = this._collectSelectors(anchor, config, selector);
+
+    for (const item of selectors) {
+      try {
+        await this.page.waitForSelector(item, { timeout: 4000, visible: true });
+        return true;
+      } catch {
+        // Try next selector.
+      }
+    }
+
+    if (anchor.xpath) {
+      try {
+        return await this.page.evaluate((xpath) => {
+          const result = document.evaluate(
+            xpath,
+            document,
+            null,
+            XPathResult.FIRST_ORDERED_NODE_TYPE,
+            null,
+          );
+          return Boolean(result.singleNodeValue);
+        }, anchor.xpath);
+      } catch {
+        // Ignore invalid xpath.
+      }
+    }
+
+    return false;
+  }
+
   async _resolveExecutionUserDataDir(scenarioId, browserProfileId, sampleId = null) {
     if (this.browserProfileService) {
       return this.browserProfileService.resolveSessionUserDataDir(
@@ -403,11 +546,7 @@ class ExecutorService {
     const anchor = step.target_anchor || {};
     const config = anchor.action_config || {};
     const selector = this._resolveSelector(anchor, config);
-    const viewport = this.page.viewport() || {
-      width: this.currentScenario?.recorded_width || 1280,
-      height: this.currentScenario?.recorded_height || 720,
-    };
-
+    const viewport = this._getExecutionViewport();
     const selectors = this._collectSelectors(anchor, config, selector);
 
     if (config.skip_if_checked) {
@@ -461,10 +600,7 @@ class ExecutorService {
     if (!text) return;
 
     const selector = this._resolveSelector(anchor, config);
-    const viewport = this.page.viewport() || {
-      width: this.currentScenario?.recorded_width || 1280,
-      height: this.currentScenario?.recorded_height || 720,
-    };
+    const viewport = this._getExecutionViewport();
 
     const focused = await this._focusTarget(anchor, config, selector);
     if (!focused) {
@@ -482,6 +618,20 @@ class ExecutorService {
     await this.page.keyboard.press('A');
     await this.page.keyboard.up('Control');
     await this.page.keyboard.type(text, { delay: randomRuntimeDelay(config.delay || 50, 25, 120) });
+  }
+
+  _getExecutionViewport() {
+    const pageViewport = this.page?.viewport?.();
+    if (pageViewport?.width && pageViewport?.height) {
+      return pageViewport;
+    }
+    if (this._executionViewport) {
+      return this._executionViewport;
+    }
+    return {
+      width: this.currentScenario?.recorded_width || 1280,
+      height: this.currentScenario?.recorded_height || 720,
+    };
   }
 
   _resolveSelector(anchor = {}, config = {}) {
@@ -713,6 +863,23 @@ class ExecutorService {
   _sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
+}
+
+function normalizeScenarioType(value) {
+  const normalized = String(value || 'action').trim().toLowerCase();
+  if (normalized === 'prepare' || normalized === 'crawl' || normalized === 'action') {
+    return normalized;
+  }
+  return 'action';
+}
+
+function normalizeExecutionViewport(viewport) {
+  if (!viewport || typeof viewport !== 'object') return null;
+  const width = Math.round(Number(viewport.width));
+  const height = Math.round(Number(viewport.height));
+  if (!Number.isFinite(width) || !Number.isFinite(height)) return null;
+  if (width < 320 || height < 240 || width > 4096 || height > 4096) return null;
+  return { width, height };
 }
 
 function randomRuntimeDelay(baseMs = DEFAULT_ACTION_DELAY_MS, minMs = 120, maxMs = 1500) {

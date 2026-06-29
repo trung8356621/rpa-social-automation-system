@@ -17,6 +17,9 @@ const createDraftScenario = (t) => ({
   description: '',
   platform: 'facebook',
   target_url: 'https://www.facebook.com',
+  scenario_type: 'action',
+  parent_id: null,
+  dom_check_anchor: null,
   recorded_width: 1280,
   recorded_height: 720,
   device_pixel_ratio: 1,
@@ -145,9 +148,10 @@ export default function ScenariosPage() {
         </div>
       ) : (
         <div className="panel w-full overflow-hidden">
-          <div className="grid grid-cols-[minmax(280px,1.35fr)_minmax(260px,1fr)_120px_90px_170px_120px] border-b border-[#2e3b4e] px-4 py-3 text-xs font-semibold uppercase tracking-wide text-[#7e8da5]">
+          <div className="grid grid-cols-[minmax(240px,1.2fr)_minmax(220px,1fr)_100px_100px_90px_170px_120px] border-b border-[#2e3b4e] px-4 py-3 text-xs font-semibold uppercase tracking-wide text-[#7e8da5]">
             <span>{t('scenarios.title')}</span>
             <span>{t('scenarios.table.url')}</span>
+            <span>{t('scenarios.table.type')}</span>
             <span>{t('scenarios.table.platform')}</span>
             <span>{t('scenarios.table.steps')}</span>
             <span>{t('scenarios.table.updated')}</span>
@@ -158,7 +162,7 @@ export default function ScenariosPage() {
             {filteredScenarios.map((scenario) => (
               <article
                 key={scenario.id}
-                className="grid grid-cols-[minmax(280px,1.35fr)_minmax(260px,1fr)_120px_90px_170px_120px] items-center gap-3 px-4 py-3 transition hover:bg-[#202b3a]"
+                className="grid grid-cols-[minmax(240px,1.2fr)_minmax(220px,1fr)_100px_100px_90px_170px_120px] items-center gap-3 px-4 py-3 transition hover:bg-[#202b3a]"
               >
                 <button type="button" onClick={() => openEditor(scenario)} className="min-w-0 text-left">
                   <div className="flex min-w-0 items-center gap-3">
@@ -178,6 +182,10 @@ export default function ScenariosPage() {
                     <p className="mt-0.5 truncate text-xs text-[#7e8da5]">{scenario.description}</p>
                   )}
                 </div>
+
+                <span className="badge w-fit capitalize">
+                  {t(`scenarios.types.${scenario.scenario_type || 'action'}`)}
+                </span>
 
                 <span className="badge w-fit">
                   <Globe className="h-3.5 w-3.5" />

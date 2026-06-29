@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
-import { app, BrowserWindow, dialog, ipcMain, Menu, net, protocol } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, Menu, net, protocol, shell } from 'electron';
+import { ScenarioEmbeddedBrowserService } from './browser/ScenarioEmbeddedBrowserService.js';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import DatabaseService from './database/DatabaseService.js';
@@ -31,6 +32,9 @@ let browserProfileService = null;
 
 /** @type {import('./rpa/RecorderService.js').RecorderService} */
 let recorderService = null;
+
+/** @type {ScenarioEmbeddedBrowserService|null} */
+let embeddedBrowserService = null;
 
 /**
  * Tạo cửa sổ Electron chính.
@@ -72,6 +76,7 @@ function createWindow() {
   }
 
   mainWindow.on('closed', () => {
+    embeddedBrowserService?.detach();
     mainWindow = null;
   });
 }
@@ -433,6 +438,108 @@ function registerDatabaseHandlers() {
     return recorderService.getStatus();
   });
 
+  ipcMain.handle('scenario:crawl-preview:attach', async (_event, payload) => {
+    try {
+      return await embeddedBrowserService.attach(payload || {});
+    } catch (error) {
+      return { attached: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('scenario:crawl-preview:detach', () => {
+    embeddedBrowserService.detach();
+    return { success: true };
+  });
+
+  ipcMain.handle('scenario:crawl-preview:set-bounds', (_event, bounds) => {
+    embeddedBrowserService.setBounds(bounds || {});
+    return embeddedBrowserService.getState();
+  });
+
+  ipcMain.handle('scenario:crawl-preview:navigate', async (_event, payload) => {
+    try {
+      return await embeddedBrowserService.navigate(payload || {});
+    } catch (error) {
+      return { attached: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('scenario:crawl-preview:reload', async () => embeddedBrowserService.reload());
+  ipcMain.handle('scenario:crawl-preview:back', () => embeddedBrowserService.goBack());
+  ipcMain.handle('scenario:crawl-preview:forward', () => embeddedBrowserService.goForward());
+  ipcMain.handle('scenario:crawl-preview:state', () => embeddedBrowserService.getState());
+
+  ipcMain.handle('scenario:crawl-preview:set-design-mode', async (_event, payload) => {
+    try {
+      return await embeddedBrowserService.setDesignMode(Boolean(payload?.enabled), {
+        parentAnchor: payload?.parentAnchor || null,
+      });
+    } catch (error) {
+      return { designMode: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('scenario:crawl-preview:open-devtools', () => embeddedBrowserService.openDevTools());
+
+  ipcMain.handle('scenario:crawl-preview:highlight-anchor', async (_event, anchor) => {
+    try {
+      return await embeddedBrowserService.highlightAnchor(anchor || null);
+    } catch (error) {
+      return { found: false, matchCount: 0, error: error.message };
+    }
+  });
+
+  ipcMain.handle('scenario:crawl-preview:clear-highlight', async () => {
+    try {
+      return await embeddedBrowserService.clearHighlight();
+    } catch (error) {
+      return { cleared: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('scenario:crawl-preview:promote-to-parent', async (_event, anchor) => {
+    try {
+      return await embeddedBrowserService.promoteSelectorToParent(anchor || null);
+    } catch (error) {
+      return { error: error.message };
+    }
+  });
+
+  ipcMain.handle('scenario:crawl-preview:zoom-in', () => embeddedBrowserService.zoomIn());
+  ipcMain.handle('scenario:crawl-preview:zoom-out', () => embeddedBrowserService.zoomOut());
+
+  ipcMain.handle('scenario:crawl-preview:find-in-page', async (_event, payload) => {
+    try {
+      return await embeddedBrowserService.findInPage(payload?.text, {
+        forward: payload?.forward,
+        findNext: payload?.findNext,
+      });
+    } catch (error) {
+      return { matches: 0, activeMatchOrdinal: 0, attached: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('scenario:crawl-preview:stop-find-in-page', () => embeddedBrowserService.stopFindInPage());
+
+  ipcMain.on('crawl:design-pick', (_event, payload) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('crawl:design-pick', payload);
+    }
+  });
+
+  ipcMain.on('crawl:design-hover', (_event, payload) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('crawl:design-hover', payload);
+    }
+  });
+
+  ipcMain.handle('scenario:crawl-preview:open-external', async (_event, url) => {
+    const target = String(url || '').trim();
+    if (!target) return { success: false };
+    await shell.openExternal(target);
+    return { success: true };
+  });
+
   ipcMain.handle('scenario:open-browser', async (_event, payload) => {
     try {
       const scenarioId = payload?.scenarioId || null;
@@ -465,7 +572,14 @@ function registerDatabaseHandlers() {
 
   ipcMain.handle('scenario:render-video', async (_event, scenarioId) => {
     // Xuat ban video tu cac frame screenshot da chup
-    return recorderService.renderVideo(scenarioId);
+    const result = await recorderService.renderVideo(scenarioId);
+    if (result.success && result.filePath) {
+      const openError = await shell.openPath(result.filePath);
+      if (openError) {
+        shell.showItemInFolder(result.filePath);
+      }
+    }
+    return result;
   });
 
   ipcMain.handle('scenario:read-frame-data-url', async (_event, filePath) => {
@@ -492,6 +606,12 @@ function registerDatabaseHandlers() {
     const variableProfileId = typeof payload === 'object' ? payload?.variableProfileId || null : null;
     const sampleId = typeof payload === 'object' ? payload?.sampleId || null : null;
     const headless = typeof payload === 'object' ? Boolean(payload?.headless) : false;
+    const viewport = typeof payload === 'object' && payload?.viewport
+      ? {
+        width: Number(payload.viewport.width),
+        height: Number(payload.viewport.height),
+      }
+      : null;
     if (!scenarioId) {
       console.error('[Main] Thiếu scenarioId khi chạy kịch bản');
       return;
@@ -518,6 +638,7 @@ function registerDatabaseHandlers() {
       browserProfileId,
       sampleId,
       headless,
+      viewport,
     })
       .then((result) => console.log(`[Main] Thực thi ${executionId} hoàn tất:`, result))
       .catch((err) => console.error(`[Main] Lỗi thực thi ${executionId}:`, err.message))
@@ -662,6 +783,11 @@ app.whenReady().then(() => {
     dbService,
     browserProfileService,
   });
+  embeddedBrowserService = new ScenarioEmbeddedBrowserService({
+    getMainWindow: () => mainWindow,
+    dbService,
+    browserProfileService,
+  });
   console.log('[Main] DatabaseService đã sẵn sàng');
 
   // Đăng ký IPC handlers (Database + RPA)
@@ -691,5 +817,6 @@ app.on('window-all-closed', () => {
 
 // Đảm bảo đóng database trước khi thoát
 app.on('before-quit', () => {
+  embeddedBrowserService?.detach();
   if (dbService) dbService.close();
 });

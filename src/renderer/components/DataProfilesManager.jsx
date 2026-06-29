@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Plus, Save, Trash2 } from 'lucide-react';
+import { Loader2, Plus, Save, Trash2, X } from 'lucide-react';
 import { useTranslation } from '../i18n';
 
 function emptyDraft() {
@@ -30,6 +30,9 @@ export default function DataProfilesManager({
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [showSampleModal, setShowSampleModal] = useState(false);
+  const [newSampleName, setNewSampleName] = useState('');
+  const [creatingSample, setCreatingSample] = useState(false);
 
   const loadProfiles = async () => {
     if (!window.electronAPI?.getVariableProfiles) {
@@ -197,10 +200,8 @@ export default function DataProfilesManager({
     }
   };
 
-  const handleCreateSample = async () => {
+  const openCreateSampleModal = () => {
     if (!selectedProfileId) return;
-    const name = window.prompt(t('dataProfiles.manager.sampleNamePrompt'));
-    if (!name?.trim()) return;
 
     const templateKeys = keyRows.map((row) => String(row.key || '').trim()).filter(Boolean);
     if (!templateKeys.length) {
@@ -208,17 +209,51 @@ export default function DataProfilesManager({
       return;
     }
 
+    setNewSampleName('');
+    setShowSampleModal(true);
+  };
+
+  const handleCreateSample = async () => {
+    if (!selectedProfileId) return;
+    const name = String(newSampleName || '').trim();
+    if (!name) return;
+
+    const templateKeys = keyRows.map((row) => String(row.key || '').trim()).filter(Boolean);
+    if (!templateKeys.length) {
+      onToast?.({ type: 'error', message: t('dataProfiles.toast.noTemplateKeys') });
+      return;
+    }
+
+    const profileName = String(draft.name || '').trim();
+    if (!profileName) {
+      onToast?.({ type: 'error', message: t('dataProfiles.toast.saveFailed') });
+      return;
+    }
+
+    setCreatingSample(true);
     try {
+      await window.electronAPI.saveVariableProfile({
+        id: selectedProfileId,
+        name: profileName,
+        keys: templateKeys.map((key) => ({ key })),
+      });
+
       const saved = await window.electronAPI.saveVariableProfileSample({
         profile_id: selectedProfileId,
-        name: name.trim(),
+        name,
         variables: templateKeys.map((key) => ({ key, value: '' })),
       });
+      setShowSampleModal(false);
+      setNewSampleName('');
+      await loadProfiles();
       await loadProfileDetail(selectedProfileId);
       setSelectedSampleId(saved.id);
       onChanged?.();
+      onToast?.({ type: 'success', message: t('dataProfiles.toast.sampleCreated') });
     } catch (error) {
       onToast?.({ type: 'error', message: error.message || t('dataProfiles.toast.sampleSaveFailed') });
+    } finally {
+      setCreatingSample(false);
     }
   };
 
@@ -355,7 +390,7 @@ export default function DataProfilesManager({
             <div className="border-t border-slate-700 pt-4">
               <div className="mb-3 flex items-center justify-between">
                 <span className="text-sm font-medium text-slate-300">{t('dataProfiles.manager.samplesSection')}</span>
-                <button type="button" onClick={handleCreateSample} className="inline-flex h-8 items-center gap-1 rounded-lg border border-slate-600 px-3 text-xs text-slate-200 hover:bg-slate-800">
+                <button type="button" onClick={openCreateSampleModal} className="inline-flex h-8 items-center gap-1 rounded-lg border border-slate-600 px-3 text-xs text-slate-200 hover:bg-slate-800">
                   <Plus className="h-3.5 w-3.5" />
                   {t('dataProfiles.manager.newSample')}
                 </button>
@@ -430,6 +465,64 @@ export default function DataProfilesManager({
           </>
         )}
       </div>
+
+      {showSampleModal && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/60 px-4">
+          <div className="w-full max-w-md rounded-xl border border-slate-700 bg-slate-900 p-5 shadow-2xl">
+            <div className="mb-4 flex items-center justify-between">
+              <h2 className="text-base font-semibold text-white">{t('dataProfiles.manager.sampleNamePrompt')}</h2>
+              <button
+                type="button"
+                onClick={() => {
+                  if (creatingSample) return;
+                  setShowSampleModal(false);
+                  setNewSampleName('');
+                }}
+                className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-800 hover:text-white"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <label className="block">
+              <span className="mb-1 block text-sm text-slate-300">{t('dataProfiles.manager.sampleNameLabel')}</span>
+              <input
+                value={newSampleName}
+                onChange={(event) => setNewSampleName(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' && String(newSampleName || '').trim()) {
+                    handleCreateSample();
+                  }
+                }}
+                className="input-field h-10"
+                placeholder={t('dataProfiles.manager.sampleNamePrompt')}
+                autoFocus
+              />
+            </label>
+            <div className="mt-5 flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => {
+                  if (creatingSample) return;
+                  setShowSampleModal(false);
+                  setNewSampleName('');
+                }}
+                className="btn-secondary"
+              >
+                {t('common.cancel')}
+              </button>
+              <button
+                type="button"
+                onClick={handleCreateSample}
+                disabled={creatingSample || !String(newSampleName || '').trim()}
+                className="btn-primary disabled:opacity-60"
+              >
+                {creatingSample ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+                {t('common.create')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -58,6 +58,39 @@ contextBridge.exposeInMainWorld('electronAPI', {
   stopScenarioRecording: () => ipcRenderer.invoke('scenario:stop-recording'),
   getScenarioRecordingStatus: () => ipcRenderer.invoke('scenario:recording-status'),
   openScenarioBrowser: (payload) => ipcRenderer.invoke('scenario:open-browser', payload),
+  attachCrawlPreview: (payload) => ipcRenderer.invoke('scenario:crawl-preview:attach', payload),
+  detachCrawlPreview: () => ipcRenderer.invoke('scenario:crawl-preview:detach'),
+  setCrawlPreviewBounds: (bounds) => ipcRenderer.invoke('scenario:crawl-preview:set-bounds', bounds),
+  navigateCrawlPreview: (payload) => ipcRenderer.invoke('scenario:crawl-preview:navigate', payload),
+  reloadCrawlPreview: () => ipcRenderer.invoke('scenario:crawl-preview:reload'),
+  backCrawlPreview: () => ipcRenderer.invoke('scenario:crawl-preview:back'),
+  forwardCrawlPreview: () => ipcRenderer.invoke('scenario:crawl-preview:forward'),
+  getCrawlPreviewState: () => ipcRenderer.invoke('scenario:crawl-preview:state'),
+  setCrawlDesignMode: (payload) => ipcRenderer.invoke('scenario:crawl-preview:set-design-mode', payload),
+  openCrawlDevTools: () => ipcRenderer.invoke('scenario:crawl-preview:open-devtools'),
+  highlightCrawlAnchor: (anchor) => ipcRenderer.invoke('scenario:crawl-preview:highlight-anchor', anchor),
+  clearCrawlHighlight: () => ipcRenderer.invoke('scenario:crawl-preview:clear-highlight'),
+  promoteCrawlSelectorToParent: (anchor) => ipcRenderer.invoke('scenario:crawl-preview:promote-to-parent', anchor),
+  zoomInCrawlPreview: () => ipcRenderer.invoke('scenario:crawl-preview:zoom-in'),
+  zoomOutCrawlPreview: () => ipcRenderer.invoke('scenario:crawl-preview:zoom-out'),
+  findInCrawlPreview: (payload) => ipcRenderer.invoke('scenario:crawl-preview:find-in-page', payload),
+  stopFindInCrawlPreview: () => ipcRenderer.invoke('scenario:crawl-preview:stop-find-in-page'),
+  onCrawlOpenFindBar: (callback) => {
+    const handler = () => callback();
+    ipcRenderer.on('crawl:open-find-bar', handler);
+    return () => ipcRenderer.removeListener('crawl:open-find-bar', handler);
+  },
+  onCrawlPreviewState: (callback) => {
+    const handler = (_event, data) => callback(data);
+    ipcRenderer.on('crawl:preview-state', handler);
+    return () => ipcRenderer.removeListener('crawl:preview-state', handler);
+  },
+  onCrawlDesignPick: (callback) => {
+    const handler = (_event, data) => callback(data);
+    ipcRenderer.on('crawl:design-pick', handler);
+    return () => ipcRenderer.removeListener('crawl:design-pick', handler);
+  },
+  openCrawlPreviewExternal: (url) => ipcRenderer.invoke('scenario:crawl-preview:open-external', url),
   replayAndRecord: (payload) => ipcRenderer.invoke('scenario:replay-and-record', payload),
   renderScenarioVideo: (scenarioId) => ipcRenderer.invoke('scenario:render-video', scenarioId),
   readFrameDataUrl: (filePath) => ipcRenderer.invoke('scenario:read-frame-data-url', filePath),

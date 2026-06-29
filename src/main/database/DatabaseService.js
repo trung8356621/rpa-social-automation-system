@@ -173,6 +173,18 @@ class DatabaseService {
       if (!hasLocalVariables) {
         this.db.exec("ALTER TABLE scenarios ADD COLUMN local_variables TEXT NOT NULL DEFAULT '[]'");
       }
+
+      if (!scenarioColumns.some((col) => col.name === 'scenario_type')) {
+        this.db.exec("ALTER TABLE scenarios ADD COLUMN scenario_type TEXT NOT NULL DEFAULT 'action'");
+      }
+
+      if (!scenarioColumns.some((col) => col.name === 'parent_id')) {
+        this.db.exec('ALTER TABLE scenarios ADD COLUMN parent_id TEXT REFERENCES scenarios(id) ON DELETE SET NULL');
+      }
+
+      if (!scenarioColumns.some((col) => col.name === 'dom_check_anchor')) {
+        this.db.exec('ALTER TABLE scenarios ADD COLUMN dom_check_anchor TEXT');
+      }
     }
 
     const browserProfilesTable = this.db
@@ -519,6 +531,9 @@ class DatabaseService {
           browser_profile_id TEXT,
           variable_profile_id TEXT,
           local_variables     TEXT NOT NULL DEFAULT '[]',
+          scenario_type       TEXT NOT NULL DEFAULT 'action',
+          parent_id           TEXT REFERENCES scenarios(id) ON DELETE SET NULL,
+          dom_check_anchor    TEXT,
           is_dirty            INTEGER NOT NULL DEFAULT 1,
           updated_at          TEXT NOT NULL DEFAULT (datetime('now'))
         );
@@ -683,6 +698,12 @@ class DatabaseService {
     const isNew = !existingScenario;
 
     // Prepared statements để tối ưu hiệu năng
+    const scenarioType = normalizeScenarioType(scenario.scenario_type ?? existingScenario?.scenario_type);
+    const parentId = normalizeScenarioParentId(scenarioType, scenario.parent_id ?? existingScenario?.parent_id);
+    const domCheckAnchorJson = serializeDomCheckAnchor(
+      scenario.dom_check_anchor ?? existingScenario?.dom_check_anchor,
+    );
+
     const upsertScenario = isNew
       ? this.db.prepare(`
           INSERT INTO scenarios (
@@ -690,9 +711,10 @@ class DatabaseService {
             recorded_width, recorded_height, device_pixel_ratio,
             preview_path, preview_manifest_path, preview_duration_ms, preview_trim_ranges,
             browser_profile_id, variable_profile_id,
+            scenario_type, parent_id, dom_check_anchor,
             is_dirty, updated_at
           )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
         `)
       : this.db.prepare(`
           UPDATE scenarios
@@ -702,6 +724,7 @@ class DatabaseService {
               preview_trim_ranges = ?,
               browser_profile_id = ?,
               variable_profile_id = ?,
+              scenario_type = ?, parent_id = ?, dom_check_anchor = ?,
               is_dirty = 1, updated_at = ?
           WHERE id = ?
         `);
@@ -757,6 +780,9 @@ class DatabaseService {
           JSON.stringify(parseJsonArray(scenario.preview_trim_ranges)),
           scenario.browser_profile_id ?? null,
           scenario.variable_profile_id ?? null,
+          scenarioType,
+          parentId,
+          domCheckAnchorJson,
           now
         );
       } else {
@@ -781,6 +807,23 @@ class DatabaseService {
           scenario.variable_profile_id !== undefined
             ? scenario.variable_profile_id
             : existingScenario.variable_profile_id || null,
+          scenario.scenario_type !== undefined
+            ? normalizeScenarioType(scenario.scenario_type)
+            : normalizeScenarioType(existingScenario.scenario_type),
+          scenario.parent_id !== undefined
+            ? normalizeScenarioParentId(
+              scenario.scenario_type !== undefined
+                ? normalizeScenarioType(scenario.scenario_type)
+                : normalizeScenarioType(existingScenario.scenario_type),
+              scenario.parent_id,
+            )
+            : normalizeScenarioParentId(
+              normalizeScenarioType(existingScenario.scenario_type),
+              existingScenario.parent_id,
+            ),
+          scenario.dom_check_anchor !== undefined
+            ? serializeDomCheckAnchor(scenario.dom_check_anchor)
+            : serializeDomCheckAnchor(existingScenario.dom_check_anchor),
           now,
           scenarioId
         );
@@ -915,6 +958,9 @@ class DatabaseService {
 
     return {
       ...scenario,
+      scenario_type: normalizeScenarioType(scenario.scenario_type),
+      parent_id: scenario.parent_id || null,
+      dom_check_anchor: parseDomCheckAnchor(scenario.dom_check_anchor),
       preview_trim_ranges: parseJsonArray(scenario.preview_trim_ranges),
       preview_url: scenario.preview_path ? toCacheUrl(scenario.preview_path) : null,
       preview_frames: readPreviewFrames(scenario.preview_manifest_path),
@@ -1420,6 +1466,9 @@ class DatabaseService {
         device_pixel_ratio: scenario.device_pixel_ratio,
         preview_duration_ms: scenario.preview_duration_ms,
         preview_trim_ranges: scenario.preview_trim_ranges || [],
+        scenario_type: normalizeScenarioType(scenario.scenario_type),
+        parent_id: scenario.parent_id || null,
+        dom_check_anchor: parseDomCheckAnchor(scenario.dom_check_anchor),
         local_variables: variables.map(({ key, value }) => ({ key, value: value ?? '' })),
       },
       steps,
@@ -1544,6 +1593,9 @@ class DatabaseService {
       preview_manifest_frames: manifestFrames,
       browser_profile_id: null,
       variable_profile_id: null,
+      scenario_type: scenarioData.scenario_type,
+      parent_id: scenarioData.parent_id,
+      dom_check_anchor: scenarioData.dom_check_anchor,
     }, steps);
 
     const variables = scenarioData.local_variables || parsed.variables;
@@ -2035,6 +2087,33 @@ function parseJsonArray(value) {
     }
   }
   return Array.isArray(parsed) ? parsed : [];
+}
+
+const SCENARIO_TYPES = new Set(['prepare', 'crawl', 'action']);
+
+function normalizeScenarioType(value) {
+  const normalized = String(value || 'action').trim().toLowerCase();
+  return SCENARIO_TYPES.has(normalized) ? normalized : 'action';
+}
+
+function normalizeScenarioParentId(scenarioType, parentId) {
+  const type = normalizeScenarioType(scenarioType);
+  if (type === 'prepare') return null;
+
+  const normalized = parentId ? String(parentId).trim() : '';
+  return normalized || null;
+}
+
+function parseDomCheckAnchor(value) {
+  const parsed = parseJsonObject(value);
+  if (!parsed || typeof parsed !== 'object') return null;
+  if (Object.keys(parsed).length === 0) return null;
+  return parsed;
+}
+
+function serializeDomCheckAnchor(value) {
+  const parsed = parseDomCheckAnchor(value);
+  return parsed ? JSON.stringify(parsed) : null;
 }
 
 function readPreviewFrames(manifestPath) {

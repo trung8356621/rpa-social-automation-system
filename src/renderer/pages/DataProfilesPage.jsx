@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React from 'react';
 import { useDispatch } from 'react-redux';
 import { Database } from 'lucide-react';
 import { showToast } from '../slices/uiSlice';
@@ -8,7 +8,6 @@ import { useTranslation } from '../i18n';
 export default function DataProfilesPage() {
   const dispatch = useDispatch();
   const { t } = useTranslation();
-  const [refreshKey, setRefreshKey] = useState(0);
 
   return (
     <div className="p-6 space-y-6">
@@ -23,9 +22,7 @@ export default function DataProfilesPage() {
       </div>
 
       <DataProfilesManager
-        key={refreshKey}
         onToast={(payload) => dispatch(showToast(payload))}
-        onChanged={() => setRefreshKey((value) => value + 1)}
       />
     </div>
   );

@@ -19,6 +19,18 @@ import {
 } from 'lucide-react';
 
 const LS_HEADLESS = 'executions:headless';
+const LS_VIEWPORT_WIDTH = 'executions:viewportWidth';
+const LS_VIEWPORT_HEIGHT = 'executions:viewportHeight';
+
+const DEFAULT_VIEWPORT = { width: 1280, height: 720 };
+const MIN_VIEWPORT = { width: 320, height: 240 };
+const MAX_VIEWPORT = { width: 4096, height: 4096 };
+
+function clampViewport(value, min, max, fallback) {
+  const parsed = Math.round(Number(value));
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, parsed));
+}
 
 function ProgressBar({ completed, total }) {
   const pct = total > 0 ? Math.round((completed / total) * 100) : 0;
@@ -51,6 +63,18 @@ export default function ExecutionsPage() {
   const [headless, setHeadless] = useState(() => {
     try { return localStorage.getItem(LS_HEADLESS) === 'true'; } catch { return false; }
   });
+  const [viewportWidth, setViewportWidth] = useState(() => {
+    try {
+      const stored = Number(localStorage.getItem(LS_VIEWPORT_WIDTH));
+      return clampViewport(stored, MIN_VIEWPORT.width, MAX_VIEWPORT.width, DEFAULT_VIEWPORT.width);
+    } catch { return DEFAULT_VIEWPORT.width; }
+  });
+  const [viewportHeight, setViewportHeight] = useState(() => {
+    try {
+      const stored = Number(localStorage.getItem(LS_VIEWPORT_HEIGHT));
+      return clampViewport(stored, MIN_VIEWPORT.height, MAX_VIEWPORT.height, DEFAULT_VIEWPORT.height);
+    } catch { return DEFAULT_VIEWPORT.height; }
+  });
   const lastNotifyRef = useRef('');
 
   const runningList = Object.values(runningExecutions);
@@ -70,6 +94,18 @@ export default function ExecutionsPage() {
     if (!scenario) return;
     setSelectedBrowserProfileId(scenario.browser_profile_id || '');
     setSelectedSampleId('');
+    setViewportWidth(clampViewport(
+      scenario.recorded_width,
+      MIN_VIEWPORT.width,
+      MAX_VIEWPORT.width,
+      DEFAULT_VIEWPORT.width,
+    ));
+    setViewportHeight(clampViewport(
+      scenario.recorded_height,
+      MIN_VIEWPORT.height,
+      MAX_VIEWPORT.height,
+      DEFAULT_VIEWPORT.height,
+    ));
   }, [selectedScenarioId, scenarios]);
 
   useEffect(() => {
@@ -123,6 +159,73 @@ export default function ExecutionsPage() {
     try { localStorage.setItem(LS_HEADLESS, String(val)); } catch { /* ignore */ }
   };
 
+  const handleViewportWidthChange = (event) => {
+    const raw = event.target.value;
+    if (raw === '') {
+      setViewportWidth('');
+      return;
+    }
+    const parsed = Math.round(Number(raw));
+    if (!Number.isFinite(parsed)) return;
+    setViewportWidth(parsed);
+  };
+
+  const handleViewportHeightChange = (event) => {
+    const raw = event.target.value;
+    if (raw === '') {
+      setViewportHeight('');
+      return;
+    }
+    const parsed = Math.round(Number(raw));
+    if (!Number.isFinite(parsed)) return;
+    setViewportHeight(parsed);
+  };
+
+  const commitViewportWidth = () => {
+    const next = clampViewport(
+      viewportWidth,
+      MIN_VIEWPORT.width,
+      MAX_VIEWPORT.width,
+      DEFAULT_VIEWPORT.width,
+    );
+    setViewportWidth(next);
+    try { localStorage.setItem(LS_VIEWPORT_WIDTH, String(next)); } catch { /* ignore */ }
+  };
+
+  const commitViewportHeight = () => {
+    const next = clampViewport(
+      viewportHeight,
+      MIN_VIEWPORT.height,
+      MAX_VIEWPORT.height,
+      DEFAULT_VIEWPORT.height,
+    );
+    setViewportHeight(next);
+    try { localStorage.setItem(LS_VIEWPORT_HEIGHT, String(next)); } catch { /* ignore */ }
+  };
+
+  const selectedScenario = scenarios.find((item) => item.id === selectedScenarioId) || null;
+  const recordedViewport = selectedScenario
+    ? {
+      width: clampViewport(
+        selectedScenario.recorded_width,
+        MIN_VIEWPORT.width,
+        MAX_VIEWPORT.width,
+        DEFAULT_VIEWPORT.width,
+      ),
+      height: clampViewport(
+        selectedScenario.recorded_height,
+        MIN_VIEWPORT.height,
+        MAX_VIEWPORT.height,
+        DEFAULT_VIEWPORT.height,
+      ),
+    }
+    : null;
+  const viewportOverridden = Boolean(
+    selectedScenario
+    && recordedViewport
+    && (viewportWidth !== recordedViewport.width || viewportHeight !== recordedViewport.height),
+  );
+
   const handleRunScenario = async () => {
     if (!selectedScenarioId) return;
     if (!selectedBrowserProfileId) {
@@ -133,11 +236,26 @@ export default function ExecutionsPage() {
       return;
     }
     const browserProfileId = selectedBrowserProfileId;
+    const runViewport = {
+      width: clampViewport(
+        viewportWidth,
+        MIN_VIEWPORT.width,
+        MAX_VIEWPORT.width,
+        recordedViewport?.width || DEFAULT_VIEWPORT.width,
+      ),
+      height: clampViewport(
+        viewportHeight,
+        MIN_VIEWPORT.height,
+        MAX_VIEWPORT.height,
+        recordedViewport?.height || DEFAULT_VIEWPORT.height,
+      ),
+    };
     const result = await dispatch(runScenario({
       scenarioId: selectedScenarioId,
       browserProfileId,
       sampleId: selectedSampleId || null,
       headless,
+      viewport: runViewport,
     }));
     if (result.meta.requestStatus === 'fulfilled') {
       dispatch(showToast({ type: 'info', message: t('executions.toast.commandSent') }));
@@ -295,6 +413,46 @@ export default function ExecutionsPage() {
             {t('executions.headless')}
           </label>
 
+          {selectedScenarioId && (
+            <div className="flex flex-wrap items-end gap-2 rounded-lg border border-slate-700 bg-slate-800/60 px-3 py-2">
+              <label className="block">
+                <span className="mb-1 block text-[11px] text-slate-400">{t('executions.viewportWidth')}</span>
+                <input
+                  type="number"
+                  min={MIN_VIEWPORT.width}
+                  max={MAX_VIEWPORT.width}
+                  value={viewportWidth}
+                  onChange={handleViewportWidthChange}
+                  onBlur={commitViewportWidth}
+                  className="input-field h-9 w-24 text-sm"
+                />
+              </label>
+              <label className="block">
+                <span className="mb-1 block text-[11px] text-slate-400">{t('executions.viewportHeight')}</span>
+                <input
+                  type="number"
+                  min={MIN_VIEWPORT.height}
+                  max={MAX_VIEWPORT.height}
+                  value={viewportHeight}
+                  onChange={handleViewportHeightChange}
+                  onBlur={commitViewportHeight}
+                  className="input-field h-9 w-24 text-sm"
+                />
+              </label>
+              {recordedViewport && (
+                <p className="pb-1 text-[11px] text-slate-500">
+                  {t('executions.recordedViewport', {
+                    width: recordedViewport.width,
+                    height: recordedViewport.height,
+                  })}
+                  {viewportOverridden && (
+                    <span className="ml-1 text-amber-400">{t('executions.viewportOverrideActive')}</span>
+                  )}
+                </p>
+              )}
+            </div>
+          )}
+
           <button
             onClick={handleRunScenario}
             disabled={!selectedScenarioId || !selectedBrowserProfileId}
@@ -310,6 +468,10 @@ export default function ExecutionsPage() {
             <Loader2 className="w-4 h-4 animate-spin" />
             {t('executions.runningParallel', { count: runningCount })}
           </div>
+        )}
+
+        {selectedScenarioId && (
+          <p className="mt-3 text-xs text-slate-500">{t('executions.viewportHint')}</p>
         )}
       </div>
 

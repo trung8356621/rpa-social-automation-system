@@ -1,4 +1,4 @@
-import crypto from 'node:crypto';
+import { getElementAnchorHelpersScript } from './ElementAnchorScript.js';
 import { ensureRememberMeChecked, isCheckboxAlreadyChecked, resolveGuestSessionDir } from '../browser/BrowserSessionPaths.js';
 import { resolveScenarioTargetUrl, resolveVariableTemplate } from './VariableResolver.js';
 import { execFile } from 'node:child_process';
@@ -1121,68 +1121,13 @@ class RecorderService {
   }
 
   _getInjectionScript() {
+    const anchorHelpers = getElementAnchorHelpersScript();
+
     return () => {
       if (window.__rpaRecorderInjected) return;
       window.__rpaRecorderInjected = true;
 
-      const buildXpath = (element) => {
-        if (!element || element.nodeType !== Node.ELEMENT_NODE) return '';
-        if (element.id) return `//*[@id="${element.id}"]`;
-
-        const parts = [];
-        let current = element;
-        while (current && current.nodeType === Node.ELEMENT_NODE && current !== document.body) {
-          const tagName = current.tagName.toLowerCase();
-          const siblings = Array.from(current.parentNode?.children || []).filter(
-            (item) => item.tagName === current.tagName,
-          );
-          const index = siblings.indexOf(current) + 1;
-          parts.unshift(`${tagName}${siblings.length > 1 ? `[${index}]` : ''}`);
-          current = current.parentElement;
-        }
-        return parts.length ? `//${parts.join('/')}` : '';
-      };
-
-      const stableClasses = (element) => Array.from(element.classList || [])
-        .filter((className) => !/^(p|m|w|h|flex|grid|text|bg|border|rounded|items|justify|gap|px|py|mx|my|mt|mb|ml|mr)-/.test(className))
-        .slice(0, 5);
-
-      const getAnchor = (element) => {
-        if (!element || !element.tagName) return {};
-
-        const text = (element.innerText || element.value || '').trim().slice(0, 160);
-        const rect = element.getBoundingClientRect();
-
-        return {
-          id: element.id || '',
-          ariaLabel: element.getAttribute('aria-label') || '',
-          placeholder: element.getAttribute('placeholder') || '',
-          role: element.getAttribute('role') || '',
-          name: element.getAttribute('name') || '',
-          title: element.getAttribute('title') || '',
-          testId: element.getAttribute('data-testid') || '',
-          tagName: element.tagName.toLowerCase(),
-          type: element.getAttribute('type') || '',
-          innerText: text,
-          classList: stableClasses(element),
-          xpath: buildXpath(element),
-          element_box: {
-            x: rect.x,
-            y: rect.y,
-            width: rect.width,
-            height: rect.height,
-          },
-        };
-      };
-
-      const pickSelector = (anchor) => {
-        if (anchor.id) return `#${anchor.id}`;
-        if (anchor.testId) return `[data-testid="${anchor.testId}"]`;
-        if (anchor.name) return `[name="${anchor.name}"]`;
-        if (anchor.ariaLabel) return `[aria-label="${anchor.ariaLabel}"]`;
-        if (anchor.placeholder) return `[placeholder="${anchor.placeholder}"]`;
-        return anchor.xpath || '';
-      };
+      eval(anchorHelpers);
 
       const send = (payload) => {
         if (typeof window.onRpaRecordedAction === 'function') {

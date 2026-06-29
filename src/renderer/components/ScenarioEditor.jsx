@@ -36,7 +36,14 @@ import { useTranslation } from '../i18n/index.jsx';
 import VariableInput from './VariableInput';
 import ScenarioVariablesBar from './ScenarioVariablesBar';
 import DataProfileSelect from './DataProfileSelect';
+import CrawlBrowserPreview from './CrawlBrowserPreview';
+import CrawlWidgetPanel from './CrawlWidgetPanel';
 import { normalizeActionType } from '../utils/variables';
+import {
+  applyPickToSteps,
+  getSelectionHighlightAnchor,
+  normalizeCrawlSteps,
+} from '../utils/crawlWidget';
 
 const DEFAULT_ACTION_DELAY_MS = 300;
 const MAX_UNDO_STEPS = 20;
@@ -508,12 +515,51 @@ function ScenarioInfoPanel({
   description,
   platform,
   targetUrl,
+  scenarioType,
+  parentId,
+  domCheckSelector,
+  parentOptions,
   variables,
   onScenarioChange,
 }) {
   const { t } = useTranslation();
+  const showParentFields = scenarioType !== 'prepare';
+
   return (
     <div className="grid grid-cols-2 gap-3">
+      <label className="block">
+        <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">{t('scenarioEditor.info.scenarioType')}</span>
+        <select
+          value={scenarioType || 'action'}
+          onChange={(event) => onScenarioChange({ nextScenarioType: event.target.value })}
+          className="select-field h-9"
+        >
+          <option value="prepare">{t('scenarioEditor.scenarioTypes.prepare')}</option>
+          <option value="crawl">{t('scenarioEditor.scenarioTypes.crawl')}</option>
+          <option value="action">{t('scenarioEditor.scenarioTypes.action')}</option>
+        </select>
+      </label>
+
+      {showParentFields ? (
+        <label className="block">
+          <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">{t('scenarioEditor.info.parentScenario')}</span>
+          <select
+            value={parentId || ''}
+            onChange={(event) => onScenarioChange({ nextParentId: event.target.value || null })}
+            className="select-field h-9"
+          >
+            <option value="">{t('scenarioEditor.info.parentNone')}</option>
+            {parentOptions.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.name}
+              </option>
+            ))}
+          </select>
+        </label>
+      ) : (
+        <div className="hidden sm:block" />
+      )}
+
       <label className="block">
         <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">{t('scenarioEditor.info.platform')}</span>
         <select
@@ -539,6 +585,27 @@ function ScenarioInfoPanel({
           placeholder={t('scenarioEditor.info.urlPlaceholder')}
         />
       </label>
+
+      {showParentFields && (
+        <label className="col-span-2 block">
+          <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">{t('scenarioEditor.info.domCheck')}</span>
+          <input
+            value={domCheckSelector || ''}
+            onChange={(event) => onScenarioChange({ nextDomCheckSelector: event.target.value })}
+            className="input-field h-9"
+            placeholder={t('scenarioEditor.info.domCheckPlaceholder')}
+          />
+          <span className="mt-1 block text-[11px] leading-relaxed text-[#8b97aa]">
+            {t('scenarioEditor.info.domCheckHint')}
+          </span>
+        </label>
+      )}
+
+      {showParentFields && (
+        <p className="col-span-2 text-[11px] leading-relaxed text-[#8b97aa]">
+          {t('scenarioEditor.info.parentHint')}
+        </p>
+      )}
 
       <label className="col-span-2 block">
         <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">{t('scenarioEditor.info.description')}</span>
@@ -812,6 +879,40 @@ function Timeline({
   );
 }
 
+function buildDomCheckAnchor(selector) {
+  const value = String(selector || '').trim();
+  if (!value) return null;
+  return {
+    selector_value: value,
+    action_config: { selector: value },
+  };
+}
+
+function readDomCheckSelector(anchor) {
+  const parsed = parseJsonObject(anchor);
+  return parsed.selector_value
+    || parsed.action_config?.selector
+    || '';
+}
+
+function buildScenarioMetaPayload(draft, extras = {}) {
+  const scenarioType = draft.scenarioType || 'action';
+  const parentId = scenarioType === 'prepare' ? null : (draft.parentId || null);
+
+  return {
+    description: draft.description,
+    platform: draft.platform || 'custom',
+    target_url: draft.targetUrl || '',
+    browser_profile_id: draft.browserProfileId || null,
+    scenario_type: scenarioType,
+    parent_id: parentId,
+    dom_check_anchor: scenarioType === 'prepare'
+      ? null
+      : buildDomCheckAnchor(draft.domCheckSelector),
+    ...extras,
+  };
+}
+
 // ===== Main ScenarioEditor Component =====
 
 export default function ScenarioEditor({ scenario, onBack }) {
@@ -823,6 +924,10 @@ export default function ScenarioEditor({ scenario, onBack }) {
   const [description, setDescription] = useState(scenario?.description || '');
   const [platform, setPlatform] = useState(scenario?.platform || 'facebook');
   const [targetUrl, setTargetUrl] = useState(scenario?.target_url || '');
+  const [scenarioType, setScenarioType] = useState(scenario?.scenario_type || 'action');
+  const [parentId, setParentId] = useState(scenario?.parent_id || '');
+  const [domCheckSelector, setDomCheckSelector] = useState(readDomCheckSelector(scenario?.dom_check_anchor));
+  const [allScenarios, setAllScenarios] = useState([]);
   const [steps, setSteps] = useState(normalizeSteps(scenario?.steps || []));
   const [selectedStepIndex, setSelectedStepIndex] = useState(null);
   const [currentScenarioId, setCurrentScenarioId] = useState(scenario?.id || null);
@@ -859,6 +964,8 @@ export default function ScenarioEditor({ scenario, onBack }) {
   const [variablesRefreshKey, setVariablesRefreshKey] = useState(0);
   const [profilesRefreshKey, setProfilesRefreshKey] = useState(0);
   const [activeVariableProfileId, setActiveVariableProfileId] = useState('');
+  const [designMode, setDesignMode] = useState(false);
+  const [selectedCrawlWidgetId, setSelectedCrawlWidgetId] = useState(null);
   const undoStackRef = useRef([]);
   const redoStackRef = useRef([]);
   const isApplyingHistoryRef = useRef(false);
@@ -870,7 +977,17 @@ export default function ScenarioEditor({ scenario, onBack }) {
     platform: scenario?.platform || 'facebook',
     targetUrl: scenario?.target_url || '',
     browserProfileId: scenario?.browser_profile_id || '',
+    scenarioType: scenario?.scenario_type || 'action',
+    parentId: scenario?.parent_id || '',
+    domCheckSelector: readDomCheckSelector(scenario?.dom_check_anchor),
   });
+
+  const parentScenarioOptions = useMemo(() => (
+    allScenarios.filter((item) => (
+      item.id !== currentScenarioId
+      && (item.scenario_type || 'action') === 'prepare'
+    ))
+  ), [allScenarios, currentScenarioId]);
 
   const loadScenarioVariables = useCallback(async (scenarioId) => {
     if (!scenarioId || !window.electronAPI?.getScenarioVariables) {
@@ -913,6 +1030,11 @@ export default function ScenarioEditor({ scenario, onBack }) {
 
   // ======== Derived State ========
   const hasSteps = steps.length > 0;
+  const isCrawlMode = scenarioType === 'crawl';
+  const isLivePreviewMode = scenarioType === 'crawl' || scenarioType === 'action';
+  const highlightSelectionAnchor = useMemo(() => (
+    getSelectionHighlightAnchor(steps, selectedCrawlWidgetId)
+  ), [steps, selectedCrawlWidgetId]);
   const stepTotalTime = steps.reduce((sum, s) => sum + (s.delay_ms || DEFAULT_ACTION_DELAY_MS), 0);
   const manifestDuration = manifestFrames.length
     ? Math.max(...manifestFrames.map((frame) => Number(frame.time) || 0))
@@ -975,6 +1097,27 @@ export default function ScenarioEditor({ scenario, onBack }) {
     if (patch.nextBrowserProfileId !== undefined) {
       scenarioDraftRef.current.browserProfileId = patch.nextBrowserProfileId || '';
       setBrowserProfileId(patch.nextBrowserProfileId || '');
+    }
+    if (patch.nextScenarioType !== undefined) {
+      scenarioDraftRef.current.scenarioType = patch.nextScenarioType;
+      setScenarioType(patch.nextScenarioType);
+      if (patch.nextScenarioType !== 'crawl') {
+        setDesignMode(false);
+      }
+      if (patch.nextScenarioType === 'prepare') {
+        scenarioDraftRef.current.parentId = '';
+        scenarioDraftRef.current.domCheckSelector = '';
+        setParentId('');
+        setDomCheckSelector('');
+      }
+    }
+    if (patch.nextParentId !== undefined) {
+      scenarioDraftRef.current.parentId = patch.nextParentId || '';
+      setParentId(patch.nextParentId || '');
+    }
+    if (patch.nextDomCheckSelector !== undefined) {
+      scenarioDraftRef.current.domCheckSelector = patch.nextDomCheckSelector;
+      setDomCheckSelector(patch.nextDomCheckSelector);
     }
   }, []);
 
@@ -1046,6 +1189,87 @@ export default function ScenarioEditor({ scenario, onBack }) {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [redo, undo]);
 
+  useEffect(() => () => {
+    window.electronAPI?.detachCrawlPreview?.().catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (!isLivePreviewMode) {
+      window.electronAPI?.detachCrawlPreview?.().catch(() => {});
+    }
+    if (!isCrawlMode) {
+      setDesignMode(false);
+    }
+  }, [isCrawlMode, isLivePreviewMode]);
+
+  useEffect(() => {
+    if (!isCrawlMode || !isLivePreviewMode || !window.electronAPI?.highlightCrawlAnchor) return undefined;
+
+    const crawlCount = steps.filter((step) => step.action_type === 'crawl').length;
+    if (crawlCount === 0) {
+      if (selectedCrawlWidgetId) setSelectedCrawlWidgetId(null);
+      window.electronAPI.clearCrawlHighlight?.().catch(() => {});
+      return undefined;
+    }
+
+    if (!highlightSelectionAnchor) {
+      window.electronAPI.clearCrawlHighlight?.().catch(() => {});
+      return undefined;
+    }
+
+    const timer = setTimeout(() => {
+      window.electronAPI.highlightCrawlAnchor(highlightSelectionAnchor).catch(() => {});
+    }, 120);
+
+    return () => clearTimeout(timer);
+  }, [highlightSelectionAnchor, isCrawlMode, isLivePreviewMode, selectedCrawlWidgetId, steps]);
+
+  useEffect(() => {
+    if (!isCrawlMode || !designMode || !window.electronAPI?.onCrawlDesignPick) return undefined;
+
+    const cleanup = window.electronAPI.onCrawlDesignPick((pickPayload) => {
+      if (pickPayload?.error) {
+        const toastKey = {
+          pickNeedsWidget: 'crawlWidget.pickNeedsWidget',
+          pickNeedsChild: 'crawlWidget.pickNeedsChild',
+          subChildNotDescendant: 'crawlWidget.subChildNotDescendant',
+        }[pickPayload.error];
+        dispatch(showToast({
+          type: 'error',
+          message: toastKey ? t(toastKey) : pickPayload.error,
+        }));
+        return;
+      }
+
+      setSteps((currentSteps) => {
+        const result = applyPickToSteps(currentSteps, pickPayload, {
+          selectedWidgetId: selectedCrawlWidgetId,
+        });
+
+        if (result.error) {
+          dispatch(showToast({
+            type: 'error',
+            message: result.error,
+          }));
+          return currentSteps;
+        }
+
+        if (!result.changed) return currentSteps;
+
+        if (result.widgetId) setSelectedCrawlWidgetId(result.widgetId);
+
+        return normalizeCrawlSteps(result.steps);
+      });
+    });
+
+    return cleanup;
+  }, [
+    designMode,
+    dispatch,
+    isCrawlMode,
+    selectedCrawlWidgetId,
+  ]);
+
   // ======== Load Settings ========
   useEffect(() => {
     window.electronAPI.getSettings().then((s) => {
@@ -1061,6 +1285,10 @@ export default function ScenarioEditor({ scenario, onBack }) {
     window.electronAPI.listAppBrowserProfiles?.()
       .then((profiles) => setBrowserProfileOptions(Array.isArray(profiles) ? profiles : []))
       .catch(() => setBrowserProfileOptions([]));
+
+    window.electronAPI.getScenarios?.()
+      .then((items) => setAllScenarios(Array.isArray(items) ? items : []))
+      .catch(() => setAllScenarios([]));
   }, []);
 
   // ======== Load Scenario Frames ========
@@ -1068,7 +1296,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
     if (!currentScenarioId) return;
     window.electronAPI.getScenarioDetails(currentScenarioId).then((s) => {
       if (s?.steps) {
-        setSteps(normalizeSteps(s.steps));
+        setSteps(normalizeCrawlSteps(normalizeSteps(s.steps)));
       }
       if (s) {
         scenarioDraftRef.current = {
@@ -1077,12 +1305,18 @@ export default function ScenarioEditor({ scenario, onBack }) {
           platform: s.platform || 'custom',
           targetUrl: s.target_url || '',
           browserProfileId: s.browser_profile_id || '',
+          scenarioType: s.scenario_type || 'action',
+          parentId: s.parent_id || '',
+          domCheckSelector: readDomCheckSelector(s.dom_check_anchor),
         };
         setName(s.name || name);
         setDescription(s.description || '');
         setPlatform(s.platform || 'custom');
         setTargetUrl(s.target_url || '');
         setBrowserProfileId(s.browser_profile_id || '');
+        setScenarioType(s.scenario_type || 'action');
+        setParentId(s.parent_id || '');
+        setDomCheckSelector(readDomCheckSelector(s.dom_check_anchor));
         setActiveVariableProfileId(s.variable_profile_id || '');
       }
       if (s?.preview_path) {
@@ -1209,22 +1443,23 @@ export default function ScenarioEditor({ scenario, onBack }) {
       const scenarioData = {
         ...(currentScenarioId ? { id: currentScenarioId } : {}),
         name: scenarioDraftRef.current.name || name,
-        description: scenarioDraftRef.current.description,
-        platform: scenarioDraftRef.current.platform || platform,
-        target_url: scenarioDraftRef.current.targetUrl || '',
-        browser_profile_id: scenarioDraftRef.current.browserProfileId || null,
-        variable_profile_id: activeVariableProfileId || null,
-        recorded_width: activeViewport.width,
-        recorded_height: activeViewport.height,
-        preview_trim_ranges: [],
-        preview_manifest_path: scenarioManifestPath,
-        preview_manifest_frames: manifestFrames,
-        preview_duration_ms: manifestDuration,
+        ...buildScenarioMetaPayload(scenarioDraftRef.current, {
+          variable_profile_id: activeVariableProfileId || null,
+          recorded_width: activeViewport.width,
+          recorded_height: activeViewport.height,
+          preview_trim_ranges: [],
+          preview_manifest_path: scenarioManifestPath,
+          preview_manifest_frames: manifestFrames,
+          preview_duration_ms: manifestDuration,
+        }),
       };
       const dbSteps = steps.map(toDatabaseStep);
       const saved = await window.electronAPI.saveScenario(scenarioData, dbSteps);
       if (saved) {
         setCurrentScenarioId(saved.id);
+        window.electronAPI.getScenarios?.()
+          .then((items) => setAllScenarios(Array.isArray(items) ? items : []))
+          .catch(() => {});
         dispatch(showToast({ type: 'success', message: 'Đã lưu kịch bản' }));
       }
       return saved;
@@ -1550,18 +1785,16 @@ export default function ScenarioEditor({ scenario, onBack }) {
       const scenarioData = {
         ...(currentScenarioId ? { id: currentScenarioId } : {}),
         name: scenarioDraftRef.current.name || name,
-        description: scenarioDraftRef.current.description,
-        platform: scenarioDraftRef.current.platform || platform,
-        target_url: scenarioDraftRef.current.targetUrl || '',
-        browser_profile_id: scenarioDraftRef.current.browserProfileId || null,
-        variable_profile_id: activeVariableProfileId || null,
-        recorded_width: activeViewport.width,
-        recorded_height: activeViewport.height,
-        preview_path: scenarioPreviewPath,
-        preview_manifest_path: scenarioManifestPath,
-        preview_manifest_frames: nextManifestFrames,
-        preview_duration_ms: nextDuration,
-        preview_trim_ranges: [],
+        ...buildScenarioMetaPayload(scenarioDraftRef.current, {
+          variable_profile_id: activeVariableProfileId || null,
+          recorded_width: activeViewport.width,
+          recorded_height: activeViewport.height,
+          preview_path: scenarioPreviewPath,
+          preview_manifest_path: scenarioManifestPath,
+          preview_manifest_frames: nextManifestFrames,
+          preview_duration_ms: nextDuration,
+          preview_trim_ranges: [],
+        }),
       };
       const saved = await window.electronAPI.saveScenario(scenarioData, nextSteps.map(toDatabaseStep));
       if (saved?.id) {
@@ -1646,7 +1879,13 @@ export default function ScenarioEditor({ scenario, onBack }) {
               className="w-full min-w-0 bg-transparent text-sm font-semibold text-white outline-none"
               placeholder="Tên kịch bản"
             />
-            <p className="truncate text-xs text-[#7e8da5]">Puppeteer scenario editor</p>
+            <p className="truncate text-xs text-[#7e8da5]">
+              {isCrawlMode
+                ? t('scenarioEditor.crawlDesignSubtitle')
+                : isLivePreviewMode
+                  ? t('scenarioEditor.livePreviewSubtitle')
+                  : t('scenarioEditor.subtitle')}
+            </p>
           </div>
         </div>
 
@@ -1686,6 +1925,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
             <Download className="h-3.5 w-3.5" />
             {t('scenarios.editor.export')}
           </button>
+          {!isCrawlMode && (
           <button
             type="button"
             onClick={handleRecordClick}
@@ -1699,10 +1939,12 @@ export default function ScenarioEditor({ scenario, onBack }) {
             {recording ? <Square className="h-4 w-4 fill-current" /> : <CircleDot className="h-4 w-4" />}
             {recording ? 'Stop' : 'Record'}
           </button>
+          )}
           <button type="button" onClick={persist} disabled={saving} className="btn-primary h-9">
             <Save className="h-4 w-4" />
             {saving ? t('scenarios.editor.saving') : t('scenarios.editor.save')}
           </button>
+          {!isCrawlMode && (
           <button
             type="button"
             onClick={handlePublish}
@@ -1712,15 +1954,37 @@ export default function ScenarioEditor({ scenario, onBack }) {
             <Upload className="h-4 w-4" />
             {publishing ? t('scenarios.editor.publishing') : t('scenarios.editor.publish')}
           </button>
+          )}
           <button type="button" onClick={onBack} className="icon-button" title="Đóng">
             <X className="h-4 w-4" />
           </button>
         </div>
       </header>
 
-      <div className={`grid min-h-0 min-w-0 flex-1 overflow-x-hidden ${timelineOpen ? 'grid-rows-[minmax(0,1fr)_190px]' : 'grid-rows-[minmax(0,1fr)]'}`}>
-        <div className={`grid min-h-0 min-w-0 overflow-x-hidden ${inspectorOpen ? 'grid-cols-[minmax(420px,1fr)_minmax(480px,1.1fr)]' : 'grid-cols-[minmax(420px,1fr)_minmax(360px,0.9fr)]'}`}>
+      <div className={`grid min-h-0 min-w-0 flex-1 overflow-x-hidden ${!isLivePreviewMode && timelineOpen ? 'grid-rows-[minmax(0,1fr)_190px]' : 'grid-rows-[minmax(0,1fr)]'}`}>
+        <div className={`grid min-h-0 min-w-0 overflow-x-hidden ${inspectorOpen
+          ? (isLivePreviewMode
+            ? 'grid-cols-[minmax(520px,1.25fr)_minmax(480px,1fr)]'
+            : 'grid-cols-[minmax(420px,1fr)_minmax(480px,1.1fr)]')
+          : (isLivePreviewMode
+            ? 'grid-cols-[minmax(520px,1.25fr)_minmax(360px,0.9fr)]'
+            : 'grid-cols-[minmax(420px,1fr)_minmax(360px,0.9fr)]')}`}>
           <section className="flex min-h-0 min-w-0 flex-col overflow-x-hidden border-r border-[#2a2d34]">
+            {isLivePreviewMode ? (
+              <CrawlBrowserPreview
+                scenarioId={currentScenarioId}
+                browserProfileId={browserProfileId}
+                targetUrl={targetUrl || defaultUrl(platform)}
+                browserProfileOptions={browserProfileOptions}
+                onBrowserProfileChange={(value) => updateScenarioDraft({ nextBrowserProfileId: value })}
+                activeViewport={activeViewport}
+                active={!recording && !showRecordMode}
+                isCrawlMode={isCrawlMode}
+                designMode={designMode}
+                onDesignModeChange={setDesignMode}
+              />
+            ) : (
+              <>
             <div className="flex h-8 shrink-0 items-center justify-between gap-2 border-b border-[#2a2d34] px-3">
               <label className="flex min-w-0 flex-1 items-center gap-2">
                 <Code2 className="h-3.5 w-3.5 shrink-0 text-[#7288ff]" />
@@ -1780,6 +2044,8 @@ export default function ScenarioEditor({ scenario, onBack }) {
                 <IconOnly icon={Eye} label="Hiển thị overlay" />
               </div>
             </div>
+              </>
+            )}
           </section>
 
           <section className="flex min-h-0 min-w-0 flex-col overflow-x-hidden bg-[#14161b]">
@@ -1795,12 +2061,36 @@ export default function ScenarioEditor({ scenario, onBack }) {
                   description={description}
                   platform={platform}
                   targetUrl={targetUrl}
+                  scenarioType={scenarioType}
+                  parentId={parentId}
+                  domCheckSelector={domCheckSelector}
+                  parentOptions={parentScenarioOptions}
                   variables={scenarioVariables}
                   onScenarioChange={updateScenarioDraft}
                 />
               </div>
             )}
 
+            {isCrawlMode ? (
+              <CrawlWidgetPanel
+                steps={steps}
+                selectedWidgetId={selectedCrawlWidgetId}
+                onSelectWidget={setSelectedCrawlWidgetId}
+                onUpdateSteps={(nextSteps) => {
+                  pushUndoSnapshot();
+                  setSteps(normalizeCrawlSteps(nextSteps));
+                }}
+                onDeleteWidget={(widgetId) => {
+                  pushUndoSnapshot();
+                  setSteps(steps.filter((step) => step.id !== widgetId));
+                  if (selectedCrawlWidgetId === widgetId) {
+                    setSelectedCrawlWidgetId(null);
+                    window.electronAPI?.clearCrawlHighlight?.().catch(() => {});
+                  }
+                }}
+                onToast={(payload) => dispatch(showToast(payload))}
+              />
+            ) : (
             <div className={`grid min-h-0 flex-1 ${inspectorOpen ? 'grid-cols-[40px_minmax(0,1fr)_minmax(260px,300px)]' : 'grid-cols-[40px_minmax(0,1fr)]'}`}>
               <ActionIconBar onAddStep={addStep} />
 
@@ -1886,10 +2176,11 @@ export default function ScenarioEditor({ scenario, onBack }) {
                 </div>
               )}
             </div>
+            )}
           </section>
         </div>
 
-        {timelineOpen ? (
+        {(!isLivePreviewMode && timelineOpen) ? (
           <section className="min-w-0 overflow-x-hidden border-t border-[#2a2d34] bg-[#14161b]">
             <PanelSectionHeader
               icon={Timer}
@@ -1956,7 +2247,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
               </div>
             </div>
           </section>
-        ) : (
+        ) : !isLivePreviewMode ? (
           <div className="flex h-8 shrink-0 items-center justify-between border-t border-[#2a2d34] bg-[#14161b] px-3">
             <span className="inline-flex items-center gap-2 text-[11px] font-bold uppercase text-[#7288ff]">
               <Timer className="h-3.5 w-3.5" />
@@ -1971,7 +2262,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
               Hiện timeline
             </button>
           </div>
-        )}
+        ) : null}
       </div>
 
       {/* ===== Record Mode Modal ===== */}
