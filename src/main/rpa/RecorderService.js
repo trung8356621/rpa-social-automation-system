@@ -1365,7 +1365,7 @@ function randomRuntimeDelay(baseMs = DEFAULT_ACTION_DELAY_MS, minMs = 120, maxMs
 
 function normalizeScenarioType(value) {
   const normalized = String(value || 'action').trim().toLowerCase();
-  if (normalized === 'prepare' || normalized === 'crawl' || normalized === 'action') {
+  if (normalized === 'prepare' || normalized === 'crawl' || normalized === 'action' || normalized === 'request_catching') {
     return normalized;
   }
   return 'action';

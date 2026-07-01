@@ -1,13 +1,19 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Loader2, Plus, Save, Trash2, X } from 'lucide-react';
 import { useTranslation } from '../i18n';
+
+function createRowId() {
+  return typeof crypto !== 'undefined' && crypto.randomUUID
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+}
 
 function emptyDraft() {
   return { name: '' };
 }
 
 function emptyKeyRow() {
-  return { key: '' };
+  return { id: createRowId(), key: '' };
 }
 
 function emptySampleDraft() {
@@ -26,7 +32,7 @@ export default function DataProfilesManager({
   const [samples, setSamples] = useState([]);
   const [selectedSampleId, setSelectedSampleId] = useState(null);
   const [sampleDraft, setSampleDraft] = useState(emptySampleDraft());
-  const [sampleValueRows, setSampleValueRows] = useState([]);
+  const [sampleValueMap, setSampleValueMap] = useState({});
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [creating, setCreating] = useState(false);
@@ -61,6 +67,7 @@ export default function DataProfilesManager({
     try {
       const detail = await window.electronAPI.getVariableProfile(profileId);
       const keys = (detail?.variables || detail?.keys || []).map((item) => ({
+        id: createRowId(),
         key: item.key || item.variable_key || '',
       }));
       setKeyRows(keys.length ? keys : [emptyKeyRow()]);
@@ -75,17 +82,19 @@ export default function DataProfilesManager({
 
   const loadSampleDetail = async (sampleId) => {
     if (!sampleId || !window.electronAPI?.getVariableProfileSample) {
-      setSampleValueRows([]);
+      setSampleValueMap({});
       return;
     }
 
     try {
       const detail = await window.electronAPI.getVariableProfileSample(sampleId);
       setSampleDraft({ name: detail?.name || '' });
-      setSampleValueRows((detail?.variables || []).map((item) => ({
-        key: item.key || item.variable_key || '',
-        value: item.value ?? '',
-      })));
+      const nextMap = {};
+      (detail?.variables || []).forEach((item) => {
+        const key = item.key || item.variable_key || '';
+        if (key) nextMap[key] = item.value ?? '';
+      });
+      setSampleValueMap(nextMap);
     } catch (error) {
       onToast?.({ type: 'error', message: error.message || t('dataProfiles.toast.loadSampleFailed') });
     }
@@ -109,12 +118,22 @@ export default function DataProfilesManager({
 
   useEffect(() => {
     if (!selectedSampleId) {
-      setSampleValueRows([]);
+      setSampleValueMap({});
       if (!selectedProfileId) setSampleDraft(emptySampleDraft());
       return;
     }
     loadSampleDetail(selectedSampleId);
   }, [selectedSampleId]);
+
+  const templateKeys = useMemo(
+    () => keyRows.map((row) => String(row.key || '').trim()).filter(Boolean),
+    [keyRows],
+  );
+
+  const sampleDisplayRows = useMemo(
+    () => templateKeys.map((key) => ({ key, value: sampleValueMap[key] ?? '' })),
+    [templateKeys, sampleValueMap],
+  );
 
   const handleCreateProfile = async () => {
     const name = String(draft.name || '').trim();
@@ -187,7 +206,7 @@ export default function DataProfilesManager({
         id: selectedSampleId,
         profile_id: selectedProfileId,
         name,
-        variables: sampleValueRows,
+        variables: templateKeys.map((key) => ({ key, value: sampleValueMap[key] ?? '' })),
       });
       await loadProfileDetail(selectedProfileId);
       await loadSampleDetail(selectedSampleId);
@@ -282,8 +301,8 @@ export default function DataProfilesManager({
     });
   };
 
-  const updateSampleValue = (index, value) => {
-    setSampleValueRows((prev) => prev.map((row, idx) => (idx === index ? { ...row, value } : row)));
+  const updateSampleValue = (key, value) => {
+    setSampleValueMap((prev) => ({ ...prev, [key]: value }));
   };
 
   return (
@@ -372,7 +391,7 @@ export default function DataProfilesManager({
 
               <div className="space-y-2">
                 {keyRows.map((row, index) => (
-                  <div key={`${row.key}-${index}`} className="grid grid-cols-[1fr_auto] gap-2">
+                  <div key={row.id} className="grid grid-cols-[1fr_auto] gap-2">
                     <input
                       value={row.key}
                       onChange={(event) => updateKeyRow(index, { key: event.target.value })}
@@ -435,12 +454,12 @@ export default function DataProfilesManager({
                     </button>
                   </div>
                   <div className="space-y-2">
-                    {sampleValueRows.map((row, index) => (
+                    {sampleDisplayRows.map((row) => (
                       <div key={row.key} className="grid grid-cols-[120px_1fr] gap-2">
                         <span className="flex h-9 items-center truncate text-xs text-slate-400">{row.key}</span>
                         <input
                           value={row.value}
-                          onChange={(event) => updateSampleValue(index, event.target.value)}
+                          onChange={(event) => updateSampleValue(row.key, event.target.value)}
                           className="input-field h-9 text-sm"
                           placeholder={t('variables.field.value')}
                         />

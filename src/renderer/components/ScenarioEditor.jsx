@@ -37,6 +37,7 @@ import VariableInput from './VariableInput';
 import ScenarioVariablesBar from './ScenarioVariablesBar';
 import DataProfileSelect from './DataProfileSelect';
 import CrawlScenarioEditorContent from './CrawlScenarioEditorContent';
+import RequestCatchingScenarioEditorContent from './RequestCatchingScenarioEditorContent';
 import StandardScenarioEditorContent from './StandardScenarioEditorContent';
 import { normalizeActionType } from '../utils/variables';
 import {
@@ -537,8 +538,10 @@ function ScenarioInfoPanel({
   onScenarioChange,
 }) {
   const { t } = useTranslation();
-  const showParentFields = scenarioType !== 'prepare';
+  const showParentFields = scenarioType !== 'prepare' && scenarioType !== 'request_catching';
   const showResultType = scenarioType === 'crawl';
+  const showScrollSettings = scenarioType === 'crawl' || scenarioType === 'request_catching';
+  const isRequestCatching = scenarioType === 'request_catching';
   const crawlMeta = defaultCrawlMeta(scenarioMeta);
   const patchCrawlMeta = (patch) => onScenarioChange({
     nextScenarioMeta: {
@@ -570,6 +573,7 @@ function ScenarioInfoPanel({
         >
           <option value="prepare">{t('scenarioEditor.scenarioTypes.prepare')}</option>
           <option value="crawl">{t('scenarioEditor.scenarioTypes.crawl')}</option>
+          <option value="request_catching">{t('scenarioEditor.scenarioTypes.requestCatching')}</option>
           <option value="action">{t('scenarioEditor.scenarioTypes.action')}</option>
         </select>
       </label>
@@ -653,7 +657,7 @@ function ScenarioInfoPanel({
         </p>
       )}
 
-      {showResultType && (
+      {showScrollSettings && (
         <div className="col-span-2 grid grid-cols-2 gap-3 rounded border border-[#2a3144] bg-[#101217] p-3">
           <label className="col-span-2 flex items-center gap-2 text-xs font-semibold text-[#c7d0dc]">
             <input
@@ -749,6 +753,7 @@ function ScenarioInfoPanel({
               </label>
             </>
           )}
+          {!isRequestCatching && (
           <button
             type="button"
             onClick={() => onScenarioChange({ testCrawlCondition: true })}
@@ -757,9 +762,11 @@ function ScenarioInfoPanel({
           >
             Run test data
           </button>
+          )}
         </div>
       )}
 
+      {!isRequestCatching && (
       <label className="col-span-2 block">
         <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">{t('scenarioEditor.info.description')}</span>
         <textarea
@@ -769,6 +776,7 @@ function ScenarioInfoPanel({
           placeholder={t('scenarioEditor.info.descriptionPlaceholder')}
         />
       </label>
+      )}
     </div>
   );
 }
@@ -1079,7 +1087,9 @@ function defaultScenarioMeta(meta = {}) {
 
 function buildScenarioMetaPayload(draft, extras = {}) {
   const scenarioType = draft.scenarioType || 'action';
-  const parentId = scenarioType === 'prepare' ? null : (draft.parentId || null);
+  const parentId = (scenarioType === 'prepare' || scenarioType === 'request_catching')
+    ? null
+    : (draft.parentId || null);
 
   return {
     description: draft.description,
@@ -1092,7 +1102,7 @@ function buildScenarioMetaPayload(draft, extras = {}) {
       ...defaultScenarioMeta(draft.scenarioMeta),
     },
     parent_id: parentId,
-    dom_check_anchor: scenarioType === 'prepare'
+    dom_check_anchor: (scenarioType === 'prepare' || scenarioType === 'request_catching')
       ? null
       : buildDomCheckAnchor(draft.domCheckSelector),
     ...extras,
@@ -1224,6 +1234,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
   // ======== Derived State ========
   const hasSteps = steps.length > 0;
   const isCrawlMode = scenarioType === 'crawl';
+  const isRequestCatchingMode = scenarioType === 'request_catching';
   const isLivePreviewMode = scenarioType === 'crawl';
   const highlightSelectionAnchor = useMemo(() => (
     getSelectionHighlightAnchor(steps, selectedCrawlWidgetId)
@@ -1300,7 +1311,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
       if (patch.nextScenarioType !== 'crawl') {
         setDesignMode(false);
       }
-      if (patch.nextScenarioType === 'prepare') {
+      if (patch.nextScenarioType === 'prepare' || patch.nextScenarioType === 'request_catching') {
         scenarioDraftRef.current.parentId = '';
         scenarioDraftRef.current.domCheckSelector = '';
         setParentId('');
@@ -1348,6 +1359,17 @@ export default function ScenarioEditor({ scenario, onBack }) {
         .catch((error) => dispatch(showToast({ type: 'error', message: error.message || 'Test failed' })));
     }
   }, [dispatch, selectedCrawlWidgetId, steps]);
+
+  const handleExitRequestCatchingMode = useCallback(() => {
+    window.electronAPI?.setRequestCatchingAuto?.({ enabled: false }).catch(() => {});
+    window.electronAPI?.detachCrawlPreview?.().catch(() => {});
+
+    const { request_catching: _removed, ...restMeta } = scenarioMeta || {};
+    updateScenarioDraft({
+      nextScenarioType: 'crawl',
+      nextScenarioMeta: restMeta,
+    });
+  }, [scenarioMeta, updateScenarioDraft]);
 
   const clearUndoHistory = useCallback(() => {
     undoStackRef.current = [];
@@ -2175,6 +2197,8 @@ export default function ScenarioEditor({ scenario, onBack }) {
             <p className="truncate text-xs text-[#7e8da5]">
               {isCrawlMode
                 ? t('scenarioEditor.crawlDesignSubtitle')
+                : isRequestCatchingMode
+                  ? t('scenarioEditor.requestCatchingSubtitle')
                 : isLivePreviewMode
                   ? t('scenarioEditor.livePreviewSubtitle')
                   : t('scenarioEditor.subtitle')}
@@ -2218,7 +2242,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
             <Download className="h-3.5 w-3.5" />
             {t('scenarios.editor.export')}
           </button>
-          {!isCrawlMode && (
+          {!isCrawlMode && !isRequestCatchingMode && (
           <button
             type="button"
             onClick={handleRecordClick}
@@ -2237,7 +2261,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
             <Save className="h-4 w-4" />
             {saving ? t('scenarios.editor.saving') : t('scenarios.editor.save')}
           </button>
-          {!isCrawlMode && (
+          {!isCrawlMode && !isRequestCatchingMode && (
           <button
             type="button"
             onClick={handlePublish}
@@ -2302,6 +2326,40 @@ export default function ScenarioEditor({ scenario, onBack }) {
             }
           }}
           onToast={(payload) => dispatch(showToast(payload))}
+        />
+      ) : isRequestCatchingMode ? (
+        <RequestCatchingScenarioEditorContent
+          currentScenarioId={currentScenarioId}
+          browserProfileId={browserProfileId}
+          targetUrl={targetUrl}
+          defaultTargetUrl={defaultUrl(platform)}
+          browserProfileOptions={browserProfileOptions}
+          onBrowserProfileChange={(value) => updateScenarioDraft({ nextBrowserProfileId: value })}
+          activeViewport={activeViewport}
+          active={!recording && !showRecordMode}
+          platform={platform}
+          scenarioInfoOpen={scenarioInfoOpen}
+          onScenarioInfoToggle={() => setScenarioInfoOpen((current) => !current)}
+          ScenarioInfoPanelComponent={ScenarioInfoPanel}
+          PanelSectionHeaderComponent={PanelSectionHeader}
+          scenarioInfoProps={{
+            title: t('scenarioEditor.info.title'),
+            description,
+            platform,
+            targetUrl,
+            scenarioType,
+            resultType,
+            parentId,
+            domCheckSelector,
+            scenarioMeta,
+            selectedCrawlWidget,
+            parentOptions: parentScenarioOptions,
+            variables: scenarioVariables,
+            onScenarioChange: updateScenarioDraft,
+          }}
+          scenarioMeta={scenarioMeta}
+          onScenarioMetaChange={(nextMeta) => updateScenarioDraft({ nextScenarioMeta: nextMeta })}
+          onExitRequestCatchingMode={handleExitRequestCatchingMode}
         />
       ) : (
         <StandardScenarioEditorContent

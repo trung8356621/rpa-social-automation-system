@@ -12,6 +12,8 @@ import {
 } from '../rpa/DesignModeScript.js';
 import { getCrawlExtractionScript } from '../rpa/CardExtractorScript.js';
 import { buildPreviewPartition, invalidateProfileCookieCache, syncProfileCookiesToSession } from './ProfileCookieSync.js';
+import { RequestCatchingPreviewBridge } from './RequestCatchingPreviewBridge.js';
+import { RequestCatchingDumpService } from '../rpa/RequestCatchingDumpService.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -36,6 +38,24 @@ class ScenarioEmbeddedBrowserService {
     this._keyboardInputHandler = null;
     this._onStartLoading = null;
     this._onStopLoading = null;
+    this.requestCatchingBridge = new RequestCatchingPreviewBridge();
+    this.requestCatchingAutoConfig = null;
+    this._requestCatchingPageUrl = '';
+    this._onRequestCatchingNavigateHandler = null;
+  }
+
+  _normalizePreviewUrl(url) {
+    return String(url || '').trim().replace(/\/+$/, '') || '';
+  }
+
+  _emitRequestCatchingReset(url = '') {
+    const win = this._getWindow();
+    if (win && !win.isDestroyed()) {
+      win.webContents.send('request-catching:reset', {
+        url: url || '',
+        timestamp: new Date().toISOString(),
+      });
+    }
   }
 
   _getWindow() {
@@ -82,15 +102,101 @@ class ScenarioEmbeddedBrowserService {
   }
 
   _setupNavigationHooks() {
-    if (!this.view || this._didFinishLoadHandler) return;
+    if (!this.view) return;
 
-    this._didFinishLoadHandler = async () => {
-      await this._injectDesignMode();
-      if (this.designModeEnabled) {
-        await this._applyDesignModeState();
-      }
+    if (!this._didFinishLoadHandler) {
+      this._didFinishLoadHandler = async () => {
+        await this._injectDesignMode();
+        if (this.designModeEnabled) {
+          await this._applyDesignModeState();
+        }
+        await this._handleRequestCatchingPageReady();
+      };
+      this.view.webContents.on('did-finish-load', this._didFinishLoadHandler);
+    }
+
+    if (!this._onRequestCatchingNavigateHandler) {
+      this._onRequestCatchingNavigateHandler = (_event, _url, _isInPlace, isMainFrame) => {
+        if (isMainFrame === false) return;
+        void this._handleRequestCatchingNavigationStart(_url);
+      };
+      this.view.webContents.on('did-start-navigation', this._onRequestCatchingNavigateHandler);
+    }
+  }
+
+  async _handleRequestCatchingNavigationStart(nextUrl) {
+    if (!this.requestCatchingAutoConfig?.enabled || !this.view) return;
+
+    const normalized = this._normalizePreviewUrl(nextUrl);
+    if (!normalized || normalized === 'about:blank') return;
+
+    this._requestCatchingPageUrl = normalized;
+    this.requestCatchingAutoConfig.paused = false;
+    await this.requestCatchingBridge.stop(this.view.webContents);
+    this._emitRequestCatchingReset(normalized);
+  }
+
+  async _handleRequestCatchingPageReady() {
+    const cfg = this.requestCatchingAutoConfig;
+    console.log('[RC] _handleRequestCatchingPageReady called, cfg=', cfg?.enabled, 'paused=', cfg?.paused, 'view=', Boolean(this.view));
+    if (!cfg?.enabled || cfg?.paused || !this.view) return;
+
+    const pageUrl = this.view.webContents.getURL() || '';
+    const normalized = this._normalizePreviewUrl(pageUrl);
+    console.log('[RC] page url=', normalized);
+    if (!normalized || normalized === 'about:blank') return;
+
+    this._requestCatchingPageUrl = normalized;
+
+    try {
+      await this.startRequestCatching({
+        listenOnly: true,
+        platform: cfg.platform,
+        scenarioId: cfg.scenarioId,
+        crawlMeta: cfg.crawlMeta,
+        requestCatchingFilters: cfg.requestCatchingFilters || {},
+      });
+    } catch (error) {
+      console.warn('[RC] auto-start failed:', error.message);
+    }
+  }
+
+  async setRequestCatchingAuto(payload = {}) {
+    console.log('[RC] setRequestCatchingAuto', payload);
+    if (!payload.enabled) {
+      this.requestCatchingAutoConfig = null;
+      this._requestCatchingPageUrl = '';
+      await this.stopRequestCatching();
+      return { enabled: false };
+    }
+
+    this.requestCatchingAutoConfig = {
+      enabled: true,
+      paused: Boolean(payload.paused),
+      platform: payload.platform || 'facebook',
+      scenarioId: payload.scenarioId || null,
+      crawlMeta: payload.crawlMeta || {},
+      requestCatchingFilters: payload.requestCatchingFilters || {},
     };
-    this.view.webContents.on('did-finish-load', this._didFinishLoadHandler);
+
+    if (this.requestCatchingAutoConfig.paused) {
+      await this.stopRequestCatching();
+      return { enabled: true, paused: true, platform: this.requestCatchingAutoConfig.platform };
+    }
+
+    if (this.view && !this.view.webContents.isDestroyed()) {
+      this._setupNavigationHooks();
+      const isLoading = this.view.webContents.isLoading();
+      console.log('[RC] view exists, isLoading=', isLoading);
+      // Always try to start — bridge.start() is idempotent for the same webContents.
+      // If page is loading, did-finish-load will trigger _handleRequestCatchingPageReady.
+      // If page is already loaded, start immediately.
+      await this._handleRequestCatchingPageReady();
+    } else {
+      console.log('[RC] view not ready yet — will auto-start on did-finish-load');
+    }
+
+    return { enabled: true, platform: this.requestCatchingAutoConfig.platform };
   }
 
   _setupLoadingStateHooks() {
@@ -309,6 +415,10 @@ class ScenarioEmbeddedBrowserService {
         void this._injectDesignMode().then(() => this._applyDesignModeState());
       }
       this._setupKeyboardHooks();
+      // If request-catching auto is configured and page is ready, ensure bridge is started.
+      if (this.requestCatchingAutoConfig?.enabled && !this.view.webContents.isLoading()) {
+        void this._handleRequestCatchingPageReady();
+      }
       return this.getState();
     }
 
@@ -350,6 +460,11 @@ class ScenarioEmbeddedBrowserService {
       }
       return undefined;
     });
+
+    // did-finish-load also triggers this, but call explicitly when page is already idle.
+    if (this.requestCatchingAutoConfig?.enabled && !this.view.webContents.isLoading()) {
+      void this._handleRequestCatchingPageReady();
+    }
 
     return this.getState();
   }
@@ -432,6 +547,134 @@ class ScenarioEmbeddedBrowserService {
     return { opened: true };
   }
 
+  async startRequestCatching(payload = {}) {
+    if (!this.view) {
+      throw new Error('Embedded browser is not attached');
+    }
+
+    const platform = payload.platform
+      || this.requestCatchingAutoConfig?.platform
+      || 'facebook';
+    const listenOnly = payload.listenOnly === true;
+    const win = this._getWindow();
+
+    const result = await this.requestCatchingBridge.start(
+      this.view.webContents,
+      platform,
+      {
+        customFilters: payload.requestCatchingFilters
+          || this.requestCatchingAutoConfig?.requestCatchingFilters
+          || {},
+        onDiscover: async (record) => {
+          if (!win || win.isDestroyed()) return;
+          const scenarioId = payload.scenarioId
+            || this.requestCatchingAutoConfig?.scenarioId
+            || null;
+          if (scenarioId) {
+            try {
+              await RequestCatchingDumpService.appendDiscovered(scenarioId, record);
+            } catch {
+              // Disk write failure should not block live preview.
+            }
+          }
+          if (!win.isDestroyed()) {
+            win.webContents.send('request-catching:discovered', {
+              ...record,
+              timestamp: record.timestamp || new Date().toISOString(),
+            });
+          }
+        },
+        onCapture: async (items, meta) => {
+          if (!win || win.isDestroyed()) return;
+          const scenarioId = payload.scenarioId
+            || this.requestCatchingAutoConfig?.scenarioId
+            || null;
+          if (scenarioId) {
+            try {
+              await RequestCatchingDumpService.appendCaptured(scenarioId, items);
+            } catch {
+              // Disk write failure should not block live preview.
+            }
+          }
+          if (!win.isDestroyed()) {
+            win.webContents.send('request-catching:captured', {
+              items,
+              url: meta?.url || '',
+              itemCount: meta?.itemCount || items.length,
+              label: meta?.label || '',
+              timestamp: new Date().toISOString(),
+            });
+          }
+        },
+      },
+    );
+
+    if (!listenOnly && payload.url) {
+      const targetUrl = this._resolveUrl(payload.url, payload.scenarioId);
+      const currentUrl = this._normalizePreviewUrl(this.view.webContents.getURL());
+      const normalizedTarget = this._normalizePreviewUrl(targetUrl);
+
+      if (normalizedTarget && currentUrl === normalizedTarget) {
+        await this.reload();
+      } else {
+        await this.navigate({
+          url: payload.url,
+          scenarioId: payload.scenarioId,
+        });
+      }
+    }
+
+    await this._runPreviewAutoscroll(
+      payload.crawlMeta || this.requestCatchingAutoConfig?.crawlMeta || {},
+    );
+
+    return {
+      ...result,
+      attached: true,
+    };
+  }
+
+  async _runPreviewAutoscroll(crawlMeta = {}) {
+    if (!this.view) return;
+
+    const autoscroll = crawlMeta.autoscroll || {};
+    const infinite = crawlMeta.infinity_scroll || {};
+    const shouldScroll = autoscroll.enabled || infinite.enabled;
+    if (!shouldScroll) return;
+
+    const scrollDistance = Math.max(100, Number(autoscroll.distance_px) || 600);
+    const scrollDelay = Math.max(100, Number(autoscroll.delay_ms) || 500);
+    const maxScrolls = infinite.enabled
+      ? Math.max(1, Math.min(30, Number(infinite.max_scrolls) || 10))
+      : 5;
+    const timeoutMs = Math.max(1000, Number(infinite.timeout_ms) || 30000);
+    const startedAt = Date.now();
+
+    const { webContents } = this.view;
+    await webContents.executeJavaScript('window.scrollTo(0, 0)').catch(() => {});
+    await new Promise((resolve) => { setTimeout(resolve, scrollDelay); });
+
+    for (let index = 0; index < maxScrolls; index += 1) {
+      if (infinite.enabled && Date.now() - startedAt >= timeoutMs) break;
+
+      await webContents.executeJavaScript(`window.scrollBy(0, ${scrollDistance})`).catch(() => {});
+      await new Promise((resolve) => { setTimeout(resolve, scrollDelay); });
+    }
+  }
+
+  async stopRequestCatching() {
+    if (!this.view) {
+      await this.requestCatchingBridge.stop();
+      return { active: false, attached: false };
+    }
+
+    const result = await this.requestCatchingBridge.stop(this.view.webContents);
+    return {
+      ...result,
+      attached: true,
+    };
+  }
+
   setBounds(bounds) {
     const win = this._getWindow();
     if (!win || !this.view || !bounds) return;
@@ -508,6 +751,7 @@ class ScenarioEmbeddedBrowserService {
         isLoading: false,
         designMode: this.designModeEnabled,
         zoomFactor: this.zoomFactor,
+        requestCatchingActive: this.requestCatchingBridge.isActive(),
       };
     }
 
@@ -521,6 +765,7 @@ class ScenarioEmbeddedBrowserService {
       isLoading: this._pageLoading,
       designMode: this.designModeEnabled,
       zoomFactor: this.zoomFactor,
+      requestCatchingActive: this.requestCatchingBridge.isActive(),
     };
   }
 
@@ -536,6 +781,11 @@ class ScenarioEmbeddedBrowserService {
       this._didFinishLoadHandler = null;
     }
 
+    if (this.view && this._onRequestCatchingNavigateHandler) {
+      this.view.webContents.removeListener('did-start-navigation', this._onRequestCatchingNavigateHandler);
+      this._onRequestCatchingNavigateHandler = null;
+    }
+
     this._teardownLoadingStateHooks();
 
     if (this.view && this._keyboardInputHandler) {
@@ -544,6 +794,10 @@ class ScenarioEmbeddedBrowserService {
     }
 
     this.stopFindInPage();
+    // Preserve requestCatchingAutoConfig — detach() runs during attach() recycle;
+    // clearing here breaks auto-start on did-finish-load.
+    this._requestCatchingPageUrl = '';
+    void this.requestCatchingBridge.stop(this.view?.webContents || null);
 
     if (win && this.view) {
       win.removeBrowserView(this.view);

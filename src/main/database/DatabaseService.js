@@ -2366,7 +2366,7 @@ function buildScenarioMetaForStorage(scenario = {}, existingScenario = null, exi
   return meta;
 }
 
-const SCENARIO_TYPES = new Set(['prepare', 'crawl', 'action']);
+const SCENARIO_TYPES = new Set(['prepare', 'crawl', 'action', 'request_catching']);
 const SCENARIO_RESULT_TYPES = new Set(['simple', 'list']);
 
 function normalizeScenarioType(value) {
@@ -2381,7 +2381,7 @@ function normalizeScenarioResultType(value) {
 
 function normalizeScenarioParentId(scenarioType, parentId) {
   const type = normalizeScenarioType(scenarioType);
-  if (type === 'prepare') return null;
+  if (type === 'prepare' || type === 'request_catching') return null;
 
   const normalized = parentId ? String(parentId).trim() : '';
   return normalized || null;

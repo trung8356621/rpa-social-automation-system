@@ -2,9 +2,11 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import { app, BrowserWindow, dialog, ipcMain, Menu, net, protocol, shell } from 'electron';
 import { ScenarioEmbeddedBrowserService } from './browser/ScenarioEmbeddedBrowserService.js';
+import { RequestCatchingDumpService } from './rpa/RequestCatchingDumpService.js';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import DatabaseService from './database/DatabaseService.js';
+import PlatformCrawledDataService from './database/PlatformCrawledDataService.js';
 import BrowserProfileService from './browser/BrowserProfileService.js';
 import { ExecutorService } from './rpa/ExecutorService.js';
 import { initRecorderService } from './rpa/RecorderService.js';
@@ -14,6 +16,7 @@ import {
   sanitizeScenarioFileName,
   writeScenarioBundleZip,
 } from './scenario/ScenarioBundleZip.js';
+import { isMasterBuild } from './appRoleConfig.js';
 
 // __dirname equivalent trong ESM:
 // Trong ES Module, không có __dirname và __filename global.
@@ -26,6 +29,18 @@ let mainWindow = null;
 
 /** @type {DatabaseService} */
 let dbService = null;
+
+/** @type {PlatformCrawledDataService|null} */
+let platformCrawledDataService = null;
+
+function assertMasterFacebookDataAccess() {
+  if (!isMasterBuild) {
+    throw new Error('Facebook crawled data is disabled on slave builds.');
+  }
+  if (!platformCrawledDataService) {
+    throw new Error('Platform crawled data service is not available.');
+  }
+}
 
 /** @type {BrowserProfileService} */
 let browserProfileService = null;
@@ -188,6 +203,62 @@ function registerDatabaseHandlers() {
 
   ipcMain.handle('settings:save', (_event, settings) => {
     return withDefaultSettings(dbService.saveSettings(settings));
+  });
+
+  // ===== Facebook Crawled Data (platform SQLite, master only) =====
+
+  ipcMain.handle('facebook-data:get-stats', () => {
+    assertMasterFacebookDataAccess();
+    return platformCrawledDataService.getFacebookStats();
+  });
+
+  ipcMain.handle('facebook-data:list-groups', (_event, options = {}) => {
+    assertMasterFacebookDataAccess();
+    return platformCrawledDataService.listFacebookGroups(options);
+  });
+
+  ipcMain.handle('facebook-data:list-authors', (_event, options = {}) => {
+    assertMasterFacebookDataAccess();
+    return platformCrawledDataService.listFacebookAuthors(options);
+  });
+
+  ipcMain.handle('facebook-data:list-posts', (_event, options = {}) => {
+    assertMasterFacebookDataAccess();
+    return platformCrawledDataService.listFacebookPosts(options);
+  });
+
+  ipcMain.handle('facebook-data:list-comments', (_event, options = {}) => {
+    assertMasterFacebookDataAccess();
+    return platformCrawledDataService.listFacebookComments(options);
+  });
+
+  ipcMain.handle('facebook-data:export-csv', async (_event, payload = {}) => {
+    assertMasterFacebookDataAccess();
+
+    const content = String(payload?.content || '');
+    if (!content) {
+      throw new Error('Export content is empty.');
+    }
+
+    const defaultPath = String(payload?.defaultPath || 'facebook-data-export.csv');
+    const filePath = await showNativeSaveDialog({
+      defaultPath,
+      filters: [
+        { name: 'CSV', extensions: ['csv'] },
+        { name: 'Excel', extensions: ['csv', 'xls'] },
+      ],
+    });
+
+    if (!filePath) {
+      return { cancelled: true };
+    }
+
+    const normalizedPath = filePath.toLowerCase().endsWith('.csv')
+      ? filePath
+      : `${filePath}.csv`;
+
+    await fs.writeFile(normalizedPath, content, 'utf8');
+    return { cancelled: false, filePath: normalizedPath };
   });
 
   ipcMain.handle('dialog:select-directory', async () => {
@@ -559,6 +630,69 @@ function registerDatabaseHandlers() {
 
   ipcMain.handle('scenario:crawl-preview:stop-find-in-page', () => embeddedBrowserService.stopFindInPage());
 
+  ipcMain.handle('scenario:request-catching:start', async (_event, payload) => {
+    try {
+      return await embeddedBrowserService.startRequestCatching(payload || {});
+    } catch (error) {
+      return { active: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('scenario:request-catching:stop', async () => {
+    try {
+      return await embeddedBrowserService.stopRequestCatching();
+    } catch (error) {
+      return { active: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('scenario:request-catching:set-auto', async (_event, payload) => {
+    try {
+      return await embeddedBrowserService.setRequestCatchingAuto(payload || {});
+    } catch (error) {
+      return { enabled: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('scenario:request-catching:load-dump', async (_event, scenarioId) => {
+    try {
+      return await RequestCatchingDumpService.loadSession(scenarioId);
+    } catch (error) {
+      return {
+        scenarioId: scenarioId || 'draft',
+        crawledData: [],
+        discovered: [],
+        error: error.message,
+      };
+    }
+  });
+
+  ipcMain.handle('scenario:request-catching:clear-dump', async (_event, scenarioId) => {
+    try {
+      return await RequestCatchingDumpService.clearSession(scenarioId);
+    } catch (error) {
+      return { cleared: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('scenario:request-catching:save-dump', async (_event, payload = {}) => {
+    try {
+      return await RequestCatchingDumpService.saveSession(payload.scenarioId, {
+        crawledData: payload.crawledData,
+        discovered: payload.discovered,
+      });
+    } catch (error) {
+      return { saved: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('scenario:request-catching:get-dump-path', async (_event, scenarioId) => {
+    return {
+      dumpPath: RequestCatchingDumpService.resolveScenarioDir(scenarioId),
+      rootPath: RequestCatchingDumpService.resolveRoot(),
+    };
+  });
+
   ipcMain.on('crawl:design-pick', (_event, payload) => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('crawl:design-pick', payload);
@@ -815,6 +949,12 @@ app.whenReady().then(() => {
   dbService = new DatabaseService(app.getPath('userData'));
   dbService.open();
   dbService.initSchema();
+  if (isMasterBuild) {
+    platformCrawledDataService = new PlatformCrawledDataService(app.getPath('userData'));
+    console.log('[Main] PlatformCrawledDataService đã sẵn sàng (master build)');
+  } else {
+    console.log('[Main] Slave build — PlatformCrawledDataService bị vô hiệu hóa');
+  }
   browserProfileService = new BrowserProfileService({ dbService, appDataPath: app.getPath('userData') });
   recorderService = initRecorderService({
     appDataPath: app.getPath('userData'),
@@ -827,6 +967,7 @@ app.whenReady().then(() => {
     browserProfileService,
   });
   console.log('[Main] DatabaseService đã sẵn sàng');
+  console.log(`[Main] App role: ${isMasterBuild ? 'master' : 'slave'}`);
 
   // Đăng ký IPC handlers (Database + RPA)
   registerDatabaseHandlers();
@@ -848,6 +989,7 @@ app.whenReady().then(() => {
 // Đóng database khi tất cả cửa sổ đóng
 app.on('window-all-closed', () => {
   if (dbService) dbService.close();
+  platformCrawledDataService?.closeAll();
   if (process.platform !== 'darwin') {
     app.quit();
   }
@@ -857,4 +999,5 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
   embeddedBrowserService?.detach();
   if (dbService) dbService.close();
+  platformCrawledDataService?.closeAll();
 });

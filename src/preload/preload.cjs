@@ -97,6 +97,28 @@ contextBridge.exposeInMainWorld('electronAPI', {
     return () => ipcRenderer.removeListener('crawl:design-pick', handler);
   },
   openCrawlPreviewExternal: (url) => ipcRenderer.invoke('scenario:crawl-preview:open-external', url),
+  startRequestCatchingPreview: (payload) => ipcRenderer.invoke('scenario:request-catching:start', payload),
+  stopRequestCatchingPreview: () => ipcRenderer.invoke('scenario:request-catching:stop'),
+  setRequestCatchingAuto: (payload) => ipcRenderer.invoke('scenario:request-catching:set-auto', payload),
+  loadRequestCatchingDump: (scenarioId) => ipcRenderer.invoke('scenario:request-catching:load-dump', scenarioId),
+  saveRequestCatchingDump: (payload) => ipcRenderer.invoke('scenario:request-catching:save-dump', payload),
+  clearRequestCatchingDump: (scenarioId) => ipcRenderer.invoke('scenario:request-catching:clear-dump', scenarioId),
+  getRequestCatchingDumpPath: (scenarioId) => ipcRenderer.invoke('scenario:request-catching:get-dump-path', scenarioId),
+  onRequestCatchingCaptured: (callback) => {
+    const handler = (_event, data) => callback(data);
+    ipcRenderer.on('request-catching:captured', handler);
+    return () => ipcRenderer.removeListener('request-catching:captured', handler);
+  },
+  onRequestCatchingDiscovered: (callback) => {
+    const handler = (_event, data) => callback(data);
+    ipcRenderer.on('request-catching:discovered', handler);
+    return () => ipcRenderer.removeListener('request-catching:discovered', handler);
+  },
+  onRequestCatchingReset: (callback) => {
+    const handler = (_event, data) => callback(data);
+    ipcRenderer.on('request-catching:reset', handler);
+    return () => ipcRenderer.removeListener('request-catching:reset', handler);
+  },
   replayAndRecord: (payload) => ipcRenderer.invoke('scenario:replay-and-record', payload),
   renderScenarioVideo: (scenarioId) => ipcRenderer.invoke('scenario:render-video', scenarioId),
   readFrameDataUrl: (filePath) => ipcRenderer.invoke('scenario:read-frame-data-url', filePath),
@@ -129,6 +151,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   getSettings: () => ipcRenderer.invoke('settings:get'),
   saveSettings: (settings) => ipcRenderer.invoke('settings:save', settings),
+
+  getFacebookDataStats: () => ipcRenderer.invoke('facebook-data:get-stats'),
+  listFacebookGroups: (options) => ipcRenderer.invoke('facebook-data:list-groups', options),
+  listFacebookAuthors: (options) => ipcRenderer.invoke('facebook-data:list-authors', options),
+  listFacebookPosts: (options) => ipcRenderer.invoke('facebook-data:list-posts', options),
+  listFacebookComments: (options) => ipcRenderer.invoke('facebook-data:list-comments', options),
+  exportFacebookDataCsv: (payload) => ipcRenderer.invoke('facebook-data:export-csv', payload),
+
   selectDirectory: () => ipcRenderer.invoke('dialog:select-directory'),
   selectFile: (filters) => ipcRenderer.invoke('dialog:select-file', filters),
   getPathForFile: (file) => webUtils.getPathForFile(file),

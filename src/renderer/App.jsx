@@ -3,7 +3,9 @@ import { useSelector, useDispatch } from 'react-redux';
 import { updateExecutionStatus } from './slices/executionSlice';
 import { fetchLocalScenarios } from './slices/scenarioSlice';
 import { fetchSettings } from './slices/settingsSlice';
+import { setCurrentPage, setCurrentView } from './slices/uiSlice';
 import Sidebar from './components/Sidebar';
+import GlobalHeader from './components/GlobalHeader';
 import Toast from './components/Toast';
 import DashboardPage from './pages/DashboardPage';
 import ScenariosPage from './pages/ScenariosPage';
@@ -12,31 +14,24 @@ import HistoryPage from './pages/HistoryPage';
 import SettingsPage from './pages/SettingsPage';
 import BrowserProfilesPage from './pages/BrowserProfilesPage';
 import DataProfilesPage from './pages/DataProfilesPage';
+import FacebookDataPage from './pages/FacebookDataPage';
 import TasksPage from './pages/TasksPage';
 import ProxiesView from './views/ProxiesView';
+import {
+  isMasterBuild,
+  isSlaveBuild,
+  SLAVE_ALLOWED_PAGES,
+} from './utils/appRole';
 
-/**
- * useExecutionListener — Custom hook lắng nghe telemetry thực thi từ Main Process.
- *
- * Đăng ký listener qua window.electronAPI.onExecutionUpdate() (xem preload.cjs).
- * Mỗi khi ExecutorService gửi cập nhật (step started/completed/failed, ...),
- * dispatch action updateExecutionStatus để Redux store cập nhật realtime.
- *
- * Listener tự động dọn dẹp khi component unmount (tránh memory leak).
- */
 function useExecutionListener() {
   const dispatch = useDispatch();
 
   useEffect(() => {
-    // Kiểm tra window.electronAPI tồn tại trước khi đăng ký listener
-    // (preload.cjs chạy sau khi BrowserWindow được tạo, nên API luôn sẵn sàng
-    // khi React mount. Kiểm tra này chỉ để phòng tránh lỗi runtime.)
     if (!window.electronAPI?.onExecutionUpdate) {
       console.warn('[App] window.electronAPI chưa sẵn sàng — bỏ qua listener telemetry');
       return;
     }
 
-    // onExecutionUpdate trả về hàm cleanup để remove listener
     const cleanup = window.electronAPI.onExecutionUpdate((status) => {
       dispatch(updateExecutionStatus(status));
     });
@@ -45,9 +40,6 @@ function useExecutionListener() {
   }, [dispatch]);
 }
 
-/**
- * useAutoRefreshScenarios — Tự động tải danh sách kịch bản khi app khởi động.
- */
 function useAutoRefreshScenarios() {
   const dispatch = useDispatch();
 
@@ -68,45 +60,76 @@ function useBootstrapApp() {
   }, [dispatch]);
 }
 
-export default function App() {
-  const { currentPage } = useSelector((state) => state.ui);
+function useEnforceBuildRoleLayout() {
+  const dispatch = useDispatch();
+  const { currentPage, currentView } = useSelector((state) => state.ui);
 
-  // Kích hoạt các hooks
+  useEffect(() => {
+    if (!isSlaveBuild) return;
+
+    if (currentView !== 'scenarios') {
+      dispatch(setCurrentView('scenarios'));
+    }
+
+    if (!SLAVE_ALLOWED_PAGES.includes(currentPage)) {
+      dispatch(setCurrentPage('scenarios'));
+    }
+  }, [currentPage, currentView, dispatch]);
+}
+
+export default function App() {
+  const { currentPage, currentView } = useSelector((state) => state.ui);
+
   useBootstrapApp();
   useExecutionListener();
   useAutoRefreshScenarios();
+  useEnforceBuildRoleLayout();
+
+  const showFacebookDataStudio = isMasterBuild && currentView === 'facebookData';
+  const showSidebar = !showFacebookDataStudio;
 
   const renderPage = () => {
+    if (showFacebookDataStudio) {
+      return <FacebookDataPage />;
+    }
+
+    if (isSlaveBuild && !SLAVE_ALLOWED_PAGES.includes(currentPage)) {
+      return <ScenariosPage />;
+    }
+
     switch (currentPage) {
       case 'dashboard':
-        return <DashboardPage />;
+        return isMasterBuild ? <DashboardPage /> : <ScenariosPage />;
       case 'scenarios':
         return <ScenariosPage />;
       case 'tasks':
-        return <TasksPage />;
+        return isMasterBuild ? <TasksPage /> : <ScenariosPage />;
       case 'executions':
         return <ExecutionsPage />;
       case 'history':
-        return <HistoryPage />;
+        return isMasterBuild ? <HistoryPage /> : <ScenariosPage />;
       case 'proxies':
-        return <ProxiesView />;
+        return isMasterBuild ? <ProxiesView /> : <ScenariosPage />;
       case 'dataProfiles':
-        return <DataProfilesPage />;
+        return isMasterBuild ? <DataProfilesPage /> : <ScenariosPage />;
       case 'browserProfiles':
         return <BrowserProfilesPage />;
       case 'settings':
         return <SettingsPage />;
       default:
-        return <DashboardPage />;
+        return isSlaveBuild ? <ScenariosPage /> : <DashboardPage />;
     }
   };
 
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-[#111827] text-[#eef2f7]">
-      <Sidebar />
-      <main className="min-w-0 flex-1 overflow-x-hidden overflow-y-auto">
-        {renderPage()}
-      </main>
+    <div className="flex h-screen w-screen flex-col overflow-hidden bg-[#111827] text-[#eef2f7]">
+      <GlobalHeader />
+      <div className="flex min-h-0 flex-1 overflow-hidden">
+        {showSidebar && <Sidebar />}
+        <main className="min-w-0 flex-1 overflow-x-hidden overflow-y-auto">
+          {renderPage()}
+        </main>
+      </div>
       <Toast />
     </div>
   );

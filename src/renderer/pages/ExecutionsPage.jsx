@@ -80,7 +80,11 @@ function getCrawlRowCount(resultJson) {
   if (!resultJson) return null;
   if (Array.isArray(resultJson)) return resultJson.length;
   if (typeof resultJson !== 'object') return null;
-  if (resultJson.scenario_type && resultJson.scenario_type !== 'crawl') return null;
+  if (resultJson.scenario_type && resultJson.scenario_type !== 'crawl' && resultJson.scenario_type !== 'request_catching') return null;
+
+  if (Array.isArray(resultJson.crawledData)) {
+    return resultJson.crawledData.length;
+  }
 
   const values = Object.values(resultJson);
   const crawlArrays = values.filter((value) => (

@@ -4,6 +4,8 @@ const uiSlice = createSlice({
   name: 'ui',
   initialState: {
     sidebarOpen: true,
+    currentView: 'scenarios', // 'scenarios' | 'facebookData'
+    facebookDataPage: 'posts', // 'posts' | 'members' | 'groups'
     currentPage: 'dashboard',
     modalOpen: null, // null | 'createScenario' | 'confirmDelete' | 'executionDetail'
     modalData: null,
@@ -14,6 +16,12 @@ const uiSlice = createSlice({
   reducers: {
     toggleSidebar: (state) => {
       state.sidebarOpen = !state.sidebarOpen;
+    },
+    setCurrentView: (state, action) => {
+      state.currentView = action.payload;
+    },
+    setFacebookDataPage: (state, action) => {
+      state.facebookDataPage = action.payload;
     },
     setCurrentPage: (state, action) => {
       state.currentPage = action.payload;
@@ -43,6 +51,8 @@ const uiSlice = createSlice({
 
 export const {
   toggleSidebar,
+  setCurrentView,
+  setFacebookDataPage,
   setCurrentPage,
   openModal,
   closeModal,

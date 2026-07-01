@@ -4,6 +4,11 @@ import { useDispatch, useSelector } from 'react-redux';
 import { setCurrentPage } from '../slices/uiSlice';
 import { useTranslation } from '../i18n';
 import {
+  isMasterBuild,
+  isSlaveBuild,
+  SLAVE_ALLOWED_PAGES,
+} from '../utils/appRole';
+import {
   Bot,
   Database,
   Globe,
@@ -15,13 +20,13 @@ import {
   Workflow,
 } from 'lucide-react';
 
-const navItemDefs = [
-  { id: 'dashboard', icon: LayoutDashboard, labelKey: 'nav.dashboard' },
-  { id: 'proxies', icon: Shield, labelKey: 'nav.proxies' },
+const scenarioNavItemDefs = [
+  { id: 'dashboard', icon: LayoutDashboard, labelKey: 'nav.dashboard', masterOnly: true },
+  { id: 'proxies', icon: Shield, labelKey: 'nav.proxies', masterOnly: true },
   { id: 'browserProfiles', icon: Globe, labelKey: 'nav.browserProfiles' },
-  { id: 'dataProfiles', icon: Database, labelKey: 'nav.dataProfiles' },
+  { id: 'dataProfiles', icon: Database, labelKey: 'nav.dataProfiles', masterOnly: true },
   { id: 'scenarios', icon: ScrollText, labelKey: 'nav.scenarios' },
-  { id: 'tasks', icon: Workflow, labelKey: 'nav.tasks' },
+  { id: 'tasks', icon: Workflow, labelKey: 'nav.tasks', masterOnly: true },
   { id: 'executions', icon: PlayCircle, labelKey: 'nav.executions' },
   { id: 'settings', icon: Settings, labelKey: 'nav.settings' },
 ];
@@ -69,6 +74,10 @@ export default function Sidebar() {
   const { t } = useTranslation();
   const { currentPage } = useSelector((state) => state.ui);
   const [hoverTip, setHoverTip] = useState(null);
+
+  const navItemDefs = isSlaveBuild
+    ? scenarioNavItemDefs.filter((item) => SLAVE_ALLOWED_PAGES.includes(item.id))
+    : scenarioNavItemDefs.filter((item) => isMasterBuild || !item.masterOnly);
 
   const navItems = navItemDefs.map((item) => ({
     ...item,

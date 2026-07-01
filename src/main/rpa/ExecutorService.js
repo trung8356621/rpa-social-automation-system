@@ -5,6 +5,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer';
 import { getCrawlExtractionScript } from './CardExtractorScript.js';
+import { parseFacebookGraphQLBatch } from '../../shared/parseFacebookGraphQL.js';
+import { RequestCatchingDumpService } from './RequestCatchingDumpService.js';
 import { resolveVariableTemplate } from './VariableResolver.js';
 import { ensureRememberMeChecked, isCheckboxAlreadyChecked, resolveGuestSessionDir, resolveSessionStartUrl } from '../browser/BrowserSessionPaths.js';
 
@@ -64,7 +66,11 @@ class ExecutorService {
       if (!scenario) {
         throw new Error(`[Executor] Khong tim thay scenario: ${scenarioId}`);
       }
-      if (!scenario.steps || scenario.steps.length === 0) {
+      const scenarioType = normalizeScenarioType(scenario.scenario_type);
+      const isRequestCatching = scenarioType === 'request_catching';
+      const totalSteps = isRequestCatching ? 1 : (scenario.steps?.length || 0);
+
+      if (!isRequestCatching && totalSteps === 0) {
         throw new Error('[Executor] Kich ban chua co buoc nao. Hay Record truoc khi Play.');
       }
 
@@ -95,11 +101,11 @@ class ExecutorService {
         executionId,
         scenarioId,
         scenarioName: scenario.name,
-        totalSteps: scenario.steps.length,
+        totalSteps,
         timestamp: new Date().toISOString(),
       });
 
-      this.dbService.createExecutionLog({
+      await this.dbService.createExecutionLog({
         id: executionId,
         scenario_id: scenarioId,
         scenario_name: scenario.name,
@@ -109,17 +115,82 @@ class ExecutorService {
         variable_sample_id: this._currentSampleId,
         variable_sample_name: variableSampleName,
         status: 'running',
-        total_steps: scenario.steps.length,
+        total_steps: totalSteps,
         started_at: this._executionStartedAt,
       });
 
-      await this._launchBrowser(scenario, options);
+      if (!isRequestCatching) {
+        await this._launchBrowser(scenario, options);
+      }
 
-      if (normalizeScenarioType(scenario.scenario_type) !== 'prepare') {
+      if (!isRequestCatching && scenarioType !== 'prepare') {
         await this._ensureSessionReady(scenario, executionId);
       }
 
-      for (let index = 0; index < scenario.steps.length; index += 1) {
+      if (isRequestCatching) {
+        const stepStartedAt = new Date().toISOString();
+        const stepStartTime = Date.now();
+
+        this._sendTelemetry({
+          type: 'step:started',
+          executionId,
+          stepIndex: 1,
+          totalSteps,
+          stepId: null,
+          actionType: 'request_catching',
+          timestamp: new Date().toISOString(),
+        });
+
+        try {
+          const output = await this._executeRequestCatching(scenario);
+          stepResults.push({
+            index: 1,
+            step_id: null,
+            action_type: 'request_catching',
+            status: 'completed',
+            started_at: stepStartedAt,
+            finished_at: new Date().toISOString(),
+            duration_ms: Date.now() - stepStartTime,
+            output: output || null,
+          });
+        } catch (stepError) {
+          this._failedStepIndex = 1;
+          stepResults.push({
+            index: 1,
+            step_id: null,
+            action_type: 'request_catching',
+            status: 'failed',
+            started_at: stepStartedAt,
+            finished_at: new Date().toISOString(),
+            duration_ms: Date.now() - stepStartTime,
+            error: stepError.message,
+          });
+          this._sendTelemetry({
+            type: 'step:failed',
+            executionId,
+            stepIndex: 1,
+            totalSteps,
+            stepId: null,
+            actionType: 'request_catching',
+            error: stepError.message,
+            timestamp: new Date().toISOString(),
+          });
+          throw stepError;
+        }
+
+        this._sendTelemetry({
+          type: 'step:completed',
+          executionId,
+          stepIndex: 1,
+          totalSteps,
+          stepId: null,
+          actionType: 'request_catching',
+          completedSteps: 1,
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      for (let index = 0; index < (isRequestCatching ? 0 : scenario.steps.length); index += 1) {
         if (!this.isRunning) break;
 
         const step = scenario.steps[index];
@@ -195,8 +266,8 @@ class ExecutorService {
         executionId,
         scenario,
         status: 'completed',
-        totalSteps: scenario.steps.length,
-        completedSteps: scenario.steps.length,
+        totalSteps,
+        completedSteps: totalSteps,
         failedSteps: 0,
         durationMs,
         startedAt: this._executionStartedAt,
@@ -210,7 +281,7 @@ class ExecutorService {
 
       this.dbService.finishExecutionLog(executionId, {
         status: 'completed',
-        completed_steps: scenario.steps.length,
+        completed_steps: totalSteps,
         failed_steps: 0,
         duration_ms: durationMs,
         finished_at: finishedAt,
@@ -222,8 +293,8 @@ class ExecutorService {
         executionId,
         scenarioId,
         scenarioName: scenario.name,
-        totalSteps: scenario.steps.length,
-        completedSteps: scenario.steps.length,
+        totalSteps,
+        completedSteps: totalSteps,
         failedSteps: 0,
         durationMs,
         errors: [],
@@ -234,15 +305,18 @@ class ExecutorService {
       return {
         success: true,
         executionId,
-        completedSteps: scenario.steps.length,
-        totalSteps: scenario.steps.length,
+        completedSteps: totalSteps,
+        totalSteps,
         failedSteps: 0,
         durationMs,
         errors: [],
         resultJson,
       };
     } catch (error) {
-      const totalSteps = this.currentScenario?.steps?.length || 0;
+      const failedScenarioType = normalizeScenarioType(this.currentScenario?.scenario_type);
+      const totalSteps = failedScenarioType === 'request_catching'
+        ? 1
+        : (this.currentScenario?.steps?.length || 0);
       const completedSteps = Math.max(0, (this._failedStepIndex || 1) - 1);
       const finishedAt = new Date().toISOString();
       const resultJson = buildExecutionResult({
@@ -386,7 +460,7 @@ class ExecutorService {
     // Chromium's userDataDir persists all cookies natively — no JSON restore needed.
     // Prefer wp-admin when target is wp-login so an existing session is reused.
     let startUrl = this._resolveStartUrl(scenario);
-    if (startUrl) {
+    if (startUrl && normalizeScenarioType(scenario.scenario_type) !== 'request_catching') {
       startUrl = this.browserProfileService?.resolveSessionStartUrl(startUrl)
         || resolveSessionStartUrl(startUrl);
       await this.page.goto(startUrl, {
@@ -622,6 +696,44 @@ class ExecutorService {
       match_count: Number(result.match_count) || 0,
       cards,
       sample_dump: cards,
+    };
+
+    this._crawlResults.push(payload);
+    return payload;
+  }
+
+  async _executeRequestCatching(scenario) {
+    return this._executeRequestCatchingFromDump(scenario);
+  }
+
+  async _executeRequestCatchingFromDump(scenario) {
+    const platform = String(scenario?.platform || 'facebook').trim().toLowerCase() || 'facebook';
+    const session = await RequestCatchingDumpService.loadSession(scenario.id);
+    const dumpPath = session.dumpPath || RequestCatchingDumpService.resolveScenarioDir(scenario.id);
+    const rawCaptured = Array.isArray(session.crawledData) ? session.crawledData : [];
+
+    if (!rawCaptured.length) {
+      throw new Error(
+        `Khong co du lieu dump cho request_catching. Dat file JSON vao: ${dumpPath}`,
+      );
+    }
+
+    const cleaned = parseFacebookGraphQLBatch(rawCaptured, {
+      targetUrl: scenario?.target_url || '',
+    });
+    const payload = {
+      step_index: 1,
+      widget_label: 'request_catching',
+      platform,
+      source: 'debug_dumps',
+      dump_path: dumpPath,
+      raw_object_count: rawCaptured.length,
+      capture_count: cleaned.length,
+      crawledData: cleaned,
+      cards: cleaned.map((item, index) => ({
+        card_index: index,
+        data: item,
+      })),
     };
 
     this._crawlResults.push(payload);
@@ -1087,7 +1199,12 @@ class ExecutorService {
 
 function normalizeScenarioType(value) {
   const normalized = String(value || 'action').trim().toLowerCase();
-  if (normalized === 'prepare' || normalized === 'crawl' || normalized === 'action') {
+  if (
+    normalized === 'prepare'
+    || normalized === 'crawl'
+    || normalized === 'action'
+    || normalized === 'request_catching'
+  ) {
     return normalized;
   }
   return 'action';
@@ -1127,6 +1244,10 @@ function buildExecutionResult({
   pageUrl = null,
   crawlResults = [],
 }) {
+  if (isRequestCatchingScenario(scenario)) {
+    return buildRequestCatchingExecutionResult(scenario, crawlResults);
+  }
+
   if (isCrawlScenario(scenario)) {
     return buildCrawlExecutionResult(crawlResults, normalizeScenarioResultType(scenario?.result_type));
   }
@@ -1159,6 +1280,31 @@ function buildExecutionResult({
 
 function isCrawlScenario(scenario) {
   return normalizeScenarioType(scenario?.scenario_type) === 'crawl';
+}
+
+function isRequestCatchingScenario(scenario) {
+  return normalizeScenarioType(scenario?.scenario_type) === 'request_catching';
+}
+
+function buildRequestCatchingExecutionResult(scenario, crawlResults = []) {
+  const rawCrawledData = [];
+  (Array.isArray(crawlResults) ? crawlResults : []).forEach((result) => {
+    if (Array.isArray(result?.crawledData)) {
+      rawCrawledData.push(...result.crawledData);
+    }
+  });
+
+  const crawledData = parseFacebookGraphQLBatch(rawCrawledData, {
+    targetUrl: scenario?.target_url || '',
+  });
+
+  return {
+    scenario_type: 'request_catching',
+    platform: scenario?.platform || 'facebook',
+    capture_count: crawledData.length,
+    raw_object_count: rawCrawledData.length,
+    crawledData,
+  };
 }
 
 function buildCrawlExecutionResult(crawlResults = [], resultType = 'simple') {
