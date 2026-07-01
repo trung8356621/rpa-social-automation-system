@@ -9,6 +9,9 @@ export function slimAnchorForPage(anchor = null) {
     selector_value: String(anchor.selector_value || ''),
     field_selector: String(anchor.field_selector || ''),
     card_class: String(anchor.card_class || ''),
+    action_config: {
+      selector_mode: anchor.action_config?.selector_mode === 'single' ? 'single' : 'multiple',
+    },
   };
 }
 
@@ -40,8 +43,10 @@ export function getDesignModeInjectionScript() {
       let tooltip = null;
       let selectionOverlay = null;
       let selectionTooltip = null;
+      let selectionOverlays = [];
       let parentAnchor = null;
       let pinnedElement = null;
+      let pinnedElements = [];
       let pinnedListenersBound = false;
 
       function ensureOverlay() {
@@ -75,6 +80,28 @@ export function getDesignModeInjectionScript() {
       function hideSelectionOverlay() {
         if (selectionOverlay) selectionOverlay.style.display = 'none';
         if (selectionTooltip) selectionTooltip.style.display = 'none';
+        selectionOverlays.forEach(function(item) {
+          if (item.overlay) item.overlay.style.display = 'none';
+          if (item.tooltip) item.tooltip.style.display = 'none';
+        });
+      }
+
+      function getSelectionOverlayPair(index) {
+        ensureOverlay();
+        if (selectionOverlays[index]) return selectionOverlays[index];
+
+        const multiOverlay = document.createElement('div');
+        multiOverlay.id = '__rpa-design-selection-overlay-' + index;
+        multiOverlay.style.cssText = 'position:fixed;pointer-events:none;z-index:2147483644;border:2px solid #22c55e;background:rgba(34,197,94,0.10);box-sizing:border-box;display:none;';
+        document.documentElement.appendChild(multiOverlay);
+
+        const multiTooltip = document.createElement('div');
+        multiTooltip.id = '__rpa-design-selection-tooltip-' + index;
+        multiTooltip.style.cssText = 'position:fixed;pointer-events:none;z-index:2147483646;background:#14261a;color:#d7f5df;font:11px/1.3 sans-serif;padding:3px 6px;border-radius:4px;border:1px solid #22c55e;display:none;max-width:260px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
+        document.documentElement.appendChild(multiTooltip);
+
+        selectionOverlays[index] = { overlay: multiOverlay, tooltip: multiTooltip };
+        return selectionOverlays[index];
       }
 
       function positionOverlayForElement(element, overlayEl, tooltipEl, label, borderColor) {
@@ -104,6 +131,22 @@ export function getDesignModeInjectionScript() {
       }
 
       function updatePinnedSelectionOverlay() {
+        if (pinnedElements.length) {
+          if (selectionOverlay) selectionOverlay.style.display = 'none';
+          if (selectionTooltip) selectionTooltip.style.display = 'none';
+          pinnedElements.slice(0, 30).forEach(function(element, index) {
+            const pair = getSelectionOverlayPair(index);
+            const label = ((element.tagName || 'element').toLowerCase())
+              + ' · ' + (index + 1) + '/' + pinnedSelectionMatchCount;
+            positionOverlayForElement(element, pair.overlay, pair.tooltip, label);
+          });
+          selectionOverlays.slice(pinnedElements.length).forEach(function(pair) {
+            if (pair.overlay) pair.overlay.style.display = 'none';
+            if (pair.tooltip) pair.tooltip.style.display = 'none';
+          });
+          return;
+        }
+
         if (!pinnedElement) {
           hideSelectionOverlay();
           return;
@@ -124,8 +167,24 @@ export function getDesignModeInjectionScript() {
 
       function unpinSelectionHighlight() {
         pinnedElement = null;
+        pinnedElements = [];
         pinnedSelectionMatchCount = 1;
         hideSelectionOverlay();
+      }
+
+      function resolveHighlightElements(anchor) {
+        const selector = anchor && (anchor.parent_container_selector || anchor.selector_value || anchor.field_selector);
+        if (!selector) return [];
+        try {
+          return Array.from(document.querySelectorAll(selector))
+            .filter(function(element) {
+              if (!element || !element.getBoundingClientRect) return false;
+              const rect = element.getBoundingClientRect();
+              return rect.width > 0 && rect.height > 0;
+            });
+        } catch (_) {
+          return [];
+        }
       }
 
       function showOverlayForElement(element, pickKind) {
@@ -153,13 +212,28 @@ export function getDesignModeInjectionScript() {
           unpinSelectionHighlight();
           return { found: false, matchCount: 0 };
         }
+        const selectorMode = anchor.action_config && anchor.action_config.selector_mode === 'single' ? 'single' : 'multiple';
         pinnedSelectionMatchCount = countAnchorMatches(anchor);
+        if (selectorMode === 'multiple') {
+          const elements = resolveHighlightElements(anchor);
+          if (elements.length) {
+            pinnedElement = null;
+            pinnedElements = elements.slice(0, 30);
+            try {
+              pinnedElements[0].scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+            } catch (_) {}
+            updatePinnedSelectionOverlay();
+            return { found: true, matchCount: pinnedSelectionMatchCount, highlightedCount: pinnedElements.length };
+          }
+        }
+
         const element = resolveBestElementFromAnchor(anchor, pinnedElement);
         if (!element) {
           unpinSelectionHighlight();
           return { found: false, matchCount: pinnedSelectionMatchCount };
         }
         pinnedElement = element;
+        pinnedElements = [];
         try {
           element.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
         } catch (_) {}
@@ -205,7 +279,10 @@ export function getDesignModeInjectionScript() {
 
           let sampleDump = [];
           try {
-            sampleDump = buildSampleDumpForElement(parentEl);
+            sampleDump = [{
+              card_index: 0,
+              html: parentEl.outerHTML || '',
+            }];
           } catch (_) {
             sampleDump = [];
           }

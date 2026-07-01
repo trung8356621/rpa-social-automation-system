@@ -164,6 +164,7 @@ const executionSlice = createSlice({
             started_at: running?.started_at || new Date(Date.now() - (status.durationMs || 0)).toISOString(),
             finished_at: new Date().toISOString(),
             duration_ms: status.durationMs,
+            result_json: status.resultJson || null,
           });
           break;
         }
@@ -185,6 +186,7 @@ const executionSlice = createSlice({
             started_at: running?.started_at || status.startedAt || new Date().toISOString(),
             finished_at: new Date().toISOString(),
             error_message: status.error,
+            result_json: status.resultJson || null,
           });
           break;
         }

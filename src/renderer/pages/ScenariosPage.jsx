@@ -5,11 +5,12 @@ import {
   fetchScenarioDetails,
   fetchScenarios,
   setCurrentScenario,
+  setScenarioPinned,
 } from '../slices/scenarioSlice';
 import { setCurrentPage, showToast } from '../slices/uiSlice';
 import ScenarioEditor from '../components/ScenarioEditor';
 import { useTranslation } from '../i18n';
-import { Clock, Edit3, FileText, Globe, Play, Plus, Search, Trash2, Upload, X } from 'lucide-react';
+import { ChevronDown, Clock, Edit3, FileText, Folder, Globe, Play, Plus, Search, Star, Trash2, Upload, X } from 'lucide-react';
 
 const createDraftScenario = (t) => ({
   id: null,
@@ -26,6 +27,18 @@ const createDraftScenario = (t) => ({
   steps: [],
 });
 
+const getScenarioGroupName = (scenario) => {
+  const name = String(scenario.name || '').trim();
+  const [group] = name.split(/[\s_-]+/).filter(Boolean);
+  return group || 'Ungrouped';
+};
+
+const sortScenarios = (left, right) => {
+  const pinnedDiff = Number(right.is_pinned || 0) - Number(left.is_pinned || 0);
+  if (pinnedDiff) return pinnedDiff;
+  return new Date(right.updated_at || 0) - new Date(left.updated_at || 0);
+};
+
 export default function ScenariosPage() {
   const dispatch = useDispatch();
   const { t, language } = useTranslation();
@@ -34,6 +47,7 @@ export default function ScenariosPage() {
   const [searchQuery, setSearchQuery] = useState('');
   const [deleteConfirm, setDeleteConfirm] = useState(null);
   const [importing, setImporting] = useState(false);
+  const [collapsedGroups, setCollapsedGroups] = useState({});
 
   useEffect(() => {
     dispatch(fetchScenarios());
@@ -49,6 +63,28 @@ export default function ScenariosPage() {
         .some((value) => String(value).toLowerCase().includes(query))
     ));
   }, [scenarios, searchQuery]);
+
+  const scenarioGroups = useMemo(() => {
+    const groups = new Map();
+    [...filteredScenarios].sort(sortScenarios).forEach((scenario) => {
+      const groupName = getScenarioGroupName(scenario);
+      if (!groups.has(groupName)) {
+        groups.set(groupName, []);
+      }
+      groups.get(groupName).push(scenario);
+    });
+    return Array.from(groups.entries())
+      .map(([name, items]) => ({
+        name,
+        items,
+        pinnedCount: items.filter((item) => item.is_pinned).length,
+      }))
+      .sort((left, right) => {
+        const pinnedDiff = right.pinnedCount - left.pinnedCount;
+        if (pinnedDiff) return pinnedDiff;
+        return left.name.localeCompare(right.name, undefined, { sensitivity: 'base' });
+      });
+  }, [filteredScenarios]);
 
   const openEditor = useCallback((scenario) => {
     if (scenario.id) {
@@ -88,6 +124,29 @@ export default function ScenariosPage() {
     }
     setDeleteConfirm(null);
   }, [deleteConfirm, dispatch, t]);
+
+  const toggleGroup = useCallback((groupName) => {
+    setCollapsedGroups((current) => ({
+      ...current,
+      [groupName]: !current[groupName],
+    }));
+  }, []);
+
+  const togglePinned = useCallback(async (scenario) => {
+    const isPinned = !scenario.is_pinned;
+    const result = await dispatch(setScenarioPinned({ id: scenario.id, isPinned }));
+    if (result.meta.requestStatus === 'rejected') {
+      dispatch(showToast({ type: 'error', message: result.payload || 'Failed to update pin' }));
+    }
+  }, [dispatch]);
+
+  const requestDelete = useCallback((scenario) => {
+    if (scenario.is_pinned) {
+      dispatch(showToast({ type: 'info', message: 'Unpin this scenario before deleting it.' }));
+      return;
+    }
+    setDeleteConfirm(scenario.id);
+  }, [dispatch]);
 
   if (currentScenario) {
     return <ScenarioEditor scenario={currentScenario} onBack={() => dispatch(setCurrentScenario(null))} />;
@@ -148,7 +207,7 @@ export default function ScenariosPage() {
         </div>
       ) : (
         <div className="panel w-full overflow-hidden">
-          <div className="grid grid-cols-[minmax(240px,1.2fr)_minmax(220px,1fr)_100px_100px_90px_170px_120px] border-b border-[#2e3b4e] px-4 py-3 text-xs font-semibold uppercase tracking-wide text-[#7e8da5]">
+          <div className="grid grid-cols-[minmax(240px,1.2fr)_minmax(220px,1fr)_100px_100px_90px_170px_170px] border-b border-[#2e3b4e] px-4 py-3 text-xs font-semibold uppercase tracking-wide text-[#7e8da5]">
             <span>{t('scenarios.title')}</span>
             <span>{t('scenarios.table.url')}</span>
             <span>{t('scenarios.table.type')}</span>
@@ -158,73 +217,101 @@ export default function ScenariosPage() {
             <span className="text-right"></span>
           </div>
 
-          <div className="divide-y divide-[#243044]">
-            {filteredScenarios.map((scenario) => (
-              <article
-                key={scenario.id}
-                className="grid grid-cols-[minmax(240px,1.2fr)_minmax(220px,1fr)_100px_100px_90px_170px_120px] items-center gap-3 px-4 py-3 transition hover:bg-[#202b3a]"
-              >
-                <button type="button" onClick={() => openEditor(scenario)} className="min-w-0 text-left">
-                  <div className="flex min-w-0 items-center gap-3">
-                    <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded bg-[#223044] text-[#7db4ff]">
-                      <FileText className="h-4 w-4" />
-                    </div>
-                    <div className="min-w-0">
-                      <h2 className="truncate text-sm font-semibold text-white">{scenario.name}</h2>
-                      <p className="mt-0.5 truncate text-xs text-[#7e8da5]">{scenario.id}</p>
-                    </div>
-                  </div>
-                </button>
-
-                <div className="min-w-0">
-                  <p className="truncate text-sm text-[#c7d0dc]">{scenario.target_url || scenario.description || t('common.noUrl')}</p>
-                  {scenario.description && scenario.target_url && (
-                    <p className="mt-0.5 truncate text-xs text-[#7e8da5]">{scenario.description}</p>
-                  )}
-                </div>
-
-                <span className="badge w-fit capitalize">
-                  {t(`scenarios.types.${scenario.scenario_type || 'action'}`)}
-                </span>
-
-                <span className="badge w-fit">
-                  <Globe className="h-3.5 w-3.5" />
-                  {scenario.platform || 'custom'}
-                </span>
-
-                <span className="text-sm font-semibold text-[#dce5f2]">{Number(scenario.steps_count || 0)}</span>
-
-                <span className="inline-flex items-center gap-1 text-xs text-[#9aa7b7]">
-                  <Clock className="h-3.5 w-3.5" />
-                  {scenario.updated_at ? new Date(scenario.updated_at).toLocaleString(dateLocale) : t('common.notUpdated')}
-                </span>
-
-                <div className="flex justify-end gap-2">
-                  <button type="button" onClick={() => openEditor(scenario)} className="icon-button" title={t('common.edit')}>
-                    <Edit3 className="h-4 w-4" />
-                  </button>
+          <div>
+            {scenarioGroups.map((group) => {
+              const isCollapsed = collapsedGroups[group.name];
+              return (
+                <section key={group.name} className="border-b border-[#243044] last:border-b-0">
                   <button
                     type="button"
-                    onClick={() => {
-                      dispatch(setCurrentScenario(scenario));
-                      dispatch(setCurrentPage('executions'));
-                    }}
-                    className="icon-button text-[#8ddfc7]"
-                    title={t('common.run')}
+                    onClick={() => toggleGroup(group.name)}
+                    className="grid w-full grid-cols-[minmax(240px,1.2fr)_minmax(220px,1fr)_100px_100px_90px_170px_170px] items-center gap-3 bg-[#151f2c] px-4 py-2 text-left text-sm text-[#c7d0dc] transition hover:bg-[#1b2736]"
                   >
-                    <Play className="h-4 w-4" />
+                    <span className="flex min-w-0 items-center gap-2 font-semibold text-white">
+                      <ChevronDown className={`h-4 w-4 shrink-0 transition ${isCollapsed ? '-rotate-90' : ''}`} />
+                      <Folder className="h-4 w-4 shrink-0 text-[#7db4ff]" />
+                      <span className="truncate">{group.name}</span>
+                      <span className="text-xs font-medium text-[#7e8da5]">({group.items.length})</span>
+                      {group.pinnedCount > 0 && <Star className="h-3.5 w-3.5 shrink-0 fill-[#f7c948] text-[#f7c948]" />}
+                    </span>
                   </button>
-                  <button
-                    type="button"
-                    onClick={() => setDeleteConfirm(scenario.id)}
-                    className="icon-button text-[#ffb4b4]"
-                    title={t('common.delete')}
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </button>
-                </div>
-              </article>
-            ))}
+                  {!isCollapsed && group.items.map((scenario) => (
+                    <article
+                      key={scenario.id}
+                      className="grid grid-cols-[minmax(240px,1.2fr)_minmax(220px,1fr)_100px_100px_90px_170px_170px] items-center gap-3 px-4 py-3 transition hover:bg-[#202b3a]"
+                    >
+                      <button type="button" onClick={() => openEditor(scenario)} className="min-w-0 text-left">
+                        <div className="flex min-w-0 items-center gap-3 pl-6">
+                          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded bg-[#223044] text-[#7db4ff]">
+                            <FileText className="h-4 w-4" />
+                          </div>
+                          <div className="min-w-0">
+                            <h2 className="truncate text-sm font-semibold text-white">{scenario.name}</h2>
+                            <p className="mt-0.5 truncate text-xs text-[#7e8da5]">{scenario.id}</p>
+                          </div>
+                        </div>
+                      </button>
+
+                      <div className="min-w-0">
+                        <p className="truncate text-sm text-[#c7d0dc]">{scenario.target_url || scenario.description || t('common.noUrl')}</p>
+                        {scenario.description && scenario.target_url && (
+                          <p className="mt-0.5 truncate text-xs text-[#7e8da5]">{scenario.description}</p>
+                        )}
+                      </div>
+
+                      <span className="badge w-fit capitalize">
+                        {t(`scenarios.types.${scenario.scenario_type || 'action'}`)}
+                      </span>
+
+                      <span className="badge w-fit">
+                        <Globe className="h-3.5 w-3.5" />
+                        {scenario.platform || 'custom'}
+                      </span>
+
+                      <span className="text-sm font-semibold text-[#dce5f2]">{Number(scenario.steps_count || 0)}</span>
+
+                      <span className="inline-flex items-center gap-1 text-xs text-[#9aa7b7]">
+                        <Clock className="h-3.5 w-3.5" />
+                        {scenario.updated_at ? new Date(scenario.updated_at).toLocaleString(dateLocale) : t('common.notUpdated')}
+                      </span>
+
+                      <div className="flex justify-end gap-2">
+                        <button
+                          type="button"
+                          onClick={() => togglePinned(scenario)}
+                          className={`icon-button ${scenario.is_pinned ? 'text-[#f7c948]' : ''}`}
+                          title={scenario.is_pinned ? 'Unpin scenario' : 'Pin scenario'}
+                        >
+                          <Star className={`h-4 w-4 ${scenario.is_pinned ? 'fill-current' : ''}`} />
+                        </button>
+                        <button type="button" onClick={() => openEditor(scenario)} className="icon-button" title={t('common.edit')}>
+                          <Edit3 className="h-4 w-4" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            dispatch(setCurrentScenario(scenario));
+                            dispatch(setCurrentPage('executions'));
+                          }}
+                          className="icon-button text-[#8ddfc7]"
+                          title={t('common.run')}
+                        >
+                          <Play className="h-4 w-4" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => requestDelete(scenario)}
+                          className={`icon-button text-[#ffb4b4] ${scenario.is_pinned ? 'opacity-45' : ''}`}
+                          title={scenario.is_pinned ? 'Unpin before delete' : t('common.delete')}
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </button>
+                      </div>
+                    </article>
+                  ))}
+                </section>
+              );
+            })}
           </div>
         </div>
       )}

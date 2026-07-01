@@ -1,8 +1,58 @@
 const DEFAULT_ACTION_DELAY_MS = 300;
 
+function createLocalId() {
+  return typeof crypto !== 'undefined' && crypto.randomUUID
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+}
+
+export function createDefaultResultPatterns() {
+  return [
+    {
+      id: createLocalId(),
+      label: 'link',
+      selector: 'a',
+      attributes: [
+        { name: 'href', result_key: 'link' },
+        { name: 'text', result_key: '' },
+      ],
+    },
+  ];
+}
+
+function normalizeResultAttribute(attribute = {}) {
+  if (typeof attribute === 'string') {
+    return {
+      name: attribute.trim(),
+      result_key: '',
+    };
+  }
+
+  return {
+    name: String(attribute.name || attribute.attribute || attribute.key || '').trim(),
+    result_key: String(attribute.result_key || '').trim(),
+  };
+}
+
+function normalizeResultPattern(pattern = {}, index = 0) {
+  const legacyAttribute = pattern.attribute_name || pattern.attribute || '';
+  const attributes = Array.isArray(pattern.attributes)
+    ? pattern.attributes
+    : [legacyAttribute || pattern.extract_mode || 'text'];
+
+  return {
+    id: pattern.id || createLocalId(),
+    label: pattern.label || (index === 0 ? 'link' : `pattern_${index + 1}`),
+    selector: pattern.selector || '',
+    attributes: attributes
+      .map(normalizeResultAttribute)
+      .filter((attribute) => attribute.name),
+  };
+}
+
 export function createChildNode(overrides = {}) {
   return {
-    id: crypto.randomUUID(),
+    id: createLocalId(),
     label: '',
     target_anchor: {},
     extract_mode: 'text',
@@ -20,6 +70,9 @@ export function defaultCrawlActionConfig(overrides = {}) {
     label: '',
     children: [],
     parent_container_selector: '',
+    selector_mode: 'multiple',
+    result_mode: 'full_html',
+    result_patterns: createDefaultResultPatterns(),
     sample_dump: [],
     match_count: 0,
     ...overrides,
@@ -64,7 +117,7 @@ export function createCrawlWidgetFromPick(pickPayload = {}) {
   });
 
   return {
-    id: crypto.randomUUID(),
+    id: createLocalId(),
     action_type: 'crawl',
     delay_ms: DEFAULT_ACTION_DELAY_MS,
     target_anchor: {
@@ -82,6 +135,11 @@ export function getCrawlActionConfig(step) {
     ...defaultCrawlActionConfig(),
     ...config,
     children: Array.isArray(config.children) ? config.children : [],
+    selector_mode: config.selector_mode === 'single' ? 'single' : 'multiple',
+    result_mode: config.result_mode === 'patterns' ? 'patterns' : 'full_html',
+    result_patterns: Array.isArray(config.result_patterns) && config.result_patterns.length
+      ? config.result_patterns.map(normalizeResultPattern)
+      : createDefaultResultPatterns(),
   };
 }
 

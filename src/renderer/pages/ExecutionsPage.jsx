@@ -25,6 +25,38 @@ const LS_VIEWPORT_HEIGHT = 'executions:viewportHeight';
 const DEFAULT_VIEWPORT = { width: 1280, height: 720 };
 const MIN_VIEWPORT = { width: 320, height: 240 };
 const MAX_VIEWPORT = { width: 4096, height: 4096 };
+const VIEWPORT_PRESETS = [
+  {
+    label: 'Mobile',
+    options: [
+      { label: 'Mobile S - 360 x 640', width: 360, height: 640 },
+      { label: 'Mobile M - 390 x 844', width: 390, height: 844 },
+      { label: 'Mobile L - 414 x 896', width: 414, height: 896 },
+      { label: 'Android phổ biến - 360 x 800', width: 360, height: 800 },
+    ],
+  },
+  {
+    label: 'Tablet',
+    options: [
+      { label: 'iPad Mini - 768 x 1024', width: 768, height: 1024 },
+      { label: 'iPad Pro - 1024 x 1366', width: 1024, height: 1366 },
+    ],
+  },
+  {
+    label: 'PC',
+    options: [
+      { label: 'HD - 1280 x 720', width: 1280, height: 720 },
+      { label: 'Laptop - 1366 x 768', width: 1366, height: 768 },
+      { label: 'Desktop - 1440 x 900', width: 1440, height: 900 },
+      { label: 'Desktop - 1536 x 864', width: 1536, height: 864 },
+      { label: 'Full HD - 1920 x 1080', width: 1920, height: 1080 },
+    ],
+  },
+];
+
+function viewportKey(viewport) {
+  return `${viewport.width}x${viewport.height}`;
+}
 
 function clampViewport(value, min, max, fallback) {
   const parsed = Math.round(Number(value));
@@ -42,6 +74,26 @@ function ProgressBar({ completed, total }) {
       />
     </div>
   );
+}
+
+function getCrawlRowCount(resultJson) {
+  if (!resultJson) return null;
+  if (Array.isArray(resultJson)) return resultJson.length;
+  if (typeof resultJson !== 'object') return null;
+  if (resultJson.scenario_type && resultJson.scenario_type !== 'crawl') return null;
+
+  const values = Object.values(resultJson);
+  const crawlArrays = values.filter((value) => (
+    Array.isArray(value)
+    && value.every((item) => item && typeof item === 'object' && ('card_index' in item || 'data' in item))
+  ));
+  if (crawlArrays.length) {
+    return Math.max(...crawlArrays.map((items) => items.length));
+  }
+  if (values.length && values.every((value) => value && typeof value === 'object' && !Array.isArray(value))) {
+    return values.length;
+  }
+  return null;
 }
 
 export default function ExecutionsPage() {
@@ -159,48 +211,18 @@ export default function ExecutionsPage() {
     try { localStorage.setItem(LS_HEADLESS, String(val)); } catch { /* ignore */ }
   };
 
-  const handleViewportWidthChange = (event) => {
-    const raw = event.target.value;
-    if (raw === '') {
-      setViewportWidth('');
-      return;
-    }
-    const parsed = Math.round(Number(raw));
-    if (!Number.isFinite(parsed)) return;
-    setViewportWidth(parsed);
-  };
-
-  const handleViewportHeightChange = (event) => {
-    const raw = event.target.value;
-    if (raw === '') {
-      setViewportHeight('');
-      return;
-    }
-    const parsed = Math.round(Number(raw));
-    if (!Number.isFinite(parsed)) return;
-    setViewportHeight(parsed);
-  };
-
-  const commitViewportWidth = () => {
-    const next = clampViewport(
-      viewportWidth,
-      MIN_VIEWPORT.width,
-      MAX_VIEWPORT.width,
-      DEFAULT_VIEWPORT.width,
-    );
-    setViewportWidth(next);
-    try { localStorage.setItem(LS_VIEWPORT_WIDTH, String(next)); } catch { /* ignore */ }
-  };
-
-  const commitViewportHeight = () => {
-    const next = clampViewport(
-      viewportHeight,
-      MIN_VIEWPORT.height,
-      MAX_VIEWPORT.height,
-      DEFAULT_VIEWPORT.height,
-    );
-    setViewportHeight(next);
-    try { localStorage.setItem(LS_VIEWPORT_HEIGHT, String(next)); } catch { /* ignore */ }
+  const handleViewportPresetChange = (event) => {
+    const [rawWidth, rawHeight] = event.target.value.split('x');
+    const next = {
+      width: clampViewport(rawWidth, MIN_VIEWPORT.width, MAX_VIEWPORT.width, DEFAULT_VIEWPORT.width),
+      height: clampViewport(rawHeight, MIN_VIEWPORT.height, MAX_VIEWPORT.height, DEFAULT_VIEWPORT.height),
+    };
+    setViewportWidth(next.width);
+    setViewportHeight(next.height);
+    try {
+      localStorage.setItem(LS_VIEWPORT_WIDTH, String(next.width));
+      localStorage.setItem(LS_VIEWPORT_HEIGHT, String(next.height));
+    } catch { /* ignore */ }
   };
 
   const selectedScenario = scenarios.find((item) => item.id === selectedScenarioId) || null;
@@ -225,6 +247,29 @@ export default function ExecutionsPage() {
     && recordedViewport
     && (viewportWidth !== recordedViewport.width || viewportHeight !== recordedViewport.height),
   );
+  const currentViewport = {
+    width: clampViewport(viewportWidth, MIN_VIEWPORT.width, MAX_VIEWPORT.width, DEFAULT_VIEWPORT.width),
+    height: clampViewport(viewportHeight, MIN_VIEWPORT.height, MAX_VIEWPORT.height, DEFAULT_VIEWPORT.height),
+  };
+  const presetKeys = new Set(
+    VIEWPORT_PRESETS.flatMap((group) => group.options.map((option) => viewportKey(option))),
+  );
+  const extraViewportOptions = [];
+  if (recordedViewport && !presetKeys.has(viewportKey(recordedViewport))) {
+    extraViewportOptions.push({
+      label: `${t('executions.recordedViewportOption')} - ${recordedViewport.width} x ${recordedViewport.height}`,
+      width: recordedViewport.width,
+      height: recordedViewport.height,
+    });
+  }
+  if (!presetKeys.has(viewportKey(currentViewport))
+    && (!recordedViewport || viewportKey(currentViewport) !== viewportKey(recordedViewport))) {
+    extraViewportOptions.push({
+      label: `${t('executions.currentViewportOption')} - ${currentViewport.width} x ${currentViewport.height}`,
+      width: currentViewport.width,
+      height: currentViewport.height,
+    });
+  }
 
   const handleRunScenario = async () => {
     if (!selectedScenarioId) return;
@@ -329,6 +374,14 @@ export default function ExecutionsPage() {
   const statsTotal = executions.length;
   const statsSuccess = executions.filter((e) => e.status === 'completed').length;
   const statsFailed = executions.filter((e) => e.status === 'failed').length;
+  const formatResultJson = (value) => {
+    if (!value) return '';
+    try {
+      return JSON.stringify(typeof value === 'string' ? JSON.parse(value) : value, null, 2);
+    } catch {
+      return String(value);
+    }
+  };
 
   return (
     <div className="p-6 space-y-6">
@@ -416,28 +469,31 @@ export default function ExecutionsPage() {
           {selectedScenarioId && (
             <div className="flex flex-wrap items-end gap-2 rounded-lg border border-slate-700 bg-slate-800/60 px-3 py-2">
               <label className="block">
-                <span className="mb-1 block text-[11px] text-slate-400">{t('executions.viewportWidth')}</span>
-                <input
-                  type="number"
-                  min={MIN_VIEWPORT.width}
-                  max={MAX_VIEWPORT.width}
-                  value={viewportWidth}
-                  onChange={handleViewportWidthChange}
-                  onBlur={commitViewportWidth}
-                  className="input-field h-9 w-24 text-sm"
-                />
-              </label>
-              <label className="block">
-                <span className="mb-1 block text-[11px] text-slate-400">{t('executions.viewportHeight')}</span>
-                <input
-                  type="number"
-                  min={MIN_VIEWPORT.height}
-                  max={MAX_VIEWPORT.height}
-                  value={viewportHeight}
-                  onChange={handleViewportHeightChange}
-                  onBlur={commitViewportHeight}
-                  className="input-field h-9 w-24 text-sm"
-                />
+                <span className="mb-1 block text-[11px] text-slate-400">{t('executions.viewport')}</span>
+                <select
+                  value={viewportKey(currentViewport)}
+                  onChange={handleViewportPresetChange}
+                  className="select-field h-9 min-w-[250px] text-sm"
+                >
+                  {extraViewportOptions.length > 0 && (
+                    <optgroup label={t('executions.viewportSavedGroup')}>
+                      {extraViewportOptions.map((option) => (
+                        <option key={viewportKey(option)} value={viewportKey(option)}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </optgroup>
+                  )}
+                  {VIEWPORT_PRESETS.map((group) => (
+                    <optgroup key={group.label} label={group.label}>
+                      {group.options.map((option) => (
+                        <option key={viewportKey(option)} value={viewportKey(option)}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </optgroup>
+                  ))}
+                </select>
               </label>
               {recordedViewport && (
                 <p className="pb-1 text-[11px] text-slate-500">
@@ -558,6 +614,8 @@ export default function ExecutionsPage() {
             executions.map((exec) => {
               const isSuccess = exec.status === 'completed' || exec.status === 'completed_with_errors';
               const isFailed = exec.status === 'failed';
+              const crawlRows = getCrawlRowCount(exec.result_json);
+              const isCrawlExecution = crawlRows !== null;
               return (
                 <div
                   key={exec.id}
@@ -574,6 +632,11 @@ export default function ExecutionsPage() {
                       <div>
                         <p className="text-sm font-medium text-slate-200">
                           {exec.scenario_name || t('common.na')}
+                          {isCrawlExecution && (
+                            <span className="ml-2 rounded bg-cyan-900/30 px-1.5 py-0.5 text-xs font-normal text-cyan-300">
+                              crawl
+                            </span>
+                          )}
                           {exec.variable_sample_name && (
                             <span className="ml-2 text-xs font-normal text-emerald-400 bg-emerald-900/30 px-1.5 py-0.5 rounded">
                               {exec.variable_sample_name}
@@ -594,10 +657,12 @@ export default function ExecutionsPage() {
                     <div className="flex items-center gap-4">
                       <div className="text-right">
                         <p className="text-xs text-slate-400">
-                          {t('common.stepsProgress', {
-                            completed: exec.completed_steps,
-                            total: exec.total_steps,
-                          })}
+                          {isCrawlExecution
+                            ? `${crawlRows} rows`
+                            : t('common.stepsProgress', {
+                              completed: exec.completed_steps,
+                              total: exec.total_steps,
+                            })}
                         </p>
                         {exec.error_message && (
                           <p className="text-xs text-red-400 max-w-[200px] truncate" title={exec.error_message}>
@@ -647,6 +712,17 @@ export default function ExecutionsPage() {
             </div>
 
             <div className="p-6 space-y-3">
+              {currentExecution.result_json && (
+                <div className="rounded-lg border border-slate-700 bg-slate-950/70">
+                  <div className="border-b border-slate-700 px-3 py-2 text-xs font-semibold uppercase tracking-wide text-slate-300">
+                    Result JSON
+                  </div>
+                  <pre className="max-h-72 overflow-auto p-3 text-xs leading-relaxed text-emerald-100">
+                    {formatResultJson(currentExecution.result_json)}
+                  </pre>
+                </div>
+              )}
+
               {currentExecution.steps?.length ? currentExecution.steps.map((stepExec, i) => {
                 const sSuccess = stepExec.status === 'completed';
                 const sFailed = stepExec.status === 'failed';

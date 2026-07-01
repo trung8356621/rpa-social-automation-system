@@ -4,6 +4,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer';
+import { getCrawlExtractionScript } from './CardExtractorScript.js';
 import { resolveVariableTemplate } from './VariableResolver.js';
 import { ensureRememberMeChecked, isCheckboxAlreadyChecked, resolveGuestSessionDir, resolveSessionStartUrl } from '../browser/BrowserSessionPaths.js';
 
@@ -39,6 +40,7 @@ class ExecutorService {
     this._variableMap = null;
     this._executionViewport = null;
     this._releaseDirLock = null;
+    this._crawlResults = [];
   }
 
   async startScenario(scenarioId, options = {}) {
@@ -54,6 +56,8 @@ class ExecutorService {
       ? String(options.sampleId).trim() || null
       : null;
     this._variableMap = null;
+    this._crawlResults = [];
+    const stepResults = [];
 
     try {
       const scenario = this.dbService.getScenarioById(scenarioId);
@@ -120,6 +124,8 @@ class ExecutorService {
 
         const step = scenario.steps[index];
         const stepIndex = index + 1;
+        const stepStartedAt = new Date().toISOString();
+        const stepStartTime = Date.now();
 
         this._sendTelemetry({
           type: 'step:started',
@@ -132,9 +138,29 @@ class ExecutorService {
         });
 
         try {
-          await this._executeStep(step, stepIndex);
+          const output = await this._executeStep(step, stepIndex);
+          stepResults.push({
+            index: stepIndex,
+            step_id: step.id,
+            action_type: step.action_type,
+            status: 'completed',
+            started_at: stepStartedAt,
+            finished_at: new Date().toISOString(),
+            duration_ms: Date.now() - stepStartTime,
+            output: output || null,
+          });
         } catch (stepError) {
           this._failedStepIndex = stepIndex;
+          stepResults.push({
+            index: stepIndex,
+            step_id: step.id,
+            action_type: step.action_type,
+            status: 'failed',
+            started_at: stepStartedAt,
+            finished_at: new Date().toISOString(),
+            duration_ms: Date.now() - stepStartTime,
+            error: stepError.message,
+          });
           this._sendTelemetry({
             type: 'step:failed',
             executionId,
@@ -164,6 +190,23 @@ class ExecutorService {
 
       const durationMs = Date.now() - startTime;
       const finishedAt = new Date().toISOString();
+      const resultJson = buildExecutionResult({
+        success: true,
+        executionId,
+        scenario,
+        status: 'completed',
+        totalSteps: scenario.steps.length,
+        completedSteps: scenario.steps.length,
+        failedSteps: 0,
+        durationMs,
+        startedAt: this._executionStartedAt,
+        finishedAt,
+        stepResults,
+        browserProfileId: this._currentBrowserProfileId,
+        variableSampleId: this._currentSampleId,
+        pageUrl: this.page && !this.page.isClosed() ? this.page.url() : null,
+        crawlResults: this._crawlResults,
+      });
 
       this.dbService.finishExecutionLog(executionId, {
         status: 'completed',
@@ -171,6 +214,7 @@ class ExecutorService {
         failed_steps: 0,
         duration_ms: durationMs,
         finished_at: finishedAt,
+        result_json: resultJson,
       });
 
       this._sendTelemetry({
@@ -183,6 +227,7 @@ class ExecutorService {
         failedSteps: 0,
         durationMs,
         errors: [],
+        resultJson,
         timestamp: new Date().toISOString(),
       });
 
@@ -194,11 +239,31 @@ class ExecutorService {
         failedSteps: 0,
         durationMs,
         errors: [],
+        resultJson,
       };
     } catch (error) {
       const totalSteps = this.currentScenario?.steps?.length || 0;
       const completedSteps = Math.max(0, (this._failedStepIndex || 1) - 1);
       const finishedAt = new Date().toISOString();
+      const resultJson = buildExecutionResult({
+        success: false,
+        executionId,
+        scenario: this.currentScenario || { id: scenarioId },
+        status: 'failed',
+        totalSteps,
+        completedSteps,
+        failedSteps: 1,
+        failedStepIndex: this._failedStepIndex,
+        durationMs: Date.now() - startTime,
+        startedAt: this._executionStartedAt || new Date(startTime).toISOString(),
+        finishedAt,
+        stepResults,
+        error: error.message,
+        browserProfileId: this._currentBrowserProfileId,
+        variableSampleId: this._currentSampleId,
+        pageUrl: this.page && !this.page.isClosed() ? this.page.url() : null,
+        crawlResults: this._crawlResults,
+      });
 
       this.dbService.finishExecutionLog(executionId, {
         status: 'failed',
@@ -208,6 +273,7 @@ class ExecutorService {
         failed_step_index: this._failedStepIndex,
         error_message: error.message,
         finished_at: finishedAt,
+        result_json: resultJson,
       });
 
       this._sendTelemetry({
@@ -219,6 +285,7 @@ class ExecutorService {
         completedSteps,
         stepIndex: this._failedStepIndex,
         error: error.message,
+        resultJson,
         startedAt: this._executionStartedAt || new Date(startTime).toISOString(),
         timestamp: finishedAt,
       });
@@ -228,6 +295,7 @@ class ExecutorService {
       this.isRunning = false;
       this.currentScenario = null;
       this._executionViewport = null;
+      this._crawlResults = [];
     }
   }
 
@@ -503,8 +571,7 @@ class ExecutorService {
         await this._executeNavigate(step);
         break;
       case 'click':
-        await this._executeClick(step);
-        break;
+        return this._executeClick(step);
       case 'input':
       case 'type':
       case 'keypress':
@@ -516,10 +583,118 @@ class ExecutorService {
       case 'wait':
         await this._sleep(randomRuntimeDelay(step.target_anchor?.action_config?.duration || step.delay_ms || DEFAULT_ACTION_DELAY_MS));
         break;
+      case 'crawl':
+        return this._executeCrawl(step, stepIndex);
       default:
         console.warn(`[Executor] Unsupported action type at step ${stepIndex}: ${step.action_type}`);
         break;
     }
+    return null;
+  }
+
+  async _executeCrawl(step, stepIndex) {
+    if (!this.page || this.page.isClosed()) {
+      throw new Error('Trang browser khong san sang de crawl.');
+    }
+
+    const anchor = {
+      ...(step.target_anchor || {}),
+      action_config: {
+        ...((step.target_anchor || {}).action_config || {}),
+        ...(step.action_config || {}),
+      },
+    };
+    const config = anchor.action_config || {};
+    const maxCards = config.max_cards || config.limit || 100;
+    const crawlMeta = getCrawlMeta(this.currentScenario?.scenario_meta);
+    const result = await this._extractCrawlWithScroll(anchor, maxCards, crawlMeta);
+
+    if (!result?.ok) {
+      throw new Error(result?.message || 'Khong extract duoc crawl widget.');
+    }
+
+    const cards = Array.isArray(result.sample_dump) ? result.sample_dump : [];
+    const payload = {
+      step_index: stepIndex,
+      step_id: step.id,
+      widget_label: config.label || '',
+      selector: result.selector || config.parent_container_selector || anchor.selector_value || '',
+      match_count: Number(result.match_count) || 0,
+      cards,
+      sample_dump: cards,
+    };
+
+    this._crawlResults.push(payload);
+    return payload;
+  }
+
+  async _extractCrawlWithScroll(anchor, maxCards, crawlMeta = {}) {
+    const autoscroll = crawlMeta.autoscroll || {};
+    const infinite = crawlMeta.infinity_scroll || {};
+    const scrollDistance = Math.max(100, Number(autoscroll.distance_px) || 600);
+    const scrollDelay = Math.max(100, Number(autoscroll.delay_ms) || 500);
+    const shouldScroll = autoscroll.enabled || infinite.enabled;
+
+    if (shouldScroll) {
+      await this.page.evaluate(() => window.scrollTo(0, 0));
+      await this._sleep(scrollDelay);
+    }
+
+    let latest = await this.page.evaluate(getCrawlExtractionScript(anchor, maxCards));
+    const accumulatedCards = createCrawlCardAccumulator();
+    accumulatedCards.add(latest?.sample_dump);
+    if (!shouldScroll) return latest;
+
+    const startedAt = Date.now();
+    const timeoutMs = Math.max(1000, Number(infinite.timeout_ms) || 30000);
+    const maxScrolls = infinite.enabled
+      ? Math.max(1, Math.min(200, Number(infinite.max_scrolls) || 30))
+      : 200;
+    let previousHeight = 0;
+    let previousY = -1;
+
+    for (let scrollIndex = 0; scrollIndex < maxScrolls; scrollIndex += 1) {
+      if (infinite.stop_mode === 'condition' && crawlConditionMatched(latest?.sample_dump, infinite.condition)) {
+        break;
+      }
+      if (infinite.enabled && Date.now() - startedAt >= timeoutMs) {
+        break;
+      }
+
+      await this.page.evaluate((distance) => {
+        window.scrollBy(0, distance);
+      }, scrollDistance);
+      await this._sleep(scrollDelay);
+
+      const scrollState = await this.page.evaluate(() => {
+        return {
+          y: window.scrollY,
+          innerHeight: window.innerHeight || 0,
+          height: document.documentElement.scrollHeight || document.body.scrollHeight || 0,
+        };
+      });
+      latest = await this.page.evaluate(getCrawlExtractionScript(anchor, maxCards));
+      accumulatedCards.add(latest?.sample_dump);
+
+      const atBottom = scrollState.y + scrollState.innerHeight >= scrollState.height - 2;
+      const didNotMove = scrollState.y === previousY && scrollState.height === previousHeight;
+      if (atBottom && didNotMove) {
+        break;
+      }
+      previousHeight = scrollState.height;
+      previousY = scrollState.y;
+    }
+
+    latest = {
+      ...(latest || {}),
+      match_count: Math.max(Number(latest?.match_count) || 0, accumulatedCards.cards.length),
+      sample_dump: accumulatedCards.cards.map((card, index) => ({
+        ...card,
+        card_index: index,
+      })),
+    };
+
+    return latest;
   }
 
   async _executeNavigate(step) {
@@ -548,6 +723,8 @@ class ExecutorService {
     const selector = this._resolveSelector(anchor, config);
     const viewport = this._getExecutionViewport();
     const selectors = this._collectSelectors(anchor, config, selector);
+    let coordinateAttempt = null;
+    let coordinateError = null;
 
     if (config.skip_if_checked) {
       const alreadyChecked = await isCheckboxAlreadyChecked(this.page, {
@@ -555,17 +732,14 @@ class ExecutorService {
         coords: anchor.relative_coords,
         viewport,
       });
-      if (alreadyChecked) return;
-    }
-
-    for (const item of selectors) {
-      try {
-        await this.page.waitForSelector(item, { timeout: 5000, visible: true });
-        await this.page.click(item);
-        await this._waitAfterClick();
-        return;
-      } catch {
-        // Try next selector.
+      if (alreadyChecked) {
+        return {
+          click_method: 'skipped_checked',
+          reason: 'checkbox_already_checked',
+          selector: selectors[0] || null,
+          coords_percent: anchor.relative_coords || null,
+          viewport,
+        };
       }
     }
 
@@ -577,15 +751,61 @@ class ExecutorService {
           coords,
           viewport,
         });
-        if (alreadyChecked) return;
+        if (alreadyChecked) {
+          return {
+            click_method: 'skipped_checked',
+            reason: 'checkbox_already_checked',
+            coords_percent: coords,
+            viewport,
+          };
+        }
       }
 
       const x = Math.round((coords.x / 100) * viewport.width);
       const y = Math.round((coords.y / 100) * viewport.height);
-      await this.page.mouse.move(x, y, { steps: 5 });
-      await this.page.mouse.click(x, y, { button: 'left' });
-      await this._waitAfterClick();
-      return;
+      coordinateAttempt = {
+        x,
+        y,
+        coords_percent: {
+          x: Number(coords.x),
+          y: Number(coords.y),
+        },
+        viewport,
+      };
+      try {
+        await this.page.mouse.move(x, y, { steps: 5 });
+        await this.page.mouse.click(x, y, { button: 'left' });
+        await this._waitAfterClick();
+        console.log(`[Executor] Click by coordinates x=${x}, y=${y} (${coords.x}%, ${coords.y}%)`);
+        return {
+          click_method: 'coordinates',
+          ...coordinateAttempt,
+        };
+      } catch (error) {
+        coordinateError = error;
+        console.warn(`[Executor] Coordinate click failed x=${x}, y=${y}; falling back to selector. ${error.message}`);
+      }
+    }
+
+    for (const item of selectors) {
+      try {
+        await this.page.waitForSelector(item, { timeout: 5000, visible: true });
+        await this.page.click(item);
+        await this._waitAfterClick();
+        if (coordinateAttempt) {
+          console.log(`[Executor] Click fallback selector="${item}" after coordinate x=${coordinateAttempt.x}, y=${coordinateAttempt.y}`);
+        } else {
+          console.log(`[Executor] Click by selector="${item}" (no valid coordinates)`);
+        }
+        return {
+          click_method: coordinateAttempt ? 'selector_fallback' : 'selector',
+          selector: item,
+          coordinate_attempt: coordinateAttempt,
+          fallback_reason: coordinateError?.message || null,
+        };
+      } catch {
+        // Try next selector.
+      }
     }
 
     throw new Error('Click step không tìm thấy phần tử hoặc tọa độ hợp lệ.');
@@ -886,6 +1106,244 @@ function randomRuntimeDelay(baseMs = DEFAULT_ACTION_DELAY_MS, minMs = 120, maxMs
   const base = Math.max(1, Number(baseMs) || DEFAULT_ACTION_DELAY_MS);
   const factor = 0.7 + Math.random() * 1.1;
   return Math.round(Math.max(minMs, Math.min(maxMs, base * factor)));
+}
+
+function buildExecutionResult({
+  success,
+  executionId,
+  scenario,
+  status,
+  totalSteps,
+  completedSteps,
+  failedSteps,
+  failedStepIndex = null,
+  durationMs,
+  startedAt,
+  finishedAt,
+  stepResults = [],
+  error = null,
+  browserProfileId = null,
+  variableSampleId = null,
+  pageUrl = null,
+  crawlResults = [],
+}) {
+  if (isCrawlScenario(scenario)) {
+    return buildCrawlExecutionResult(crawlResults, normalizeScenarioResultType(scenario?.result_type));
+  }
+
+  return {
+    success: Boolean(success),
+    status,
+    execution_id: executionId,
+    scenario_id: scenario?.id || null,
+    scenario_name: scenario?.name || null,
+    scenario_type: normalizeScenarioType(scenario?.scenario_type),
+    result_type: normalizeScenarioResultType(scenario?.result_type),
+    browser_profile_id: browserProfileId,
+    variable_sample_id: variableSampleId,
+    total_steps: totalSteps || 0,
+    completed_steps: completedSteps || 0,
+    failed_steps: failedSteps || 0,
+    failed_step_index: failedStepIndex,
+    duration_ms: durationMs || 0,
+    started_at: startedAt || null,
+    finished_at: finishedAt || null,
+    page_url: pageUrl,
+    error,
+    data: {
+      crawl: Array.isArray(crawlResults) ? crawlResults : [],
+    },
+    steps: stepResults,
+  };
+}
+
+function isCrawlScenario(scenario) {
+  return normalizeScenarioType(scenario?.scenario_type) === 'crawl';
+}
+
+function buildCrawlExecutionResult(crawlResults = [], resultType = 'simple') {
+  return resultType === 'list'
+    ? buildMergedCrawlListResult(crawlResults)
+    : buildSampleCardDataDumpResult(crawlResults);
+}
+
+function normalizeCrawlCardData(card = {}) {
+  const data = card?.data !== undefined ? card.data : card?.html;
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    return data ?? '';
+  }
+
+  const keys = Object.keys(data);
+  if (keys.length === 1 && (keys[0] === 'text' || keys[0] === 'html')) {
+    return data[keys[0]];
+  }
+
+  return data;
+}
+
+function normalizeCrawlCard(card = {}) {
+  const { page_y: _pageY, ...publicCard } = card || {};
+  return {
+    ...publicCard,
+    data: normalizeCrawlCardData(card),
+  };
+}
+
+function buildSampleCardDataDumpResult(crawlResults = []) {
+  const results = Array.isArray(crawlResults) ? crawlResults : [];
+  return results.reduce((merged, result, index) => {
+    const key = String(result?.widget_label || `widget_${index + 1}`).trim() || `widget_${index + 1}`;
+    const cards = result?.sample_dump || result?.cards || [];
+    merged[key] = Array.isArray(cards) ? cards.map(normalizeCrawlCard) : [];
+    return merged;
+  }, {});
+}
+
+function buildMergedCrawlListResult(crawlResults = []) {
+  const results = Array.isArray(crawlResults) ? crawlResults : [];
+  const rows = new Map();
+
+  results.forEach((result, resultIndex) => {
+    const label = String(result?.widget_label || `widget_${resultIndex + 1}`).trim() || `widget_${resultIndex + 1}`;
+    const cards = result?.sample_dump || result?.cards || [];
+    if (!Array.isArray(cards)) return;
+
+    cards.forEach((card, cardIndex) => {
+      const rowIndex = Number.isFinite(Number(card?.card_index)) ? Number(card.card_index) : cardIndex;
+      const row = rows.get(rowIndex) || {};
+      const value = normalizeCrawlCardData(card);
+
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        Object.assign(row, value);
+      } else {
+        row[label] = value;
+      }
+
+      rows.set(rowIndex, row);
+    });
+  });
+
+  return Array.from(rows.entries())
+    .sort(([leftIndex], [rightIndex]) => leftIndex - rightIndex)
+    .map(([, row]) => row);
+}
+
+function createCrawlCardAccumulator() {
+  const seen = new Set();
+  const cards = [];
+
+  return {
+    cards,
+    add(nextCards = []) {
+      if (!Array.isArray(nextCards)) return;
+      nextCards.forEach((card) => {
+        const signature = getCrawlCardSignature(card);
+        if (!signature || seen.has(signature)) return;
+        seen.add(signature);
+        cards.push(card);
+      });
+    },
+  };
+}
+
+function getCrawlCardSignature(card = {}) {
+  const content = card?.data !== undefined
+    ? card.data
+    : (card?.html !== undefined ? card.html : card);
+  if (content && typeof content === 'object' && !Array.isArray(content)) {
+    const strongKey = content.permalink
+      || content.link
+      || content.href
+      || content.url
+      || content.post_title
+      || content.title
+      || content.keyword;
+    if (strongKey) return `strong:${String(strongKey).trim()}`;
+  }
+  if (Number.isFinite(Number(card?.page_y))) {
+    return `page_y:${Math.round(Number(card.page_y))}`;
+  }
+  try {
+    return JSON.stringify(content);
+  } catch {
+    return String(content || '');
+  }
+}
+
+function getCrawlMeta(meta = {}) {
+  const crawl = meta?.crawl || {};
+  return {
+    autoscroll: {
+      enabled: Boolean(crawl.autoscroll?.enabled),
+      distance_px: Number(crawl.autoscroll?.distance_px) || 600,
+      delay_ms: Number(crawl.autoscroll?.delay_ms) || 500,
+    },
+    infinity_scroll: {
+      enabled: Boolean(crawl.infinity_scroll?.enabled),
+      stop_mode: crawl.infinity_scroll?.stop_mode === 'condition' ? 'condition' : 'timeout',
+      timeout_ms: Number(crawl.infinity_scroll?.timeout_ms) || 30000,
+      max_scrolls: Number(crawl.infinity_scroll?.max_scrolls) || 30,
+      condition: {
+        field: String(crawl.infinity_scroll?.condition?.field || '').trim(),
+        operator: crawl.infinity_scroll?.condition?.operator || '<',
+        value: crawl.infinity_scroll?.condition?.value ?? '',
+      },
+    },
+  };
+}
+
+function crawlConditionMatched(cards = [], condition = {}) {
+  const field = String(condition?.field || '').trim();
+  if (!field || !Array.isArray(cards)) return false;
+
+  return cards.some((card) => {
+    const data = normalizeCrawlCardData(card);
+    const value = data && typeof data === 'object' && !Array.isArray(data)
+      ? data[field]
+      : undefined;
+    return compareCrawlValues(value, condition.operator, condition.value);
+  });
+}
+
+function compareCrawlValues(left, operator = '<', right) {
+  if (left === undefined || left === null || right === undefined || right === null || right === '') {
+    return false;
+  }
+
+  const leftComparable = toComparableValue(left);
+  const rightComparable = toComparableValue(right);
+
+  switch (operator) {
+    case '<': return leftComparable < rightComparable;
+    case '<=': return leftComparable <= rightComparable;
+    case '>': return leftComparable > rightComparable;
+    case '>=': return leftComparable >= rightComparable;
+    case '!=': return leftComparable !== rightComparable;
+    case '=':
+    default:
+      return leftComparable === rightComparable;
+  }
+}
+
+function toComparableValue(value) {
+  const text = String(value).trim();
+  const dateText = text.includes('/') && !text.includes('-')
+    ? text.split('/').reverse().join('-')
+    : text;
+  const timestamp = Date.parse(dateText);
+  if (!Number.isNaN(timestamp) && /[/-]\d{1,2}[/-]/.test(text)) {
+    return timestamp;
+  }
+  const number = Number(text.replace(/,/g, ''));
+  if (!Number.isNaN(number) && text !== '') return number;
+  return text.toLowerCase();
+}
+
+const SCENARIO_RESULT_TYPES = new Set(['simple', 'list']);
+
+function normalizeScenarioResultType(value) {
+  const normalized = String(value || 'simple').trim().toLowerCase();
+  return SCENARIO_RESULT_TYPES.has(normalized) ? normalized : 'simple';
 }
 
 export { ExecutorService };

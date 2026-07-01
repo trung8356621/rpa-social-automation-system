@@ -87,6 +87,19 @@ export const deleteScenario = createAsyncThunk(
   },
 );
 
+export const setScenarioPinned = createAsyncThunk(
+  'scenarios/setPinned',
+  async ({ id, isPinned }, { rejectWithValue, dispatch }) => {
+    try {
+      await window.electronAPI.setScenarioPinned(id, isPinned);
+      dispatch(fetchLocalScenarios());
+      return { id, is_pinned: isPinned ? 1 : 0 };
+    } catch (error) {
+      return rejectWithValue(error.message);
+    }
+  },
+);
+
 export const fetchScenarios = fetchLocalScenarios;
 export const fetchScenarioById = fetchScenarioDetails;
 
@@ -180,6 +193,15 @@ const scenarioSlice = createSlice({
       .addCase(deleteScenario.rejected, (state, action) => {
         state.loading = false;
         state.error = action.payload;
+      })
+      .addCase(setScenarioPinned.fulfilled, (state, action) => {
+        const scenario = state.items.find((item) => item.id === action.payload.id);
+        if (scenario) {
+          scenario.is_pinned = action.payload.is_pinned;
+        }
+        if (state.currentScenario?.id === action.payload.id) {
+          state.currentScenario.is_pinned = action.payload.is_pinned;
+        }
       });
   },
 });

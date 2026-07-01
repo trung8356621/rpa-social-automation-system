@@ -12,6 +12,7 @@ import {
   ScrollText,
   Settings,
   Shield,
+  Workflow,
 } from 'lucide-react';
 
 const navItemDefs = [
@@ -20,6 +21,7 @@ const navItemDefs = [
   { id: 'browserProfiles', icon: Globe, labelKey: 'nav.browserProfiles' },
   { id: 'dataProfiles', icon: Database, labelKey: 'nav.dataProfiles' },
   { id: 'scenarios', icon: ScrollText, labelKey: 'nav.scenarios' },
+  { id: 'tasks', icon: Workflow, labelKey: 'nav.tasks' },
   { id: 'executions', icon: PlayCircle, labelKey: 'nav.executions' },
   { id: 'settings', icon: Settings, labelKey: 'nav.settings' },
 ];

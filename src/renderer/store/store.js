@@ -6,6 +6,7 @@ import uiReducer from '../slices/uiSlice';
 import proxyReducer from '../slices/proxySlice';
 import browserProfileReducer from '../slices/browserProfileSlice';
 import settingsReducer from '../slices/settingsSlice';
+import taskReducer from '../slices/taskSlice';
 
 export const store = configureStore({
   reducer: {
@@ -16,6 +17,7 @@ export const store = configureStore({
     proxies: proxyReducer,
     browserProfiles: browserProfileReducer,
     settings: settingsReducer,
+    tasks: taskReducer,
   },
   middleware: (getDefaultMiddleware) =>
     getDefaultMiddleware({

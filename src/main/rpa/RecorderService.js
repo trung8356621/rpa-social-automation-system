@@ -143,6 +143,12 @@ class RecorderService {
       this.page.setDefaultTimeout(30000);
       this.page.setDefaultNavigationTimeout(60000);
 
+      await this._prepareParentScenarioForRecording(sourceScenario, {
+        page: this.page,
+        viewport: this.viewport,
+        variableMap,
+      });
+
       await this.page.exposeFunction('onRpaRecordedAction', (payload) => {
         this._handleClientAction(payload);
       });
@@ -356,41 +362,11 @@ class RecorderService {
       // Doi trang load
       await new Promise((resolve) => setTimeout(resolve, randomRuntimeDelay(1000)));
 
-      for (const step of steps) {
-        const { action_type, target_anchor, delay_ms } = step;
-        const anchor = target_anchor || {};
-        const config = anchor.action_config || {};
-        // Lay selector tu nhieu truong khac nhau (anchor.selector_value, config.selector, anchor.url, config.url)
-        const selector = anchor.selector_value || config.selector || '';
-        const stepUrl = config.url || anchor.url || '';
-
-        console.log(`[Recorder] Phat lai buoc: ${action_type} | selector="${selector}"`);
-
-        if (action_type === 'navigate') {
-          const url = resolveScenarioTargetUrl(
-            stepUrl || scenario.target_url || 'about:blank',
-            variableMap,
-          );
-          console.log(`[Recorder] Navigate den: ${url}`);
-          await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((err) => {
-            console.warn(`[Recorder] Navigate that bai: ${err.message}`);
-          });
-        } else if (action_type === 'click') {
-          await this._replayClick(page, anchor, selector, effectiveViewport, config);
-        } else if (action_type === 'input' || action_type === 'type') {
-          const text = resolveVariableTemplate(config.text || '', variableMap);
-          await this._replayType(page, anchor, selector, text, effectiveViewport, config.delay || 50);
-        } else if (action_type === 'scroll') {
-          const scrollX = anchor.scroll_x ?? config.scrollX ?? 0;
-          const scrollY = anchor.scroll_y ?? config.scrollY ?? 0;
-          await page.evaluate((x, y) => window.scrollTo({ left: x, top: y, behavior: 'instant' }), scrollX, scrollY).catch(() => {});
-        } else if (action_type === 'wait') {
-          await new Promise((resolve) => setTimeout(resolve, config.duration || delay_ms || 2000));
-        }
-
-        // Doi delay_ms truoc khi chay buoc tiep theo
-        await new Promise((resolve) => setTimeout(resolve, randomRuntimeDelay(delay_ms || DEFAULT_ACTION_DELAY_MS)));
-      }
+      await this._replayStepsOnPage(page, steps, {
+        scenario,
+        viewport: effectiveViewport,
+        variableMap,
+      });
 
       // Sau khi phat lai xong, bat dau record append mode
       // Tien inject script va CDP screencast
@@ -452,6 +428,85 @@ class RecorderService {
     }
   }
 
+  async _prepareParentScenarioForRecording(scenario, { page, viewport, variableMap } = {}) {
+    if (!page || page.isClosed()) return;
+    if (normalizeScenarioType(scenario?.scenario_type) === 'prepare') return;
+
+    const parentId = String(scenario?.parent_id || '').trim();
+    if (!parentId) return;
+    if (!hasDomCheckAnchor(scenario?.dom_check_anchor)) return;
+
+    const parent = this.dbService.getScenarioById(parentId);
+    if (!parent) {
+      throw new Error(`Khong tim thay kich ban parent/login: ${parentId}`);
+    }
+    if (!parent.steps?.length) {
+      throw new Error('Kich ban parent/login chua co buoc nao.');
+    }
+
+    const parentVariableMap = this.dbService.buildVariableMap(parentId, null);
+    const parentStartUrl = resolveScenarioTargetUrl(parent.target_url || 'about:blank', parentVariableMap);
+    console.log(`[Recorder] Chay parent/login truoc khi record action: ${parent.name || parentId}`);
+    await page.goto(parentStartUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch((err) => {
+      console.warn(`[Recorder] Khong the mo URL parent/login: ${err.message}`);
+    });
+    await ensureRememberMeChecked(page);
+    await this._releaseBrowserTopMost();
+    await new Promise((resolve) => setTimeout(resolve, randomRuntimeDelay(1000)));
+
+    await this._replayStepsOnPage(page, parent.steps, {
+      scenario: parent,
+      viewport,
+      variableMap: parentVariableMap,
+    });
+
+    await ensureRememberMeChecked(page);
+    await new Promise((resolve) => setTimeout(resolve, randomRuntimeDelay(500)));
+
+    const targetUrl = resolveScenarioTargetUrl(scenario?.target_url || 'about:blank', variableMap);
+    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch((err) => {
+      console.warn(`[Recorder] Khong the quay lai URL action sau parent/login: ${err.message}`);
+    });
+    await ensureRememberMeChecked(page);
+    await this._releaseBrowserTopMost();
+  }
+
+  async _replayStepsOnPage(page, steps = [], { scenario = {}, viewport = DEFAULT_VIEWPORT, variableMap = new Map() } = {}) {
+    for (const step of steps) {
+      const { action_type, target_anchor, delay_ms } = step;
+      const anchor = target_anchor || {};
+      const config = anchor.action_config || {};
+      const selector = anchor.selector_value || config.selector || '';
+      const stepUrl = config.url || anchor.url || '';
+
+      console.log(`[Recorder] Phat lai buoc: ${action_type} | selector="${selector}"`);
+
+      if (action_type === 'navigate') {
+        const url = resolveScenarioTargetUrl(
+          stepUrl || scenario.target_url || 'about:blank',
+          variableMap,
+        );
+        console.log(`[Recorder] Navigate den: ${url}`);
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((err) => {
+          console.warn(`[Recorder] Navigate that bai: ${err.message}`);
+        });
+      } else if (action_type === 'click') {
+        await this._replayClick(page, anchor, selector, viewport, config);
+      } else if (action_type === 'input' || action_type === 'type') {
+        const text = resolveVariableTemplate(config.text || '', variableMap);
+        await this._replayType(page, anchor, selector, text, viewport, config.delay || 50);
+      } else if (action_type === 'scroll') {
+        const scrollX = anchor.scroll_x ?? config.scrollX ?? 0;
+        const scrollY = anchor.scroll_y ?? config.scrollY ?? 0;
+        await page.evaluate((x, y) => window.scrollTo({ left: x, top: y, behavior: 'instant' }), scrollX, scrollY).catch(() => {});
+      } else if (action_type === 'wait') {
+        await new Promise((resolve) => setTimeout(resolve, config.duration || delay_ms || 2000));
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, randomRuntimeDelay(delay_ms || DEFAULT_ACTION_DELAY_MS)));
+    }
+  }
+
   async _replayClick(page, anchor = {}, selector = '', viewport = DEFAULT_VIEWPORT, config = {}) {
     const selectors = [
       selector,
@@ -471,23 +526,8 @@ class RecorderService {
       if (alreadyChecked) return;
     }
 
-    for (const item of selectors) {
-      try {
-        await page.waitForSelector(item, { timeout: 1500 });
-        await page.click(item);
-        return;
-      } catch {
-        // Try next selector.
-      }
-    }
-
-    const focused = await this._replayFocus(page, anchor, selector);
-    if (focused) {
-      await page.keyboard.press('Enter').catch(() => {});
-      return;
-    }
-
     const coords = anchor.relative_coords;
+    let coordinateAttempt = null;
     if (coords?.x !== undefined && coords?.y !== undefined) {
       if (config.skip_if_checked) {
         const alreadyChecked = await isCheckboxAlreadyChecked(page, {
@@ -500,8 +540,35 @@ class RecorderService {
 
       const x = Math.round((coords.x / 100) * viewport.width);
       const y = Math.round((coords.y / 100) * viewport.height);
-      await page.mouse.move(x, y, { steps: 5 }).catch(() => {});
-      await page.mouse.click(x, y).catch(() => {});
+      coordinateAttempt = { x, y };
+      try {
+        await page.mouse.move(x, y, { steps: 5 });
+        await page.mouse.click(x, y);
+        console.log(`[Recorder] Replay click by coordinates x=${x}, y=${y} (${coords.x}%, ${coords.y}%)`);
+        return;
+      } catch (error) {
+        console.warn(`[Recorder] Replay coordinate click failed x=${x}, y=${y}; falling back to selector. ${error.message}`);
+      }
+    }
+
+    for (const item of selectors) {
+      try {
+        await page.waitForSelector(item, { timeout: 1500 });
+        await page.click(item);
+        if (coordinateAttempt) {
+          console.log(`[Recorder] Replay click fallback selector="${item}" after coordinate x=${coordinateAttempt.x}, y=${coordinateAttempt.y}`);
+        } else {
+          console.log(`[Recorder] Replay click by selector="${item}" (no valid coordinates)`);
+        }
+        return;
+      } catch {
+        // Try next selector.
+      }
+    }
+
+    const focused = await this._replayFocus(page, anchor, selector);
+    if (focused) {
+      await page.keyboard.press('Enter').catch(() => {});
     }
   }
 
@@ -1123,11 +1190,11 @@ class RecorderService {
   _getInjectionScript() {
     const anchorHelpers = getElementAnchorHelpersScript();
 
-    return () => {
+    return new Function(`
       if (window.__rpaRecorderInjected) return;
       window.__rpaRecorderInjected = true;
 
-      eval(anchorHelpers);
+      eval(${JSON.stringify(anchorHelpers)});
 
       const send = (payload) => {
         if (typeof window.onRpaRecordedAction === 'function') {
@@ -1176,7 +1243,7 @@ class RecorderService {
           });
         }, 180);
       }, true);
-    };
+    `);
   }
 
   async _cleanupBrowser() {
@@ -1294,6 +1361,22 @@ function randomRuntimeDelay(baseMs = DEFAULT_ACTION_DELAY_MS, minMs = 120, maxMs
   const base = Math.max(1, Number(baseMs) || DEFAULT_ACTION_DELAY_MS);
   const factor = 0.7 + Math.random() * 1.1;
   return Math.round(Math.max(minMs, Math.min(maxMs, base * factor)));
+}
+
+function normalizeScenarioType(value) {
+  const normalized = String(value || 'action').trim().toLowerCase();
+  if (normalized === 'prepare' || normalized === 'crawl' || normalized === 'action') {
+    return normalized;
+  }
+  return 'action';
+}
+
+function hasDomCheckAnchor(value) {
+  if (!value || typeof value !== 'object') return false;
+  return Boolean(
+    String(value.selector_value || '').trim()
+    || String(value.action_config?.selector || '').trim(),
+  );
 }
 
 function escapeConcatPath(filePath) {

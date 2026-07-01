@@ -1,3 +1,6 @@
+import { Buffer } from 'node:buffer';
+import { getElementAnchorHelpersScript } from './ElementAnchorScript.js';
+
 /**
  * Class-based card container detection and DOM subtree JSON extraction.
  * Injected into BrowserView pages for crawl design mode (WebScraper-style).
@@ -552,6 +555,114 @@ export function getCardExtractorScript() {
         });
     }
 
+    function resolveCardsByMode(parentSelector, selectorMode, maxCards) {
+      const limit = maxCards || 5;
+      if (!parentSelector) return [];
+
+      try {
+        if (selectorMode === 'single') {
+          const card = document.querySelector(parentSelector);
+          return card && !isVisuallyHiddenElement(card) ? [card] : [];
+        }
+
+        return Array.from(document.querySelectorAll(parentSelector))
+          .filter(function(card) { return !isVisuallyHiddenElement(card); })
+          .slice(0, limit);
+      } catch (_) {
+        return [];
+      }
+    }
+
+    function resolvePatternElement(card, selector) {
+      if (!card) return null;
+      if (!selector) return card;
+      try {
+        return card.querySelector(selector);
+      } catch (_) {
+        return null;
+      }
+    }
+
+    function extractAttributeValue(el, attributeName) {
+      const attrName = normalizeText(attributeName);
+      if (!el || !attrName) return '';
+      if (attrName === 'text') return normalizeText(el.innerText || el.textContent || '');
+      if (attrName === 'html') return el.outerHTML || el.innerHTML || '';
+      if (attrName === 'href' && el.href) return String(el.href).trim();
+      if (attrName === 'src' && el.src) return String(el.src).trim();
+      const attrValue = el.getAttribute(attrName);
+      return attrValue == null ? '' : String(attrValue).trim();
+    }
+
+    function extractPatternValue(card, pattern) {
+      const el = resolvePatternElement(card, pattern && pattern.selector);
+      if (!el) return '';
+
+      if (Array.isArray(pattern && pattern.attributes) && pattern.attributes.length) {
+        const output = {};
+        pattern.attributes.forEach(function(attribute) {
+          const attributeName = typeof attribute === 'string'
+            ? attribute
+            : (attribute && (attribute.name || attribute.attribute || attribute.key));
+          const key = normalizeText(attributeName);
+          const resultKey = typeof attribute === 'object' && attribute
+            ? normalizeText(attribute.result_key)
+            : '';
+          if (!key) return;
+          output[resultKey || key] = extractAttributeValue(el, key);
+        });
+        return output;
+      }
+
+      const legacyAttribute = (pattern && (pattern.attribute_name || pattern.attribute)) || '';
+      const mode = (pattern && pattern.extract_mode) || 'text';
+      return extractAttributeValue(el, legacyAttribute || mode);
+    }
+
+    function assignPatternValue(data, pattern, patternIndex, value) {
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        Object.keys(value).forEach(function(key) {
+          if (!key) return;
+          data[key] = value[key];
+        });
+        return;
+      }
+
+      const label = normalizeText(pattern && pattern.label) || ('field_' + (patternIndex + 1));
+      data[label] = value;
+    }
+
+    function buildPatternDataDump(parentSelector, selectorMode, patterns, maxCards) {
+      const cards = resolveCardsByMode(parentSelector, selectorMode, maxCards);
+      const safePatterns = Array.isArray(patterns) ? patterns : [];
+
+      return cards.map(function(card, index) {
+        const data = {};
+        const rect = card.getBoundingClientRect();
+        safePatterns.forEach(function(pattern, patternIndex) {
+          assignPatternValue(data, pattern, patternIndex, extractPatternValue(card, pattern));
+        });
+        return {
+          card_index: index,
+          page_y: Math.round((window.scrollY || window.pageYOffset || 0) + rect.top),
+          data: data,
+        };
+      });
+    }
+
+    function buildFullHtmlDataDump(parentSelector, selectorMode, maxCards) {
+      const cards = resolveCardsByMode(parentSelector, selectorMode, maxCards);
+
+      return cards.map(function(card, index) {
+        const rect = card.getBoundingClientRect();
+        return {
+          card_index: index,
+          page_y: Math.round((window.scrollY || window.pageYOffset || 0) + rect.top),
+          html: card.outerHTML || '',
+        };
+      });
+    }
+
     function buildCardPickPayload(element, pickKind) {
       const isRoot = pickKind === 'root';
       const cardElement = isRoot ? findCardContainer(element) : element;
@@ -577,7 +688,7 @@ export function getCardExtractorScript() {
       };
 
       if (isRoot) {
-        payload.sample_dump = buildCardDataDump(parentSelector, 3);
+        payload.sample_dump = buildFullHtmlDataDump(parentSelector, 'multiple', 3);
         payload.widget_type = 'parent';
       } else {
         payload.field_selector = parentSelector;
@@ -587,5 +698,74 @@ export function getCardExtractorScript() {
 
       return payload;
     }
+  `;
+}
+
+export function getCrawlExtractionScript(anchor = {}, maxCards = 100) {
+  const encodedAnchor = Buffer.from(JSON.stringify(anchor || {}), 'utf8').toString('base64');
+  const safeMaxCards = Math.max(1, Math.min(500, Math.round(Number(maxCards) || 100)));
+
+  return `
+    (function runRpaCrawlExtraction() {
+      try {
+        var anchor = JSON.parse(atob('${encodedAnchor}')) || {};
+        ${getElementAnchorHelpersScript()}
+        ${getCardExtractorScript()}
+
+        var config = anchor.action_config || {};
+        var selectorMode = config.selector_mode === 'single' ? 'single' : 'multiple';
+        var resultMode = config.result_mode === 'patterns' ? 'patterns' : 'full_html';
+        var selector = config.parent_container_selector
+          || anchor.parent_container_selector
+          || config.selector
+          || anchor.selector_value
+          || anchor.field_selector
+          || '';
+        var cards = [];
+        var matchCount = 0;
+
+        if (selector) {
+          matchCount = countSelectorMatches(selector);
+          if (resultMode === 'patterns') {
+            cards = buildPatternDataDump(selector, selectorMode, config.result_patterns || [], ${safeMaxCards});
+          } else {
+            cards = buildFullHtmlDataDump(selector, selectorMode, ${safeMaxCards});
+          }
+          if (selectorMode === 'single') {
+            matchCount = cards.length;
+          }
+        }
+
+        if (!cards.length) {
+          var fallbackElement = resolveBestElementFromAnchor(anchor, null) || resolveElementFromAnchor(anchor);
+          matchCount = fallbackElement ? 1 : matchCount;
+          if (resultMode === 'patterns') {
+            cards = fallbackElement ? buildPatternDataDump(selector || '', 'single', config.result_patterns || [], 1) : [];
+            if (!cards.length && fallbackElement) {
+              var fallbackData = {};
+              (config.result_patterns || []).forEach(function(pattern, patternIndex) {
+                assignPatternValue(fallbackData, pattern, patternIndex, extractPatternValue(fallbackElement, pattern));
+              });
+              cards = [{ card_index: 0, data: fallbackData }];
+            }
+          } else {
+            cards = fallbackElement ? [{ card_index: 0, html: fallbackElement.outerHTML || '' }] : buildSampleDumpForElement(fallbackElement);
+          }
+        }
+
+        return {
+          ok: true,
+          selector: selector,
+          match_count: matchCount,
+          sample_dump: cards,
+        };
+      } catch (err) {
+        return {
+          ok: false,
+          error: 'crawl_extract_failed',
+          message: err && err.message ? err.message : String(err),
+        };
+      }
+    })()
   `;
 }

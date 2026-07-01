@@ -12,6 +12,7 @@ import HistoryPage from './pages/HistoryPage';
 import SettingsPage from './pages/SettingsPage';
 import BrowserProfilesPage from './pages/BrowserProfilesPage';
 import DataProfilesPage from './pages/DataProfilesPage';
+import TasksPage from './pages/TasksPage';
 import ProxiesView from './views/ProxiesView';
 
 /**
@@ -81,6 +82,8 @@ export default function App() {
         return <DashboardPage />;
       case 'scenarios':
         return <ScenariosPage />;
+      case 'tasks':
+        return <TasksPage />;
       case 'executions':
         return <ExecutionsPage />;
       case 'history':

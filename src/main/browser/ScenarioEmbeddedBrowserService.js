@@ -10,6 +10,7 @@ import {
   getHighlightAnchorScript,
   getPromoteToParentScript,
 } from '../rpa/DesignModeScript.js';
+import { getCrawlExtractionScript } from '../rpa/CardExtractorScript.js';
 import { buildPreviewPartition, invalidateProfileCookieCache, syncProfileCookiesToSession } from './ProfileCookieSync.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -378,6 +379,19 @@ class ScenarioEmbeddedBrowserService {
       return { ...(result || {}), attached: true };
     } catch (error) {
       return { cleared: false, attached: true, error: error.message };
+    }
+  }
+
+  async extractCrawlSample(anchor = null, maxCards = 100) {
+    if (!this.view) {
+      return { ok: false, error: 'not_attached' };
+    }
+
+    try {
+      const result = await this.view.webContents.executeJavaScript(getCrawlExtractionScript(anchor || {}, maxCards));
+      return result || { ok: false, error: 'empty_result' };
+    } catch (error) {
+      return { ok: false, error: 'crawl_extract_failed', message: error.message };
     }
   }
 

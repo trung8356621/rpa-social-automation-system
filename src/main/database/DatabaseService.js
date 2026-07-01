@@ -178,6 +178,10 @@ class DatabaseService {
         this.db.exec("ALTER TABLE scenarios ADD COLUMN scenario_type TEXT NOT NULL DEFAULT 'action'");
       }
 
+      if (!scenarioColumns.some((col) => col.name === 'result_type')) {
+        this.db.exec("ALTER TABLE scenarios ADD COLUMN result_type TEXT NOT NULL DEFAULT 'simple'");
+      }
+
       if (!scenarioColumns.some((col) => col.name === 'parent_id')) {
         this.db.exec('ALTER TABLE scenarios ADD COLUMN parent_id TEXT REFERENCES scenarios(id) ON DELETE SET NULL');
       }
@@ -185,7 +189,24 @@ class DatabaseService {
       if (!scenarioColumns.some((col) => col.name === 'dom_check_anchor')) {
         this.db.exec('ALTER TABLE scenarios ADD COLUMN dom_check_anchor TEXT');
       }
+
+      if (!scenarioColumns.some((col) => col.name === 'is_pinned')) {
+        this.db.exec('ALTER TABLE scenarios ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0');
+      }
     }
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS scenarios_meta (
+        id          TEXT PRIMARY KEY,
+        scenario_id TEXT NOT NULL,
+        meta_key    TEXT NOT NULL,
+        meta_value  TEXT,
+        updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(scenario_id, meta_key),
+        FOREIGN KEY (scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE
+      );
+    `);
+    this._migrateScenarioColumnsToMeta();
 
     const browserProfilesTable = this.db
       .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='browser_profiles'")
@@ -218,6 +239,7 @@ class DatabaseService {
           failed_steps        INTEGER NOT NULL DEFAULT 0,
           failed_step_index   INTEGER,
           error_message       TEXT,
+          result_json         TEXT,
           duration_ms         INTEGER,
           started_at          TEXT NOT NULL,
           finished_at         TEXT,
@@ -231,6 +253,7 @@ class DatabaseService {
     this._migrateScenarioVariablesTable();
     this._migrateVariableProfilesTables();
     this._migrateLocalVariablesAndSamples();
+    this._migrateScenarioColumnsToMeta();
     this._migrateExecutionLogsProfileColumns();
 
     const scenarioStepsTable = this.db
@@ -456,6 +479,9 @@ class DatabaseService {
     if (!columns.some((col) => col.name === 'variable_sample_name')) {
       this.db.exec('ALTER TABLE execution_logs ADD COLUMN variable_sample_name TEXT');
     }
+    if (!columns.some((col) => col.name === 'result_json')) {
+      this.db.exec('ALTER TABLE execution_logs ADD COLUMN result_json TEXT');
+    }
   }
 
   initSchema() {
@@ -511,6 +537,16 @@ class DatabaseService {
           updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
+        CREATE TABLE IF NOT EXISTS tasks (
+          id          TEXT PRIMARY KEY,
+          name        TEXT NOT NULL,
+          description TEXT,
+          flow_data   TEXT,
+          is_active   INTEGER NOT NULL DEFAULT 1,
+          created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
         -- ============================================================
         -- Bảng scenarios: kịch bản tự động hóa
         -- Lưu thông tin viewport gốc để chuyển đổi tọa độ sau này
@@ -532,8 +568,10 @@ class DatabaseService {
           variable_profile_id TEXT,
           local_variables     TEXT NOT NULL DEFAULT '[]',
           scenario_type       TEXT NOT NULL DEFAULT 'action',
+          result_type         TEXT NOT NULL DEFAULT 'simple',
           parent_id           TEXT REFERENCES scenarios(id) ON DELETE SET NULL,
           dom_check_anchor    TEXT,
+          is_pinned           INTEGER NOT NULL DEFAULT 0,
           is_dirty            INTEGER NOT NULL DEFAULT 1,
           updated_at          TEXT NOT NULL DEFAULT (datetime('now'))
         );
@@ -544,6 +582,16 @@ class DatabaseService {
           key         TEXT NOT NULL,
           value       TEXT,
           UNIQUE(scenario_id, key),
+          FOREIGN KEY (scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS scenarios_meta (
+          id          TEXT PRIMARY KEY,
+          scenario_id TEXT NOT NULL,
+          meta_key    TEXT NOT NULL,
+          meta_value  TEXT,
+          updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+          UNIQUE(scenario_id, meta_key),
           FOREIGN KEY (scenario_id) REFERENCES scenarios(id) ON DELETE CASCADE
         );
 
@@ -656,6 +704,7 @@ class DatabaseService {
           failed_steps        INTEGER NOT NULL DEFAULT 0,
           failed_step_index   INTEGER,
           error_message       TEXT,
+          result_json         TEXT,
           duration_ms         INTEGER,
           started_at          TEXT NOT NULL,
           finished_at         TEXT,
@@ -667,6 +716,7 @@ class DatabaseService {
     });
 
     createTables();
+    this._migrateScenarioColumnsToMeta();
     console.log('[DatabaseService] Schema đã được khởi tạo thành công');
   }
 
@@ -700,31 +750,32 @@ class DatabaseService {
     // Prepared statements để tối ưu hiệu năng
     const scenarioType = normalizeScenarioType(scenario.scenario_type ?? existingScenario?.scenario_type);
     const parentId = normalizeScenarioParentId(scenarioType, scenario.parent_id ?? existingScenario?.parent_id);
-    const domCheckAnchorJson = serializeDomCheckAnchor(
-      scenario.dom_check_anchor ?? existingScenario?.dom_check_anchor,
+    const scenarioMeta = buildScenarioMetaForStorage(
+      scenario,
+      existingScenario,
+      existingScenario ? this.getScenarioMeta(scenarioId) : {},
     );
 
     const upsertScenario = isNew
       ? this.db.prepare(`
           INSERT INTO scenarios (
             id, name, description, platform, target_url,
-            recorded_width, recorded_height, device_pixel_ratio,
+            device_pixel_ratio,
             preview_path, preview_manifest_path, preview_duration_ms, preview_trim_ranges,
-            browser_profile_id, variable_profile_id,
-            scenario_type, parent_id, dom_check_anchor,
+            browser_profile_id,
+            scenario_type, parent_id,
             is_dirty, updated_at
           )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
         `)
       : this.db.prepare(`
           UPDATE scenarios
           SET name = ?, description = ?, platform = ?, target_url = ?,
-              recorded_width = ?, recorded_height = ?, device_pixel_ratio = ?,
+              device_pixel_ratio = ?,
               preview_path = ?, preview_manifest_path = ?, preview_duration_ms = ?,
               preview_trim_ranges = ?,
               browser_profile_id = ?,
-              variable_profile_id = ?,
-              scenario_type = ?, parent_id = ?, dom_check_anchor = ?,
+              scenario_type = ?, parent_id = ?,
               is_dirty = 1, updated_at = ?
           WHERE id = ?
         `);
@@ -737,6 +788,7 @@ class DatabaseService {
       INSERT INTO scenario_steps (id, scenario_id, step_order, action_type, target_anchor, delay_ms, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `);
+    const replaceScenarioMeta = this._replaceScenarioMetaStatement();
 
     const previousFramePaths = new Set(
       this.db
@@ -771,18 +823,14 @@ class DatabaseService {
           scenario.description || null,
           scenario.platform || 'custom',
           scenario.target_url || null,
-          scenario.recorded_width || null,
-          scenario.recorded_height || null,
           scenario.device_pixel_ratio || 1.0,
           scenario.preview_path ?? null,
           scenario.preview_manifest_path ?? null,
           scenario.preview_duration_ms ?? null,
           JSON.stringify(parseJsonArray(scenario.preview_trim_ranges)),
           scenario.browser_profile_id ?? null,
-          scenario.variable_profile_id ?? null,
           scenarioType,
           parentId,
-          domCheckAnchorJson,
           now
         );
       } else {
@@ -792,8 +840,6 @@ class DatabaseService {
           scenario.description || null,
           scenario.platform || 'custom',
           scenario.target_url || null,
-          scenario.recorded_width || null,
-          scenario.recorded_height || null,
           scenario.device_pixel_ratio || 1.0,
           scenario.preview_path !== undefined ? scenario.preview_path : existingScenario.preview_path,
           scenario.preview_manifest_path !== undefined ? scenario.preview_manifest_path : existingScenario.preview_manifest_path,
@@ -804,9 +850,6 @@ class DatabaseService {
           scenario.browser_profile_id !== undefined
             ? scenario.browser_profile_id
             : existingScenario.browser_profile_id || null,
-          scenario.variable_profile_id !== undefined
-            ? scenario.variable_profile_id
-            : existingScenario.variable_profile_id || null,
           scenario.scenario_type !== undefined
             ? normalizeScenarioType(scenario.scenario_type)
             : normalizeScenarioType(existingScenario.scenario_type),
@@ -821,9 +864,6 @@ class DatabaseService {
               normalizeScenarioType(existingScenario.scenario_type),
               existingScenario.parent_id,
             ),
-          scenario.dom_check_anchor !== undefined
-            ? serializeDomCheckAnchor(scenario.dom_check_anchor)
-            : serializeDomCheckAnchor(existingScenario.dom_check_anchor),
           now,
           scenarioId
         );
@@ -863,6 +903,8 @@ class DatabaseService {
           );
         }
       });
+
+      replaceScenarioMeta(scenarioId, scenarioMeta);
     });
 
     saveTransaction();
@@ -956,11 +998,18 @@ class DatabaseService {
       };
     });
 
+    const scenarioMeta = this.getScenarioMeta(id);
+
     return {
       ...scenario,
       scenario_type: normalizeScenarioType(scenario.scenario_type),
+      result_type: normalizeScenarioResultType(scenarioMeta.result_type ?? scenario.result_type),
+      recorded_width: Number(scenarioMeta.recorded_width ?? scenario.recorded_width) || null,
+      recorded_height: Number(scenarioMeta.recorded_height ?? scenario.recorded_height) || null,
+      variable_profile_id: scenarioMeta.variable_profile_id ?? scenario.variable_profile_id ?? null,
+      scenario_meta: scenarioMeta,
       parent_id: scenario.parent_id || null,
-      dom_check_anchor: parseDomCheckAnchor(scenario.dom_check_anchor),
+      dom_check_anchor: parseDomCheckAnchor(scenarioMeta.dom_check_anchor ?? scenario.dom_check_anchor),
       preview_trim_ranges: parseJsonArray(scenario.preview_trim_ranges),
       preview_url: scenario.preview_path ? toCacheUrl(scenario.preview_path) : null,
       preview_frames: readPreviewFrames(scenario.preview_manifest_path),
@@ -973,12 +1022,10 @@ class DatabaseService {
   }
 
   getScenarioLocalVariables(scenarioId) {
-    const row = this.db
-      .prepare('SELECT local_variables FROM scenarios WHERE id = ?')
-      .get(scenarioId);
-    if (!row) return [];
+    const existing = this.db.prepare('SELECT id FROM scenarios WHERE id = ?').get(scenarioId);
+    if (!existing) return [];
 
-    return normalizeVariableEntries(row.local_variables).map((item, index) => ({
+    return normalizeVariableEntries(this.getScenarioMeta(scenarioId).local_variables).map((item, index) => ({
       id: `${scenarioId}:${item.key}:${index}`,
       scenario_id: scenarioId,
       key: item.key,
@@ -999,11 +1046,12 @@ class DatabaseService {
     const now = new Date().toISOString();
     const json = serializeVariableEntries(variables);
 
+    this.setScenarioMetaValue(scenarioId, 'local_variables', json);
     this.db.prepare(`
       UPDATE scenarios
-      SET local_variables = ?, is_dirty = 1, updated_at = ?
+      SET is_dirty = 1, updated_at = ?
       WHERE id = ?
-    `).run(json, now, scenarioId);
+    `).run(now, scenarioId);
 
     return this.getScenarioLocalVariables(scenarioId);
   }
@@ -1017,9 +1065,7 @@ class DatabaseService {
       throw new Error('scenario_id and key are required.');
     }
 
-    const current = normalizeVariableEntries(
-      this.db.prepare('SELECT local_variables FROM scenarios WHERE id = ?').get(scenarioId)?.local_variables,
-    );
+    const current = normalizeVariableEntries(this.getScenarioMeta(scenarioId).local_variables);
     const oldKeyFromId = variable.id
       ? String(variable.id).split(':').slice(1, -1).join(':') || null
       : null;
@@ -1047,9 +1093,7 @@ class DatabaseService {
 
     const scenarioId = parts[0];
     const key = parts.slice(1, -1).join(':') || parts[1];
-    const current = normalizeVariableEntries(
-      this.db.prepare('SELECT local_variables FROM scenarios WHERE id = ?').get(scenarioId)?.local_variables,
-    );
+    const current = normalizeVariableEntries(this.getScenarioMeta(scenarioId).local_variables);
     const next = current.filter((item) => item.key !== key);
     this.saveScenarioLocalVariables(scenarioId, next);
     return { success: true, id };
@@ -1094,20 +1138,14 @@ class DatabaseService {
   }
 
   _mergeTemplateKeysIntoLocalVariables(scenarioId, templateKeys = []) {
-    const row = this.db
-      .prepare('SELECT local_variables FROM scenarios WHERE id = ?')
-      .get(scenarioId);
     const currentMap = new Map(
-      normalizeVariableEntries(row?.local_variables).map((item) => [item.key, item.value ?? '']),
+      normalizeVariableEntries(this.getScenarioMeta(scenarioId).local_variables).map((item) => [item.key, item.value ?? '']),
     );
 
-    for (const item of templateKeys) {
-      if (!currentMap.has(item.key)) {
-        currentMap.set(item.key, '');
-      }
-    }
-
-    return Array.from(currentMap.entries()).map(([key, value]) => ({ key, value }));
+    return normalizeTemplateKeys(templateKeys).map((item) => ({
+      key: item.key,
+      value: currentMap.get(item.key) ?? '',
+    }));
   }
 
   getVariableProfiles() {
@@ -1214,7 +1252,11 @@ class DatabaseService {
   }
 
   deleteVariableProfile(id) {
-    this.db.prepare('UPDATE scenarios SET variable_profile_id = NULL WHERE variable_profile_id = ?').run(id);
+    this.db.prepare(`
+      UPDATE scenarios_meta
+      SET meta_value = NULL, updated_at = ?
+      WHERE meta_key = 'variable_profile_id' AND meta_value = ?
+    `).run(new Date().toISOString(), id);
     this.db.prepare('DELETE FROM variable_profiles WHERE id = ?').run(id);
     return { success: true, id };
   }
@@ -1364,11 +1406,12 @@ class DatabaseService {
         this.saveScenarioLocalVariables(scenarioId, merged);
       }
 
+      this.setScenarioMetaValue(scenarioId, 'variable_profile_id', normalizedProfileId);
       this.db.prepare(`
         UPDATE scenarios
-        SET variable_profile_id = ?, is_dirty = 1, updated_at = ?
+        SET is_dirty = 1, updated_at = ?
         WHERE id = ?
-      `).run(normalizedProfileId, now, scenarioId);
+      `).run(now, scenarioId);
     });
 
     apply();
@@ -1398,9 +1441,7 @@ class DatabaseService {
   }
 
   exportLocalVariablesPayload(scenarioId) {
-    const variables = normalizeVariableEntries(
-      this.db.prepare('SELECT local_variables FROM scenarios WHERE id = ?').get(scenarioId)?.local_variables,
-    );
+    const variables = normalizeVariableEntries(this.getScenarioMeta(scenarioId).local_variables);
     return {
       version: 1,
       variables: variables.map(({ key, value }) => ({ key, value: value ?? '' })),
@@ -1425,9 +1466,7 @@ class DatabaseService {
       throw new Error('Khong tim thay kich ban.');
     }
 
-    const variables = normalizeVariableEntries(
-      this.db.prepare('SELECT local_variables FROM scenarios WHERE id = ?').get(scenarioId)?.local_variables,
-    );
+    const variables = normalizeVariableEntries(this.getScenarioMeta(scenarioId).local_variables);
 
     const previewFrames = (scenario.preview_frames || []).map((frame) => ({
       name: frame.name || (frame.path ? path.basename(frame.path) : null),
@@ -1467,6 +1506,8 @@ class DatabaseService {
         preview_duration_ms: scenario.preview_duration_ms,
         preview_trim_ranges: scenario.preview_trim_ranges || [],
         scenario_type: normalizeScenarioType(scenario.scenario_type),
+        result_type: normalizeScenarioResultType(scenario.result_type),
+        scenario_meta: scenario.scenario_meta || {},
         parent_id: scenario.parent_id || null,
         dom_check_anchor: parseDomCheckAnchor(scenario.dom_check_anchor),
         local_variables: variables.map(({ key, value }) => ({ key, value: value ?? '' })),
@@ -1594,6 +1635,8 @@ class DatabaseService {
       browser_profile_id: null,
       variable_profile_id: null,
       scenario_type: scenarioData.scenario_type,
+      result_type: scenarioData.result_type,
+      scenario_meta: scenarioData.scenario_meta || scenarioData.meta || {},
       parent_id: scenarioData.parent_id,
       dom_check_anchor: scenarioData.dom_check_anchor,
     }, steps);
@@ -1607,12 +1650,8 @@ class DatabaseService {
   }
 
   buildVariableMap(scenarioId, sampleId = null) {
-    const row = this.db
-      .prepare('SELECT local_variables FROM scenarios WHERE id = ?')
-      .get(scenarioId);
-
     const resolved = new Map(
-      normalizeVariableEntries(row?.local_variables).map((item) => [item.key, item.value ?? '']),
+      normalizeVariableEntries(this.getScenarioMeta(scenarioId).local_variables).map((item) => [item.key, item.value ?? '']),
     );
 
     const normalizedSampleId = sampleId ? String(sampleId).trim() : '';
@@ -1636,7 +1675,79 @@ class DatabaseService {
   }
 
   deleteScenario(id) {
+    const scenario = this.db.prepare('SELECT is_pinned FROM scenarios WHERE id = ?').get(id);
+    if (scenario?.is_pinned) {
+      throw new Error('Pinned scenario must be unpinned before deleting.');
+    }
     this.db.prepare('DELETE FROM scenarios WHERE id = ?').run(id);
+    return { success: true, id };
+  }
+
+  setScenarioPinned(id, isPinned) {
+    const scenario = this.db.prepare('SELECT id FROM scenarios WHERE id = ?').get(id);
+    if (!scenario) {
+      throw new Error('Scenario not found.');
+    }
+    this.db
+      .prepare('UPDATE scenarios SET is_pinned = ?, is_dirty = 1, updated_at = ? WHERE id = ?')
+      .run(isPinned ? 1 : 0, new Date().toISOString(), id);
+    return { success: true, id, is_pinned: isPinned ? 1 : 0 };
+  }
+
+  getTasks() {
+    return this.db
+      .prepare('SELECT * FROM tasks ORDER BY datetime(updated_at) DESC')
+      .all()
+      .map((task) => ({
+        ...task,
+        flow_data: parseJsonObject(task.flow_data),
+      }));
+  }
+
+  getTaskById(id) {
+    const task = this.db.prepare('SELECT * FROM tasks WHERE id = ?').get(id);
+    return task ? { ...task, flow_data: parseJsonObject(task.flow_data) } : null;
+  }
+
+  saveTask(task = {}) {
+    const now = new Date().toISOString();
+    const id = task.id || crypto.randomUUID();
+    const existing = this.db.prepare('SELECT id, created_at FROM tasks WHERE id = ?').get(id);
+    const flowData = serializeJsonValue(task.flow_data || { nodes: [], edges: [] });
+
+    if (existing) {
+      this.db.prepare(`
+        UPDATE tasks
+        SET name = ?, description = ?, flow_data = ?, is_active = ?, updated_at = ?
+        WHERE id = ?
+      `).run(
+        String(task.name || '').trim() || 'Task mới',
+        task.description || null,
+        flowData,
+        task.is_active === 0 ? 0 : 1,
+        now,
+        id,
+      );
+    } else {
+      this.db.prepare(`
+        INSERT INTO tasks (id, name, description, flow_data, is_active, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        id,
+        String(task.name || '').trim() || 'Task mới',
+        task.description || null,
+        flowData,
+        task.is_active === 0 ? 0 : 1,
+        now,
+        now,
+      );
+    }
+
+    return this.getTaskById(id);
+  }
+
+  deleteTask(id) {
+    this.db.prepare('DELETE FROM tasks WHERE id = ?').run(id);
     return { success: true, id };
   }
 
@@ -1940,9 +2051,9 @@ class DatabaseService {
         variable_profile_id, variable_profile_name,
         variable_sample_id, variable_sample_name,
         status, total_steps, completed_steps, failed_steps,
-        failed_step_index, error_message, duration_ms,
+        failed_step_index, error_message, result_json, duration_ms,
         started_at, finished_at, is_dirty, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
     `).run(
       id,
       log.scenario_id,
@@ -1958,6 +2069,7 @@ class DatabaseService {
       log.failed_steps || 0,
       log.failed_step_index ?? null,
       log.error_message || null,
+      serializeJsonValue(log.result_json ?? log.result),
       log.duration_ms ?? null,
       log.started_at || now,
       log.finished_at || null,
@@ -1981,6 +2093,7 @@ class DatabaseService {
           failed_steps = ?,
           failed_step_index = ?,
           error_message = ?,
+          result_json = ?,
           duration_ms = ?,
           finished_at = ?,
           is_dirty = 1,
@@ -1992,6 +2105,9 @@ class DatabaseService {
       patch.failed_steps ?? existing.failed_steps,
       patch.failed_step_index ?? existing.failed_step_index,
       patch.error_message ?? existing.error_message,
+      patch.result_json !== undefined || patch.result !== undefined
+        ? serializeJsonValue(patch.result_json ?? patch.result)
+        : serializeJsonValue(existing.result_json),
       patch.duration_ms ?? existing.duration_ms,
       patch.finished_at || now,
       now,
@@ -2038,6 +2154,7 @@ class DatabaseService {
       failed_steps: row.failed_steps,
       failed_step_index: row.failed_step_index,
       error_message: row.error_message,
+      result_json: parseJsonObject(row.result_json),
       duration_ms: row.duration_ms,
       started_at: row.started_at,
       finished_at: row.finished_at,
@@ -2048,6 +2165,98 @@ class DatabaseService {
    * Đóng kết nối database an toàn.
    * Nên gọi khi ứng dụng thoát (app.on('before-quit')).
    */
+  getScenarioMeta(scenarioId) {
+    if (!scenarioId) return {};
+    const table = this.db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='scenarios_meta'")
+      .get();
+    if (!table) return {};
+
+    const rows = this.db
+      .prepare('SELECT meta_key, meta_value FROM scenarios_meta WHERE scenario_id = ? ORDER BY meta_key ASC')
+      .all(scenarioId);
+
+    return rows.reduce((meta, row) => {
+      meta[row.meta_key] = parseMetaValue(row.meta_value);
+      return meta;
+    }, {});
+  }
+
+  _replaceScenarioMetaStatement() {
+    const deleteMeta = this.db.prepare('DELETE FROM scenarios_meta WHERE scenario_id = ?');
+    const insertMeta = this.db.prepare(`
+      INSERT INTO scenarios_meta (id, scenario_id, meta_key, meta_value, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(scenario_id, meta_key) DO UPDATE SET
+        meta_value = excluded.meta_value,
+        updated_at = excluded.updated_at
+    `);
+
+    return (scenarioId, meta = {}) => {
+      const now = new Date().toISOString();
+      const entries = Object.entries(meta || {})
+        .filter(([key, value]) => String(key || '').trim() && value !== undefined);
+      deleteMeta.run(scenarioId);
+      entries.forEach(([key, value]) => {
+        insertMeta.run(crypto.randomUUID(), scenarioId, String(key).trim(), serializeMetaValue(value), now);
+      });
+    };
+  }
+
+  setScenarioMetaValue(scenarioId, key, value) {
+    if (!scenarioId || !String(key || '').trim()) return;
+    const now = new Date().toISOString();
+    this.db.prepare(`
+      INSERT INTO scenarios_meta (id, scenario_id, meta_key, meta_value, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(scenario_id, meta_key) DO UPDATE SET
+        meta_value = excluded.meta_value,
+        updated_at = excluded.updated_at
+    `).run(crypto.randomUUID(), scenarioId, String(key).trim(), serializeMetaValue(value), now);
+  }
+
+  _migrateScenarioColumnsToMeta() {
+    const scenariosTable = this.db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='scenarios'")
+      .get();
+    const metaTable = this.db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='scenarios_meta'")
+      .get();
+    if (!scenariosTable || !metaTable) return;
+
+    const columns = this.db.prepare('PRAGMA table_info(scenarios)').all();
+    const columnNames = new Set(columns.map((col) => col.name));
+    const movedColumns = [
+      'result_type',
+      'recorded_width',
+      'recorded_height',
+      'dom_check_anchor',
+      'local_variables',
+      'variable_profile_id',
+    ].filter((name) => columnNames.has(name));
+    if (!movedColumns.length) return;
+
+    const rows = this.db
+      .prepare(`SELECT id, ${movedColumns.join(', ')} FROM scenarios`)
+      .all();
+    const findMeta = this.db
+      .prepare('SELECT 1 FROM scenarios_meta WHERE scenario_id = ? AND meta_key = ?');
+    const insertMeta = this.db.prepare(`
+      INSERT OR IGNORE INTO scenarios_meta (id, scenario_id, meta_key, meta_value, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+    const now = new Date().toISOString();
+
+    rows.forEach((row) => {
+      movedColumns.forEach((key) => {
+        const value = row[key];
+        if (value === null || value === undefined || value === '') return;
+        if (findMeta.get(row.id, key)) return;
+        insertMeta.run(crypto.randomUUID(), row.id, key, serializeMetaValue(value), now);
+      });
+    });
+  }
+
   close() {
     if (this.db) {
       this.db.close();
@@ -2089,11 +2298,85 @@ function parseJsonArray(value) {
   return Array.isArray(parsed) ? parsed : [];
 }
 
+function serializeJsonValue(value) {
+  if (value === undefined || value === null || value === '') return null;
+  if (typeof value === 'string') {
+    try {
+      JSON.parse(value);
+      return value;
+    } catch {
+      return JSON.stringify({ value });
+    }
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return JSON.stringify({ value: String(value) });
+  }
+}
+
+function serializeMetaValue(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function parseMetaValue(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'string') return value;
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return value;
+  }
+}
+
+function buildScenarioMetaForStorage(scenario = {}, existingScenario = null, existingMeta = {}) {
+  const meta = {
+    ...(existingMeta || {}),
+    ...(scenario.meta || {}),
+    ...(scenario.scenario_meta || {}),
+  };
+
+  const readMovedValue = (key, fallback) => (
+    scenario[key] !== undefined
+      ? scenario[key]
+      : (meta[key] !== undefined ? meta[key] : fallback)
+  );
+
+  meta.result_type = normalizeScenarioResultType(
+    readMovedValue('result_type', existingScenario?.result_type || 'simple'),
+  );
+  meta.recorded_width = readMovedValue('recorded_width', existingScenario?.recorded_width ?? null);
+  meta.recorded_height = readMovedValue('recorded_height', existingScenario?.recorded_height ?? null);
+  meta.dom_check_anchor = parseDomCheckAnchor(
+    readMovedValue('dom_check_anchor', existingScenario?.dom_check_anchor ?? null),
+  );
+  meta.local_variables = serializeVariableEntries(
+    normalizeVariableEntries(readMovedValue('local_variables', existingScenario?.local_variables || '[]')),
+  );
+  meta.variable_profile_id = readMovedValue('variable_profile_id', existingScenario?.variable_profile_id ?? null) || null;
+
+  return meta;
+}
+
 const SCENARIO_TYPES = new Set(['prepare', 'crawl', 'action']);
+const SCENARIO_RESULT_TYPES = new Set(['simple', 'list']);
 
 function normalizeScenarioType(value) {
   const normalized = String(value || 'action').trim().toLowerCase();
   return SCENARIO_TYPES.has(normalized) ? normalized : 'action';
+}
+
+function normalizeScenarioResultType(value) {
+  const normalized = String(value || 'simple').trim().toLowerCase();
+  return SCENARIO_RESULT_TYPES.has(normalized) ? normalized : 'simple';
 }
 
 function normalizeScenarioParentId(scenarioType, parentId) {

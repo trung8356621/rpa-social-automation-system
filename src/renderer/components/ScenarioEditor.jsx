@@ -36,8 +36,8 @@ import { useTranslation } from '../i18n/index.jsx';
 import VariableInput from './VariableInput';
 import ScenarioVariablesBar from './ScenarioVariablesBar';
 import DataProfileSelect from './DataProfileSelect';
-import CrawlBrowserPreview from './CrawlBrowserPreview';
-import CrawlWidgetPanel from './CrawlWidgetPanel';
+import CrawlScenarioEditorContent from './CrawlScenarioEditorContent';
+import StandardScenarioEditorContent from './StandardScenarioEditorContent';
 import { normalizeActionType } from '../utils/variables';
 import {
   applyPickToSteps,
@@ -448,7 +448,15 @@ function drawImageContain(ctx, img, canvasWidth, canvasHeight) {
   ctx.drawImage(img, x, y, drawWidth, drawHeight);
 }
 
-function StepCard({ step, index, isSelected, onSelect, onDelete, onUpdate }) {
+function StepCard({
+  step,
+  index,
+  isSelected,
+  isMultiSelected = false,
+  onSelect,
+  onContextMenu,
+  onDelete,
+}) {
   const { t } = useTranslation();
   const config = step.action_config || {};
   const Icon = getAction(step.action_type);
@@ -462,9 +470,12 @@ function StepCard({ step, index, isSelected, onSelect, onDelete, onUpdate }) {
       className={`group relative flex cursor-pointer items-start gap-2 rounded-md border px-2.5 py-2 transition ${
         isSelected
           ? 'border-[#635bff] bg-[#1e2140]'
+          : isMultiSelected
+            ? 'border-[#4c5570] bg-[#1c2231]'
           : 'border-transparent bg-[#171b26] hover:bg-[#1c2130]'
       }`}
-      onClick={() => onSelect(index)}
+      onClick={(event) => onSelect(index, event)}
+      onContextMenu={(event) => onContextMenu?.(index, event)}
     >
       <div className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded bg-[#232838]">
         <Icon className="h-3.5 w-3.5 text-[#9aa7b7]" />
@@ -516,14 +527,37 @@ function ScenarioInfoPanel({
   platform,
   targetUrl,
   scenarioType,
+  resultType,
   parentId,
   domCheckSelector,
+  scenarioMeta,
+  selectedCrawlWidget,
   parentOptions,
   variables,
   onScenarioChange,
 }) {
   const { t } = useTranslation();
   const showParentFields = scenarioType !== 'prepare';
+  const showResultType = scenarioType === 'crawl';
+  const crawlMeta = defaultCrawlMeta(scenarioMeta);
+  const patchCrawlMeta = (patch) => onScenarioChange({
+    nextScenarioMeta: {
+      ...defaultScenarioMeta(scenarioMeta),
+      crawl: {
+        ...crawlMeta,
+        ...patch,
+      },
+    },
+  });
+  const patchAutoscroll = (patch) => patchCrawlMeta({
+    autoscroll: { ...crawlMeta.autoscroll, ...patch },
+  });
+  const patchInfinity = (patch) => patchCrawlMeta({
+    infinity_scroll: { ...crawlMeta.infinity_scroll, ...patch },
+  });
+  const patchCondition = (patch) => patchInfinity({
+    condition: { ...crawlMeta.infinity_scroll.condition, ...patch },
+  });
 
   return (
     <div className="grid grid-cols-2 gap-3">
@@ -540,24 +574,18 @@ function ScenarioInfoPanel({
         </select>
       </label>
 
-      {showParentFields ? (
+      {showResultType && (
         <label className="block">
-          <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">{t('scenarioEditor.info.parentScenario')}</span>
+          <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">{t('scenarioEditor.info.resultType', { defaultValue: 'Result type' })}</span>
           <select
-            value={parentId || ''}
-            onChange={(event) => onScenarioChange({ nextParentId: event.target.value || null })}
+            value={resultType || 'simple'}
+            onChange={(event) => onScenarioChange({ nextResultType: event.target.value })}
             className="select-field h-9"
           >
-            <option value="">{t('scenarioEditor.info.parentNone')}</option>
-            {parentOptions.map((item) => (
-              <option key={item.id} value={item.id}>
-                {item.name}
-              </option>
-            ))}
+            <option value="simple">{t('scenarioEditor.resultTypes.simple', { defaultValue: 'Simple - keep as-is' })}</option>
+            <option value="list">{t('scenarioEditor.resultTypes.list', { defaultValue: 'List - merge by widget label' })}</option>
           </select>
         </label>
-      ) : (
-        <div className="hidden sm:block" />
       )}
 
       <label className="block">
@@ -587,24 +615,149 @@ function ScenarioInfoPanel({
       </label>
 
       {showParentFields && (
-        <label className="col-span-2 block">
-          <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">{t('scenarioEditor.info.domCheck')}</span>
-          <input
-            value={domCheckSelector || ''}
-            onChange={(event) => onScenarioChange({ nextDomCheckSelector: event.target.value })}
-            className="input-field h-9"
-            placeholder={t('scenarioEditor.info.domCheckPlaceholder')}
-          />
-          <span className="mt-1 block text-[11px] leading-relaxed text-[#8b97aa]">
-            {t('scenarioEditor.info.domCheckHint')}
-          </span>
-        </label>
+        <>
+          <label className="block">
+            <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">{t('scenarioEditor.info.parentScenario')}</span>
+            <select
+              value={parentId || ''}
+              onChange={(event) => onScenarioChange({ nextParentId: event.target.value || null })}
+              className="select-field h-9"
+            >
+              <option value="">{t('scenarioEditor.info.parentNone')}</option>
+              {parentOptions.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.name}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="block">
+            <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">{t('scenarioEditor.info.domCheck')}</span>
+            <input
+              value={domCheckSelector || ''}
+              onChange={(event) => onScenarioChange({ nextDomCheckSelector: event.target.value })}
+              className="input-field h-9"
+              placeholder={t('scenarioEditor.info.domCheckPlaceholder')}
+            />
+            <span className="mt-1 block text-[11px] leading-relaxed text-[#8b97aa]">
+              {t('scenarioEditor.info.domCheckHint')}
+            </span>
+          </label>
+        </>
       )}
 
       {showParentFields && (
         <p className="col-span-2 text-[11px] leading-relaxed text-[#8b97aa]">
           {t('scenarioEditor.info.parentHint')}
         </p>
+      )}
+
+      {showResultType && (
+        <div className="col-span-2 grid grid-cols-2 gap-3 rounded border border-[#2a3144] bg-[#101217] p-3">
+          <label className="col-span-2 flex items-center gap-2 text-xs font-semibold text-[#c7d0dc]">
+            <input
+              type="checkbox"
+              checked={crawlMeta.autoscroll.enabled}
+              onChange={(event) => patchAutoscroll({ enabled: event.target.checked })}
+            />
+            Autoscroll
+          </label>
+          <label className="block">
+            <span className="mb-1 block text-[11px] font-semibold text-[#b7c4d8]">Scroll distance (px)</span>
+            <input
+              type="number"
+              min="100"
+              value={crawlMeta.autoscroll.distance_px}
+              onChange={(event) => patchAutoscroll({ distance_px: Number(event.target.value) || 600 })}
+              className="input-field h-8"
+            />
+          </label>
+          <label className="block">
+            <span className="mb-1 block text-[11px] font-semibold text-[#b7c4d8]">Delay (ms)</span>
+            <input
+              type="number"
+              min="100"
+              value={crawlMeta.autoscroll.delay_ms}
+              onChange={(event) => patchAutoscroll({ delay_ms: Number(event.target.value) || 500 })}
+              className="input-field h-8"
+            />
+          </label>
+
+          <label className="col-span-2 mt-1 flex items-center gap-2 text-xs font-semibold text-[#c7d0dc]">
+            <input
+              type="checkbox"
+              checked={crawlMeta.infinity_scroll.enabled}
+              onChange={(event) => patchInfinity({ enabled: event.target.checked })}
+            />
+            Infinity scroll
+          </label>
+          <label className="block">
+            <span className="mb-1 block text-[11px] font-semibold text-[#b7c4d8]">Stop condition</span>
+            <select
+              value={crawlMeta.infinity_scroll.stop_mode}
+              onChange={(event) => patchInfinity({ stop_mode: event.target.value })}
+              className="select-field h-8"
+            >
+              <option value="timeout">Auto stop after time</option>
+              <option value="condition">Stop by result condition</option>
+            </select>
+          </label>
+          <label className="block">
+            <span className="mb-1 block text-[11px] font-semibold text-[#b7c4d8]">Timeout (seconds)</span>
+            <input
+              type="number"
+              min="1"
+              value={Math.round(crawlMeta.infinity_scroll.timeout_ms / 1000)}
+              onChange={(event) => patchInfinity({ timeout_ms: (Number(event.target.value) || 30) * 1000 })}
+              className="input-field h-8"
+            />
+          </label>
+          {crawlMeta.infinity_scroll.stop_mode === 'condition' && (
+            <>
+              <label className="block">
+                <span className="mb-1 block text-[11px] font-semibold text-[#b7c4d8]">Field</span>
+                <input
+                  value={crawlMeta.infinity_scroll.condition.field}
+                  onChange={(event) => patchCondition({ field: event.target.value })}
+                  className="input-field h-8"
+                  placeholder="post_date"
+                />
+              </label>
+              <label className="block">
+                <span className="mb-1 block text-[11px] font-semibold text-[#b7c4d8]">Compare</span>
+                <div className="grid grid-cols-[88px_minmax(0,1fr)] gap-2">
+                  <select
+                    value={crawlMeta.infinity_scroll.condition.operator}
+                    onChange={(event) => patchCondition({ operator: event.target.value })}
+                    className="select-field h-8"
+                  >
+                    <option value="<">&lt;</option>
+                    <option value="<=">&lt;=</option>
+                    <option value=">">&gt;</option>
+                    <option value=">=">&gt;=</option>
+                    <option value="=">=</option>
+                    <option value="!=">!=</option>
+                  </select>
+                  <input
+                    value={crawlMeta.infinity_scroll.condition.value}
+                    onChange={(event) => patchCondition({ value: event.target.value })}
+                    className="input-field h-8"
+                    placeholder="2026-06-30"
+                  />
+                </div>
+              </label>
+            </>
+          )}
+          <button
+            type="button"
+            onClick={() => onScenarioChange({ testCrawlCondition: true })}
+            disabled={!selectedCrawlWidget}
+            className="btn-secondary col-span-2 justify-self-start disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            Run test data
+          </button>
+        </div>
       )}
 
       <label className="col-span-2 block">
@@ -895,6 +1048,35 @@ function readDomCheckSelector(anchor) {
     || '';
 }
 
+function defaultCrawlMeta(meta = {}) {
+  const crawl = meta.crawl || {};
+  return {
+    autoscroll: {
+      enabled: Boolean(crawl.autoscroll?.enabled),
+      distance_px: Number(crawl.autoscroll?.distance_px) || 600,
+      delay_ms: Number(crawl.autoscroll?.delay_ms) || 500,
+    },
+    infinity_scroll: {
+      enabled: Boolean(crawl.infinity_scroll?.enabled),
+      stop_mode: crawl.infinity_scroll?.stop_mode === 'condition' ? 'condition' : 'timeout',
+      timeout_ms: Number(crawl.infinity_scroll?.timeout_ms) || 30000,
+      max_scrolls: Number(crawl.infinity_scroll?.max_scrolls) || 30,
+      condition: {
+        field: crawl.infinity_scroll?.condition?.field || '',
+        operator: crawl.infinity_scroll?.condition?.operator || '<',
+        value: crawl.infinity_scroll?.condition?.value || '',
+      },
+    },
+  };
+}
+
+function defaultScenarioMeta(meta = {}) {
+  return {
+    ...(meta || {}),
+    crawl: defaultCrawlMeta(meta),
+  };
+}
+
 function buildScenarioMetaPayload(draft, extras = {}) {
   const scenarioType = draft.scenarioType || 'action';
   const parentId = scenarioType === 'prepare' ? null : (draft.parentId || null);
@@ -905,6 +1087,10 @@ function buildScenarioMetaPayload(draft, extras = {}) {
     target_url: draft.targetUrl || '',
     browser_profile_id: draft.browserProfileId || null,
     scenario_type: scenarioType,
+    result_type: draft.resultType || 'simple',
+    scenario_meta: {
+      ...defaultScenarioMeta(draft.scenarioMeta),
+    },
     parent_id: parentId,
     dom_check_anchor: scenarioType === 'prepare'
       ? null
@@ -925,11 +1111,15 @@ export default function ScenarioEditor({ scenario, onBack }) {
   const [platform, setPlatform] = useState(scenario?.platform || 'facebook');
   const [targetUrl, setTargetUrl] = useState(scenario?.target_url || '');
   const [scenarioType, setScenarioType] = useState(scenario?.scenario_type || 'action');
+  const [resultType, setResultType] = useState(scenario?.result_type || 'simple');
+  const [scenarioMeta, setScenarioMeta] = useState(defaultScenarioMeta(scenario?.scenario_meta));
   const [parentId, setParentId] = useState(scenario?.parent_id || '');
   const [domCheckSelector, setDomCheckSelector] = useState(readDomCheckSelector(scenario?.dom_check_anchor));
   const [allScenarios, setAllScenarios] = useState([]);
   const [steps, setSteps] = useState(normalizeSteps(scenario?.steps || []));
   const [selectedStepIndex, setSelectedStepIndex] = useState(null);
+  const [selectedStepIndexes, setSelectedStepIndexes] = useState(() => new Set());
+  const [stepContextMenu, setStepContextMenu] = useState(null);
   const [currentScenarioId, setCurrentScenarioId] = useState(scenario?.id || null);
   const [activeViewport, setActiveViewport] = useState({
     width: scenario?.recorded_width || 1280,
@@ -968,6 +1158,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
   const [selectedCrawlWidgetId, setSelectedCrawlWidgetId] = useState(null);
   const undoStackRef = useRef([]);
   const redoStackRef = useRef([]);
+  const stepSelectionAnchorRef = useRef(null);
   const isApplyingHistoryRef = useRef(false);
   const stepEditUndoPushedRef = useRef(false);
   const stepEditUndoTimerRef = useRef(null);
@@ -978,6 +1169,8 @@ export default function ScenarioEditor({ scenario, onBack }) {
     targetUrl: scenario?.target_url || '',
     browserProfileId: scenario?.browser_profile_id || '',
     scenarioType: scenario?.scenario_type || 'action',
+    resultType: scenario?.result_type || 'simple',
+    scenarioMeta: defaultScenarioMeta(scenario?.scenario_meta),
     parentId: scenario?.parent_id || '',
     domCheckSelector: readDomCheckSelector(scenario?.dom_check_anchor),
   });
@@ -1031,7 +1224,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
   // ======== Derived State ========
   const hasSteps = steps.length > 0;
   const isCrawlMode = scenarioType === 'crawl';
-  const isLivePreviewMode = scenarioType === 'crawl' || scenarioType === 'action';
+  const isLivePreviewMode = scenarioType === 'crawl';
   const highlightSelectionAnchor = useMemo(() => (
     getSelectionHighlightAnchor(steps, selectedCrawlWidgetId)
   ), [steps, selectedCrawlWidgetId]);
@@ -1041,6 +1234,9 @@ export default function ScenarioEditor({ scenario, onBack }) {
     : 0;
   const totalTime = Math.max(stepTotalTime, manifestDuration);
   const selectedStep = selectedStepIndex !== null ? steps[selectedStepIndex] : null;
+  const selectedCrawlWidget = useMemo(() => (
+    steps.find((step) => step.id === selectedCrawlWidgetId) || null
+  ), [selectedCrawlWidgetId, steps]);
   const stepPreviewFrames = useMemo(() => (
     steps
       .map((step, index) => {
@@ -1111,6 +1307,15 @@ export default function ScenarioEditor({ scenario, onBack }) {
         setDomCheckSelector('');
       }
     }
+    if (patch.nextResultType !== undefined) {
+      scenarioDraftRef.current.resultType = patch.nextResultType || 'simple';
+      setResultType(patch.nextResultType || 'simple');
+    }
+    if (patch.nextScenarioMeta !== undefined) {
+      const nextMeta = defaultScenarioMeta(patch.nextScenarioMeta);
+      scenarioDraftRef.current.scenarioMeta = nextMeta;
+      setScenarioMeta(nextMeta);
+    }
     if (patch.nextParentId !== undefined) {
       scenarioDraftRef.current.parentId = patch.nextParentId || '';
       setParentId(patch.nextParentId || '');
@@ -1119,7 +1324,30 @@ export default function ScenarioEditor({ scenario, onBack }) {
       scenarioDraftRef.current.domCheckSelector = patch.nextDomCheckSelector;
       setDomCheckSelector(patch.nextDomCheckSelector);
     }
-  }, []);
+    if (patch.testCrawlCondition) {
+      const widget = steps.find((step) => step.id === selectedCrawlWidgetId);
+      if (!widget || !window.electronAPI?.extractCrawlPreviewSample) {
+        dispatch(showToast({ type: 'error', message: 'Select a crawl widget before testing.' }));
+        return;
+      }
+      const anchor = {
+        ...(widget.target_anchor || {}),
+        action_config: {
+          ...((widget.target_anchor || {}).action_config || {}),
+          ...(widget.action_config || {}),
+        },
+      };
+      window.electronAPI.extractCrawlPreviewSample({ anchor, maxCards: 5 })
+        .then((result) => {
+          const first = Array.isArray(result?.sample_dump) ? result.sample_dump[0] : null;
+          dispatch(showToast({
+            type: first ? 'success' : 'info',
+            message: first ? `Test data: ${JSON.stringify(first.data ?? first).slice(0, 180)}` : 'No sample data found.',
+          }));
+        })
+        .catch((error) => dispatch(showToast({ type: 'error', message: error.message || 'Test failed' })));
+    }
+  }, [dispatch, selectedCrawlWidgetId, steps]);
 
   const clearUndoHistory = useCallback(() => {
     undoStackRef.current = [];
@@ -1306,6 +1534,8 @@ export default function ScenarioEditor({ scenario, onBack }) {
           targetUrl: s.target_url || '',
           browserProfileId: s.browser_profile_id || '',
           scenarioType: s.scenario_type || 'action',
+          resultType: s.result_type || 'simple',
+          scenarioMeta: defaultScenarioMeta(s.scenario_meta),
           parentId: s.parent_id || '',
           domCheckSelector: readDomCheckSelector(s.dom_check_anchor),
         };
@@ -1315,6 +1545,8 @@ export default function ScenarioEditor({ scenario, onBack }) {
         setTargetUrl(s.target_url || '');
         setBrowserProfileId(s.browser_profile_id || '');
         setScenarioType(s.scenario_type || 'action');
+        setResultType(s.result_type || 'simple');
+        setScenarioMeta(defaultScenarioMeta(s.scenario_meta));
         setParentId(s.parent_id || '');
         setDomCheckSelector(readDomCheckSelector(s.dom_check_anchor));
         setActiveVariableProfileId(s.variable_profile_id || '');
@@ -1733,13 +1965,45 @@ export default function ScenarioEditor({ scenario, onBack }) {
   }, [pushUndoSnapshot]);
 
   const handleDeleteStep = useCallback((index) => {
+    const targets = selectedStepIndexes.has(index) ? selectedStepIndexes : new Set([index]);
     pushUndoSnapshot();
-    setSteps((prev) => prev.filter((_, i) => i !== index));
-    setSelectedStepIndex((prev) => (prev === index ? null : prev > index ? prev - 1 : prev));
-  }, [pushUndoSnapshot]);
+    setSteps((prev) => prev.filter((_, i) => !targets.has(i)));
+    setSelectedStepIndex((prev) => {
+      if (prev === null || targets.has(prev)) return null;
+      let removedBefore = 0;
+      targets.forEach((target) => {
+        if (target < prev) removedBefore += 1;
+      });
+      return Math.max(0, prev - removedBefore);
+    });
+    setSelectedStepIndexes(new Set());
+    stepSelectionAnchorRef.current = null;
+    setStepContextMenu(null);
+  }, [pushUndoSnapshot, selectedStepIndexes]);
 
-  const handleSelectStep = useCallback((index) => {
+  const handleDeleteSelectedSteps = useCallback(() => {
+    if (!selectedStepIndexes.size) return;
+
+    pushUndoSnapshot();
+    setSteps((prev) => prev.filter((_, i) => !selectedStepIndexes.has(i)));
+    setSelectedStepIndex(null);
+    setSelectedStepIndexes(new Set());
+    stepSelectionAnchorRef.current = null;
+    setStepContextMenu(null);
+  }, [pushUndoSnapshot, selectedStepIndexes]);
+
+  const handleSelectStep = useCallback((index, event = {}) => {
+    if (event.shiftKey && stepSelectionAnchorRef.current !== null) {
+      const anchor = stepSelectionAnchorRef.current;
+      const start = Math.min(anchor, index);
+      const end = Math.max(anchor, index);
+      setSelectedStepIndexes(new Set(Array.from({ length: end - start + 1 }, (_, offset) => start + offset)));
+    } else {
+      setSelectedStepIndexes(new Set([index]));
+      stepSelectionAnchorRef.current = index;
+    }
     setSelectedStepIndex(index);
+    setStepContextMenu(null);
     const step = steps[index];
     if (step) {
       // Seek preview to the step's actual recording time so the correct frame is shown
@@ -1749,6 +2013,22 @@ export default function ScenarioEditor({ scenario, onBack }) {
       setPreviewCurrentTime(Math.max(0, stepTime));
     }
   }, [steps]);
+
+  const handleStepContextMenu = useCallback((index, event) => {
+    event.preventDefault();
+    event.stopPropagation();
+
+    if (!selectedStepIndexes.has(index)) {
+      setSelectedStepIndexes(new Set([index]));
+      setSelectedStepIndex(index);
+      stepSelectionAnchorRef.current = index;
+    }
+
+    setStepContextMenu({
+      x: Math.min(event.clientX, window.innerWidth - 190),
+      y: Math.min(event.clientY, window.innerHeight - 80),
+    });
+  }, [selectedStepIndexes]);
 
   const handleUpdateStep = useCallback((index, updates) => {
     if (!stepEditUndoPushedRef.current) {
@@ -1776,6 +2056,19 @@ export default function ScenarioEditor({ scenario, onBack }) {
       stepEditUndoTimerRef.current = null;
     }
   }, [selectedStepIndex]);
+
+  useEffect(() => {
+    setSelectedStepIndexes((prev) => {
+      const next = new Set([...prev].filter((index) => index >= 0 && index < steps.length));
+      return next.size === prev.size ? prev : next;
+    });
+    if (selectedStepIndex !== null && selectedStepIndex >= steps.length) {
+      setSelectedStepIndex(null);
+    }
+    if (stepSelectionAnchorRef.current !== null && stepSelectionAnchorRef.current >= steps.length) {
+      stepSelectionAnchorRef.current = null;
+    }
+  }, [selectedStepIndex, steps.length]);
 
   const saveScenarioEdits = useCallback(async (nextSteps, nextManifestFrames) => {
     try {
@@ -1961,309 +2254,129 @@ export default function ScenarioEditor({ scenario, onBack }) {
         </div>
       </header>
 
-      <div className={`grid min-h-0 min-w-0 flex-1 overflow-x-hidden ${!isLivePreviewMode && timelineOpen ? 'grid-rows-[minmax(0,1fr)_190px]' : 'grid-rows-[minmax(0,1fr)]'}`}>
-        <div className={`grid min-h-0 min-w-0 overflow-x-hidden ${inspectorOpen
-          ? (isLivePreviewMode
-            ? 'grid-cols-[minmax(520px,1.25fr)_minmax(480px,1fr)]'
-            : 'grid-cols-[minmax(420px,1fr)_minmax(480px,1.1fr)]')
-          : (isLivePreviewMode
-            ? 'grid-cols-[minmax(520px,1.25fr)_minmax(360px,0.9fr)]'
-            : 'grid-cols-[minmax(420px,1fr)_minmax(360px,0.9fr)]')}`}>
-          <section className="flex min-h-0 min-w-0 flex-col overflow-x-hidden border-r border-[#2a2d34]">
-            {isLivePreviewMode ? (
-              <CrawlBrowserPreview
-                scenarioId={currentScenarioId}
-                browserProfileId={browserProfileId}
-                targetUrl={targetUrl || defaultUrl(platform)}
-                browserProfileOptions={browserProfileOptions}
-                onBrowserProfileChange={(value) => updateScenarioDraft({ nextBrowserProfileId: value })}
-                activeViewport={activeViewport}
-                active={!recording && !showRecordMode}
-                isCrawlMode={isCrawlMode}
-                designMode={designMode}
-                onDesignModeChange={setDesignMode}
-              />
-            ) : (
-              <>
-            <div className="flex h-8 shrink-0 items-center justify-between gap-2 border-b border-[#2a2d34] px-3">
-              <label className="flex min-w-0 flex-1 items-center gap-2">
-                <Code2 className="h-3.5 w-3.5 shrink-0 text-[#7288ff]" />
-                <select
-                  value={browserProfileId || ''}
-                  onChange={(event) => updateScenarioDraft({ nextBrowserProfileId: event.target.value || null })}
-                  className="select-field h-7 min-w-0 flex-1 text-xs"
-                >
-                  <option value="">Guest (không lưu profile)</option>
-                  {browserProfileOptions.map((profile) => (
-                    <option key={profile.id} value={profile.id}>
-                      {profile.display_name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <span className="shrink-0 text-[11px] text-[#7e8da5]">RES: {activeViewport.width} x {activeViewport.height}</span>
-            </div>
-
-            <div className="flex min-h-0 flex-1 flex-col p-4">
-              <div className="mx-auto flex w-full max-w-[720px] min-h-0 flex-1 items-center overflow-hidden">
-                <ProgramMonitor
-                  platform={platform}
-                  selectedStep={selectedStep}
-                  targetUrl={targetUrl}
-                  hasSteps={hasSteps}
-                  recording={recording}
-                  previewPlaying={previewPlaying}
-                  currentFrameUrl={currentPreviewFrame?.url || selectedStep?.target_anchor?.associated_frame_url || null}
-                  currentTime={previewCurrentTime}
-                  frameCount={previewFrames.length}
-                />
-              </div>
-
-              <div className="mt-3 flex shrink-0 items-center justify-between">
-                <span className="rounded border border-[#2f3541] bg-[#0b0d12] px-3 py-1.5 text-xs font-semibold text-[#9eb2d0]">
-                  {recording
-                    ? `REC ${formatSeconds(recordStatus?.elapsedMs || 0)} | ${recordStatus?.eventsCount || 0} events`
-                    : `${formatSeconds(previewCurrentTime)} / ${formatSeconds(totalTime || 20000)}`}
-                </span>
-                <div className="flex items-center gap-2">
-                  <button type="button" onClick={() => handleSeek(Math.max(0, previewCurrentTime - 1000))} className="icon-button">
-                    <ChevronLeft className="h-4 w-4" />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleRun}
-                    disabled={!hasSteps || recording}
-                    className="flex h-11 w-11 items-center justify-center rounded-full bg-[#635bff] text-white shadow-lg shadow-[#635bff]/25 disabled:cursor-not-allowed disabled:bg-[#3a4050] disabled:text-[#7e8da5] disabled:shadow-none"
-                  >
-                    {previewPlaying ? <Square className="h-5 w-5 fill-current" /> : <Play className="h-5 w-5 fill-current" />}
-                  </button>
-                  <button type="button" onClick={() => handleSeek(Math.min(totalTime, previewCurrentTime + 1000))} className="icon-button">
-                    <ChevronRight className="h-4 w-4" />
-                  </button>
-                </div>
-                <IconOnly icon={Eye} label="Hiển thị overlay" />
-              </div>
-            </div>
-              </>
-            )}
-          </section>
-
-          <section className="flex min-h-0 min-w-0 flex-col overflow-x-hidden bg-[#14161b]">
-            <PanelSectionHeader
-              icon={Info}
-              title={t('scenarioEditor.info.title')}
-              onToggle={() => setScenarioInfoOpen((current) => !current)}
-              open={scenarioInfoOpen}
-            />
-            {scenarioInfoOpen && (
-              <div className="shrink-0 border-b border-[#2a2d34] bg-[#15171d] p-3">
-                <ScenarioInfoPanel
-                  description={description}
-                  platform={platform}
-                  targetUrl={targetUrl}
-                  scenarioType={scenarioType}
-                  parentId={parentId}
-                  domCheckSelector={domCheckSelector}
-                  parentOptions={parentScenarioOptions}
-                  variables={scenarioVariables}
-                  onScenarioChange={updateScenarioDraft}
-                />
-              </div>
-            )}
-
-            {isCrawlMode ? (
-              <CrawlWidgetPanel
-                steps={steps}
-                selectedWidgetId={selectedCrawlWidgetId}
-                onSelectWidget={setSelectedCrawlWidgetId}
-                onUpdateSteps={(nextSteps) => {
-                  pushUndoSnapshot();
-                  setSteps(normalizeCrawlSteps(nextSteps));
-                }}
-                onDeleteWidget={(widgetId) => {
-                  pushUndoSnapshot();
-                  setSteps(steps.filter((step) => step.id !== widgetId));
-                  if (selectedCrawlWidgetId === widgetId) {
-                    setSelectedCrawlWidgetId(null);
-                    window.electronAPI?.clearCrawlHighlight?.().catch(() => {});
-                  }
-                }}
-                onToast={(payload) => dispatch(showToast(payload))}
-              />
-            ) : (
-            <div className={`grid min-h-0 flex-1 ${inspectorOpen ? 'grid-cols-[40px_minmax(0,1fr)_minmax(260px,300px)]' : 'grid-cols-[40px_minmax(0,1fr)]'}`}>
-              <ActionIconBar onAddStep={addStep} />
-
-              <div className="flex min-h-0 min-w-0 flex-col">
-                <PanelSectionHeader
-                  icon={FolderOpen}
-                  title="List scenario steps"
-                  trailing={(
-                    <div className="flex items-center gap-2">
-                      <span className="text-[#7e8da5]">{steps.length} steps</span>
-                      {!inspectorOpen && (
-                        <button
-                          type="button"
-                          onClick={() => setInspectorOpen(true)}
-                          className="inline-flex items-center gap-1 rounded border border-[#3c465c] px-2 py-0.5 text-[10px] font-normal normal-case text-[#c7d0dc] hover:bg-[#243047]"
-                        >
-                          <PanelRightOpen className="h-3 w-3" />
-                          {t('scenarioEditor.step.editTitle')}
-                        </button>
-                      )}
-                    </div>
-                  )}
-                />
-
-                <div className="min-h-0 flex-1 space-y-2 overflow-y-auto p-3">
-                  {steps.length === 0 ? (
-                    <div className="flex h-full flex-col items-center justify-center text-center">
-                      <FolderOpen className="mb-3 h-12 w-12 text-[#4e586b]" />
-                      <p className="text-sm font-semibold text-white">Chưa có bước nào</p>
-                      <p className="mt-1 text-xs text-[#7e8da5]">Bấm Record hoặc icon bên trái để thêm bước.</p>
-                    </div>
-                  ) : (
-                    steps.map((step, idx) => (
-                      <StepCard
-                        key={step.id || idx}
-                        step={step}
-                        index={idx}
-                        isSelected={idx === selectedStepIndex}
-                        onSelect={handleSelectStep}
-                        onDelete={handleDeleteStep}
-                        onUpdate={(updates) => handleUpdateStep(idx, updates)}
-                      />
-                    ))
-                  )}
-                </div>
-              </div>
-
-              {inspectorOpen && (
-                <div className="flex min-h-0 min-w-0 flex-col border-l border-[#2a2d34] bg-[#15171d]">
-                  <PanelSectionHeader
-                    icon={MousePointer2}
-                    title={t('scenarioEditor.step.editTitle')}
-                    onToggle={() => setStepEditorOpen((current) => !current)}
-                    open={stepEditorOpen}
-                    trailing={(
-                      <div className="flex items-center gap-2">
-                        <span className="max-w-[100px] truncate text-[10px] font-normal normal-case text-[#68758a]">
-                          {selectedStep ? describeStep(selectedStep.action_type, {}, t) : t('scenarioEditor.step.noneSelected')}
-                        </span>
-                        <button
-                          type="button"
-                          onClick={() => setInspectorOpen(false)}
-                          className="inline-flex items-center gap-1 rounded border border-[#3c465c] px-2 py-0.5 text-[10px] font-normal normal-case text-[#c7d0dc] hover:bg-[#243047]"
-                        >
-                          <PanelRightClose className="h-3 w-3" />
-                          {t('scenarioEditor.step.hideForm')}
-                        </button>
-                      </div>
-                    )}
-                  />
-                  {stepEditorOpen && (
-                    <div className="min-h-0 flex-1 overflow-y-auto p-3">
-                      <StepEditPanel
-                        selectedStep={selectedStep}
-                        variables={scenarioVariables}
-                        onStepChange={(updates) => {
-                          if (selectedStepIndex === null) return;
-                          handleUpdateStep(selectedStepIndex, updates);
-                        }}
-                      />
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-            )}
-          </section>
-        </div>
-
-        {(!isLivePreviewMode && timelineOpen) ? (
-          <section className="min-w-0 overflow-x-hidden border-t border-[#2a2d34] bg-[#14161b]">
-            <PanelSectionHeader
-              icon={Timer}
-              title="Timeline keyframes"
-              trailing={(
-                <div className="max-w-[min(100%,720px)] overflow-x-auto">
-                  <div className="flex w-max items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={handleAutoTrim}
-                      disabled={!hasSteps}
-                      className="rounded border border-[#3c465c] px-2 py-1 text-[10px] font-normal normal-case text-[#c7d0dc] hover:bg-[#243047] disabled:cursor-not-allowed disabled:opacity-40"
-                    >
-                      Auto Trim
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setSelectingTrim((current) => !current);
-                        setPendingTrimRange(null);
-                      }}
-                      disabled={!hasSteps}
-                      className={`rounded border px-2 py-1 text-[10px] font-normal normal-case disabled:cursor-not-allowed disabled:opacity-40 ${
-                        selectingTrim
-                          ? 'border-[#635bff] bg-[#2a2550] text-[#c8c4ff]'
-                          : 'border-[#3c465c] text-[#c7d0dc] hover:bg-[#243047]'
-                      }`}
-                    >
-                      Chọn vùng xóa
-                    </button>
-                    {pendingTrimRange && Math.abs(pendingTrimRange.end_ms - pendingTrimRange.start_ms) >= 100 && (
-                      <button
-                        type="button"
-                        onClick={handleSavePendingTrim}
-                        className="rounded border border-[#635bff] bg-[#2a2550] px-2 py-1 text-[10px] font-normal normal-case text-[#c8c4ff] hover:bg-[#342f66]"
-                      >
-                        Xóa vùng đã chọn
-                      </button>
-                    )}
-                    <span className="whitespace-nowrap text-[10px] font-normal normal-case text-[#7e8da5]">KEYFRAME KIM CƯƠNG = HÀNH ĐỘNG</span>
-                    <button
-                      type="button"
-                      onClick={() => setTimelineOpen(false)}
-                      className="inline-flex items-center gap-1 rounded border border-[#3c465c] px-2 py-1 text-[10px] font-normal normal-case text-[#c7d0dc] hover:bg-[#243047]"
-                    >
-                      <ChevronDown className="h-3 w-3" />
-                      Ẩn timeline
-                    </button>
-                  </div>
-                </div>
-              )}
-            />
-            <div className="overflow-x-auto px-4 pb-3 pt-3">
-              <div className="h-24 min-w-[640px]">
-                <Timeline
-                  steps={steps}
-                  currentTime={previewCurrentTime}
-                  totalTime={totalTime || 20000}
-                  onSeek={handleSeek}
-                  selectingTrim={selectingTrim}
-                  pendingTrimRange={pendingTrimRange}
-                  onTrimRangeChange={(range) => setPendingTrimRange(normalizeTrimRanges([range], totalTime || 20000)[0] || null)}
-                />
-              </div>
-            </div>
-          </section>
-        ) : !isLivePreviewMode ? (
-          <div className="flex h-8 shrink-0 items-center justify-between border-t border-[#2a2d34] bg-[#14161b] px-3">
-            <span className="inline-flex items-center gap-2 text-[11px] font-bold uppercase text-[#7288ff]">
-              <Timer className="h-3.5 w-3.5" />
-              Timeline keyframes
-            </span>
-            <button
-              type="button"
-              onClick={() => setTimelineOpen(true)}
-              className="inline-flex items-center gap-1 rounded border border-[#3c465c] px-2 py-1 text-[10px] text-[#c7d0dc] hover:bg-[#243047]"
-            >
-              <ChevronRight className="h-3 w-3 rotate-[-90deg]" />
-              Hiện timeline
-            </button>
-          </div>
-        ) : null}
-      </div>
+      {isCrawlMode ? (
+        <CrawlScenarioEditorContent
+          currentScenarioId={currentScenarioId}
+          browserProfileId={browserProfileId}
+          targetUrl={targetUrl}
+          defaultTargetUrl={defaultUrl(platform)}
+          browserProfileOptions={browserProfileOptions}
+          onBrowserProfileChange={(value) => updateScenarioDraft({ nextBrowserProfileId: value })}
+          activeViewport={activeViewport}
+          active={!recording && !showRecordMode}
+          designMode={designMode}
+          onDesignModeChange={setDesignMode}
+          inspectorOpen={inspectorOpen}
+          scenarioInfoOpen={scenarioInfoOpen}
+          onScenarioInfoToggle={() => setScenarioInfoOpen((current) => !current)}
+          ScenarioInfoPanelComponent={ScenarioInfoPanel}
+          PanelSectionHeaderComponent={PanelSectionHeader}
+          scenarioInfoProps={{
+            title: t('scenarioEditor.info.title'),
+            description,
+            platform,
+            targetUrl,
+            scenarioType,
+            resultType,
+            parentId,
+            domCheckSelector,
+            scenarioMeta,
+            selectedCrawlWidget,
+            parentOptions: parentScenarioOptions,
+            variables: scenarioVariables,
+            onScenarioChange: updateScenarioDraft,
+          }}
+          steps={steps}
+          selectedCrawlWidgetId={selectedCrawlWidgetId}
+          onSelectCrawlWidget={setSelectedCrawlWidgetId}
+          onUpdateCrawlSteps={(nextSteps, options = {}) => {
+            if (!options.skipUndo) pushUndoSnapshot();
+            setSteps(normalizeCrawlSteps(nextSteps));
+          }}
+          onDeleteCrawlWidget={(widgetId) => {
+            pushUndoSnapshot();
+            setSteps(steps.filter((step) => step.id !== widgetId));
+            if (selectedCrawlWidgetId === widgetId) {
+              setSelectedCrawlWidgetId(null);
+              window.electronAPI?.clearCrawlHighlight?.().catch(() => {});
+            }
+          }}
+          onToast={(payload) => dispatch(showToast(payload))}
+        />
+      ) : (
+        <StandardScenarioEditorContent
+          inspectorOpen={inspectorOpen}
+          setInspectorOpen={setInspectorOpen}
+          timelineOpen={timelineOpen}
+          setTimelineOpen={setTimelineOpen}
+          scenarioInfoOpen={scenarioInfoOpen}
+          setScenarioInfoOpen={setScenarioInfoOpen}
+          stepEditorOpen={stepEditorOpen}
+          setStepEditorOpen={setStepEditorOpen}
+          PanelSectionHeaderComponent={PanelSectionHeader}
+          ActionIconBarComponent={ActionIconBar}
+          IconOnlyComponent={IconOnly}
+          ProgramMonitorComponent={ProgramMonitor}
+          StepCardComponent={StepCard}
+          StepEditPanelComponent={StepEditPanel}
+          TimelineComponent={Timeline}
+          ScenarioInfoPanelComponent={ScenarioInfoPanel}
+          scenarioInfoProps={{
+            title: t('scenarioEditor.info.title'),
+            description,
+            platform,
+            targetUrl,
+            scenarioType,
+            resultType,
+            parentId,
+            domCheckSelector,
+            scenarioMeta,
+            selectedCrawlWidget,
+            parentOptions: parentScenarioOptions,
+            variables: scenarioVariables,
+            onScenarioChange: updateScenarioDraft,
+          }}
+          t={t}
+          browserProfileId={browserProfileId}
+          browserProfileOptions={browserProfileOptions}
+          onBrowserProfileChange={(value) => updateScenarioDraft({ nextBrowserProfileId: value })}
+          activeViewport={activeViewport}
+          platform={platform}
+          targetUrl={targetUrl}
+          selectedStep={selectedStep}
+          hasSteps={hasSteps}
+          recording={recording}
+          previewPlaying={previewPlaying}
+          currentFrameUrl={currentPreviewFrame?.url || selectedStep?.target_anchor?.associated_frame_url || null}
+          previewCurrentTime={previewCurrentTime}
+          totalTime={totalTime}
+          recordStatus={recordStatus}
+          previewFrames={previewFrames}
+          formatSeconds={formatSeconds}
+          describeStep={describeStep}
+          handleSeek={handleSeek}
+          handleRun={handleRun}
+          steps={steps}
+          addStep={addStep}
+          selectedStepIndex={selectedStepIndex}
+          selectedStepIndexes={selectedStepIndexes}
+          handleSelectStep={handleSelectStep}
+          handleStepContextMenu={handleStepContextMenu}
+          handleDeleteStep={handleDeleteStep}
+          handleDeleteSelectedSteps={handleDeleteSelectedSteps}
+          handleUpdateStep={handleUpdateStep}
+          stepContextMenu={stepContextMenu}
+          setStepContextMenu={setStepContextMenu}
+          scenarioVariables={scenarioVariables}
+          selectingTrim={selectingTrim}
+          setSelectingTrim={setSelectingTrim}
+          pendingTrimRange={pendingTrimRange}
+          setPendingTrimRange={setPendingTrimRange}
+          normalizeTrimRanges={normalizeTrimRanges}
+          handleAutoTrim={handleAutoTrim}
+          handleSavePendingTrim={handleSavePendingTrim}
+        />
+      )}
 
       {/* ===== Record Mode Modal ===== */}
       {showRecordMode && (

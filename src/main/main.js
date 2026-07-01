@@ -223,15 +223,25 @@ function registerDatabaseHandlers() {
         FROM scenarios s
         LEFT JOIN scenario_steps st ON st.scenario_id = s.id
         GROUP BY s.id
-        ORDER BY s.updated_at DESC
+        ORDER BY s.is_pinned DESC, s.updated_at DESC
       `)
       .all();
-    return scenarios.map((scenario) => ({
-      ...scenario,
-      preview_url: scenario.preview_path
-        ? `rpa-cache://file/${Buffer.from(scenario.preview_path).toString('base64url')}`
-        : null,
-    }));
+    return scenarios.map((scenario) => {
+      const meta = dbService.getScenarioMeta(scenario.id);
+      return {
+        ...scenario,
+        result_type: meta.result_type || scenario.result_type,
+        recorded_width: Number(meta.recorded_width ?? scenario.recorded_width) || null,
+        recorded_height: Number(meta.recorded_height ?? scenario.recorded_height) || null,
+        dom_check_anchor: meta.dom_check_anchor ?? scenario.dom_check_anchor,
+        local_variables: meta.local_variables ?? scenario.local_variables,
+        variable_profile_id: meta.variable_profile_id ?? scenario.variable_profile_id,
+        scenario_meta: meta,
+        preview_url: scenario.preview_path
+          ? `rpa-cache://file/${Buffer.from(scenario.preview_path).toString('base64url')}`
+          : null,
+      };
+    });
   });
 
   /**
@@ -253,6 +263,26 @@ function registerDatabaseHandlers() {
 
   ipcMain.handle('db:delete-scenario', (_event, id) => {
     return dbService.deleteScenario(id);
+  });
+
+  ipcMain.handle('db:set-scenario-pinned', (_event, { id, isPinned }) => {
+    return dbService.setScenarioPinned(id, isPinned);
+  });
+
+  ipcMain.handle('db:get-tasks', () => {
+    return dbService.getTasks();
+  });
+
+  ipcMain.handle('db:get-task', (_event, id) => {
+    return dbService.getTaskById(id);
+  });
+
+  ipcMain.handle('db:save-task', (_event, task) => {
+    return dbService.saveTask(task);
+  });
+
+  ipcMain.handle('db:delete-task', (_event, id) => {
+    return dbService.deleteTask(id);
   });
 
   ipcMain.handle('db:get-executions', (_event, limit) => {
@@ -494,6 +524,14 @@ function registerDatabaseHandlers() {
       return await embeddedBrowserService.clearHighlight();
     } catch (error) {
       return { cleared: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('scenario:crawl-preview:extract-sample', async (_event, payload) => {
+    try {
+      return await embeddedBrowserService.extractCrawlSample(payload?.anchor || null, payload?.maxCards || 100);
+    } catch (error) {
+      return { ok: false, error: 'crawl_extract_failed', message: error.message };
     }
   });
 

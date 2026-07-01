@@ -1,6 +1,7 @@
-import React, { useState } from 'react';
-import { ArrowUpFromLine, MousePointer2, Trash2 } from 'lucide-react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { MousePointer2 } from 'lucide-react';
 import { useTranslation } from '../i18n';
+import CrawlWidgetSettings from './CrawlWidgetSettings';
 import {
   applyPromoteToParentToStep,
   describeCrawlSelector,
@@ -8,70 +9,6 @@ import {
   patchStepAnchor,
   updateCrawlStepConfig,
 } from '../utils/crawlWidget';
-
-function SelectorFields({ anchor, onChange, onPromoteToParent, promoting }) {
-  const { t } = useTranslation();
-  const selectorValue = anchor?.parent_container_selector || anchor?.selector_value || '';
-
-  return (
-    <div className="space-y-2 rounded border border-[#2a3144] bg-[#101217] p-2">
-      <div className="flex items-end gap-2">
-        <label className="block min-w-0 flex-1">
-          <span className="mb-1 block text-[10px] font-semibold text-[#b7c4d8]">
-            {t('crawlWidget.parentCardSelector')}
-          </span>
-          <input
-            value={selectorValue}
-            onChange={(event) => onChange({
-              parent_container_selector: event.target.value,
-              selector_value: event.target.value,
-              xpath: '',
-            })}
-            className="input-field h-8 font-mono text-[11px]"
-            placeholder="div.x1abc123..."
-          />
-        </label>
-        <button
-          type="button"
-          onClick={onPromoteToParent}
-          disabled={promoting}
-          title={t('crawlWidget.toParentHint')}
-          className="inline-flex h-8 shrink-0 items-center gap-1 rounded border border-[#3c465c] px-2 text-[10px] font-semibold text-[#c7d0dc] hover:bg-[#243047] disabled:cursor-not-allowed disabled:opacity-60"
-        >
-          <ArrowUpFromLine className="h-3.5 w-3.5" />
-          {t('crawlWidget.toParent')}
-        </button>
-      </div>
-      {anchor?.card_class && (
-        <p className="text-[10px] text-[#8b97aa]">
-          {t('crawlWidget.primaryClass')}: <span className="font-mono text-[#c7d0dc]">{anchor.card_class}</span>
-        </p>
-      )}
-      <p className="text-[10px] leading-relaxed text-[#8b97aa]">{t('crawlWidget.parentSelectorHint')}</p>
-    </div>
-  );
-}
-
-function SampleDumpPreview({ sampleDump = [], matchCount = 0 }) {
-  const { t } = useTranslation();
-  if (!sampleDump?.length) return null;
-
-  return (
-    <div className="rounded border border-[#2a3144] bg-[#101217] p-2">
-      <div className="mb-2 flex items-center justify-between gap-2">
-        <p className="text-[10px] font-semibold uppercase text-[#7288ff]">{t('crawlWidget.sampleDump')}</p>
-        {matchCount > 0 && (
-          <span className="rounded bg-[#232838] px-1.5 py-0.5 text-[10px] text-[#9aa7b7]">
-            {t('crawlWidget.matchCount', { count: matchCount })}
-          </span>
-        )}
-      </div>
-      <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-all font-mono text-[10px] leading-relaxed text-[#b7c4d8]">
-        {JSON.stringify(sampleDump, null, 2)}
-      </pre>
-    </div>
-  );
-}
 
 export default function CrawlWidgetPanel({
   steps,
@@ -83,9 +20,23 @@ export default function CrawlWidgetPanel({
 }) {
   const { t } = useTranslation();
   const [promoting, setPromoting] = useState(false);
+  const sampleRequestRef = useRef(0);
   const crawlSteps = steps.filter((step) => step.action_type === 'crawl');
   const selectedWidget = crawlSteps.find((step) => step.id === selectedWidgetId);
   const selectedConfig = selectedWidget ? getCrawlActionConfig(selectedWidget) : null;
+  const liveSampleSignature = useMemo(() => {
+    if (!selectedWidget || !selectedConfig) return '';
+    return JSON.stringify({
+      id: selectedWidget.id,
+      selector: selectedConfig.parent_container_selector
+        || selectedWidget.target_anchor?.parent_container_selector
+        || selectedWidget.target_anchor?.selector_value
+        || '',
+      selectorMode: selectedConfig.selector_mode,
+      resultMode: selectedConfig.result_mode,
+      patterns: selectedConfig.result_patterns,
+    });
+  }, [selectedConfig, selectedWidget]);
 
   const handleWidgetPatch = (patch) => {
     if (!selectedWidget) return;
@@ -106,6 +57,48 @@ export default function CrawlWidgetPanel({
     }
     onUpdateSteps(steps.map((step) => (step.id === selectedWidget.id ? next : step)));
   };
+
+  useEffect(() => {
+    if (!selectedWidget || !selectedConfig || !window.electronAPI?.extractCrawlPreviewSample) return undefined;
+
+    const selector = selectedConfig.parent_container_selector
+      || selectedWidget.target_anchor?.parent_container_selector
+      || selectedWidget.target_anchor?.selector_value
+      || '';
+    if (!selector) return undefined;
+
+    const requestId = sampleRequestRef.current + 1;
+    sampleRequestRef.current = requestId;
+    const anchor = {
+      ...(selectedWidget.target_anchor || {}),
+      parent_container_selector: selector,
+      selector_value: selector,
+      action_config: {
+        ...(selectedWidget.target_anchor?.action_config || {}),
+        ...selectedConfig,
+        parent_container_selector: selector,
+      },
+    };
+
+    const timer = setTimeout(async () => {
+      try {
+        window.electronAPI?.highlightCrawlAnchor?.(anchor).catch(() => {});
+        const result = await window.electronAPI.extractCrawlPreviewSample({ anchor, maxCards: 100 });
+        if (sampleRequestRef.current !== requestId || !result?.ok) return;
+
+        const cards = Array.isArray(result.sample_dump) ? result.sample_dump : [];
+        const next = updateCrawlStepConfig(selectedWidget, {
+          sample_dump: cards,
+          match_count: Number(result.match_count) || 0,
+        });
+        onUpdateSteps(steps.map((step) => (step.id === selectedWidget.id ? next : step)), { skipUndo: true });
+      } catch {
+        // Live sample refresh should never block manual editing.
+      }
+    }, 350);
+
+    return () => clearTimeout(timer);
+  }, [liveSampleSignature]);
 
   const handlePromoteToParent = async () => {
     if (!selectedWidget || !window.electronAPI?.promoteCrawlSelectorToParent) return;
@@ -196,43 +189,15 @@ export default function CrawlWidgetPanel({
           {t('crawlWidget.settingsTitle')}
         </div>
         <div className="min-h-0 flex-1 overflow-y-auto p-3">
-          {!selectedWidget ? (
-            <div className="rounded border border-[#2a3144] bg-[#101217] px-3 py-6 text-center text-xs text-[#8b97aa]">
-              {t('crawlWidget.selectPrompt')}
-            </div>
-          ) : (
-            <div className="space-y-3">
-              <label className="block">
-                <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">{t('crawlWidget.label')}</span>
-                <input
-                  value={selectedConfig.label || ''}
-                  onChange={(event) => handleWidgetPatch({ label: event.target.value })}
-                  className="input-field h-9"
-                />
-              </label>
-
-              <SelectorFields
-                anchor={selectedWidget.target_anchor}
-                onChange={handleWidgetAnchorPatch}
-                onPromoteToParent={handlePromoteToParent}
-                promoting={promoting}
-              />
-
-              <SampleDumpPreview
-                sampleDump={selectedConfig.sample_dump}
-                matchCount={selectedConfig.match_count}
-              />
-
-              <button
-                type="button"
-                onClick={() => onDeleteWidget(selectedWidget.id)}
-                className="inline-flex items-center gap-1 rounded border border-[#4c2b35] px-2 py-1 text-[11px] text-[#ff8fa0] hover:bg-[#2f1b22]"
-              >
-                <Trash2 className="h-3.5 w-3.5" />
-                {t('crawlWidget.deleteWidget')}
-              </button>
-            </div>
-          )}
+          <CrawlWidgetSettings
+            selectedWidget={selectedWidget}
+            selectedConfig={selectedConfig}
+            onWidgetPatch={handleWidgetPatch}
+            onWidgetAnchorPatch={handleWidgetAnchorPatch}
+            onPromoteToParent={handlePromoteToParent}
+            promoting={promoting}
+            onDeleteWidget={onDeleteWidget}
+          />
         </div>
       </div>
     </div>
