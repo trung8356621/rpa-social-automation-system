@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Download, ExternalLink, Loader2, RefreshCw } from 'lucide-react';
+import { Download, Copy, ExternalLink, Loader2, RefreshCw } from 'lucide-react';
 import { useDispatch } from 'react-redux';
 import { useTranslation } from '../i18n';
 import { buildCsvContent } from '../utils/exportTableCsv';
@@ -14,6 +14,12 @@ function formatDate(value, locale) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return String(value);
   return date.toLocaleString(locale);
+}
+
+function formatCount(value) {
+  const count = Number(value);
+  if (!Number.isFinite(count) || count < 0) return '0';
+  return String(Math.floor(count));
 }
 
 function truncateText(value, max = 180) {
@@ -203,6 +209,23 @@ export default function FacebookDataPage() {
     }
   }, [dispatch, t]);
 
+  const copyPostLink = useCallback(async (url) => {
+    const target = String(url || '').trim();
+    if (!target) return;
+    try {
+      await navigator.clipboard.writeText(target);
+      dispatch(showToast({
+        type: 'success',
+        message: t('facebookData.toast.copyLinkSuccess'),
+      }));
+    } catch (copyError) {
+      dispatch(showToast({
+        type: 'error',
+        message: copyError.message || t('facebookData.toast.copyLinkFailed'),
+      }));
+    }
+  }, [dispatch, t]);
+
   const postColumns = useMemo(() => ([
     {
       key: 'post_author',
@@ -217,24 +240,62 @@ export default function FacebookDataPage() {
       accessor: (row) => row.post_content || '',
     },
     {
+      key: 'like_count',
+      label: t('facebookData.studio.columns.likeCount'),
+      render: (row) => formatCount(row.like_count),
+      accessor: (row) => formatCount(row.like_count),
+    },
+    {
+      key: 'share_count',
+      label: t('facebookData.studio.columns.shareCount'),
+      render: (row) => formatCount(row.share_count),
+      accessor: (row) => formatCount(row.share_count),
+    },
+    {
+      key: 'comment_count',
+      label: t('facebookData.studio.columns.commentCount'),
+      render: (row) => formatCount(row.comment_count),
+      accessor: (row) => formatCount(row.comment_count),
+    },
+    {
       key: 'post_link',
       label: t('facebookData.studio.columns.postLink'),
       render: (row) => (
         row.post_link ? (
-          <button
-            type="button"
-            onClick={(event) => {
-              event.stopPropagation();
-              openExternalLink(row.post_link);
-            }}
-            className="inline-flex items-center gap-1 text-left text-[#8ec0ff] hover:underline"
-          >
-            <span>{truncateText(row.post_link, 56)}</span>
-            <ExternalLink className="h-3.5 w-3.5 shrink-0" />
-          </button>
+          <div className="inline-flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                openExternalLink(row.post_link);
+              }}
+              className="inline-flex min-w-0 items-center gap-1 text-left text-[#8ec0ff] hover:underline"
+            >
+              <span>{truncateText(row.post_link, 56)}</span>
+              <ExternalLink className="h-3.5 w-3.5 shrink-0" />
+            </button>
+            <button
+              type="button"
+              title={t('facebookData.studio.copyLink')}
+              aria-label={t('facebookData.studio.copyLink')}
+              onClick={(event) => {
+                event.stopPropagation();
+                copyPostLink(row.post_link);
+              }}
+              className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded border border-[#2f3a4d] text-[#9eb4d6] hover:border-[#3f6fd6] hover:text-[#c7ddff]"
+            >
+              <Copy className="h-3.5 w-3.5" />
+            </button>
+          </div>
         ) : '—'
       ),
       accessor: (row) => row.post_link || '',
+    },
+    {
+      key: 'post_date',
+      label: t('facebookData.studio.columns.postDate'),
+      render: (row) => row.post_date || '—',
+      accessor: (row) => row.post_date || '',
     },
     {
       key: 'crawled_at',
@@ -242,7 +303,7 @@ export default function FacebookDataPage() {
       render: (row) => formatDate(row.crawled_at, dateLocale),
       accessor: (row) => formatDate(row.crawled_at, dateLocale),
     },
-  ]), [dateLocale, openExternalLink, t]);
+  ]), [copyPostLink, dateLocale, openExternalLink, t]);
 
   const commentColumns = useMemo(() => ([
     {
@@ -256,6 +317,12 @@ export default function FacebookDataPage() {
       label: t('facebookData.studio.columns.commentContent'),
       render: (row) => truncateText(row.comment_content, 260),
       accessor: (row) => row.comment_content || '',
+    },
+    {
+      key: 'like_count',
+      label: t('facebookData.studio.columns.likeCount'),
+      render: (row) => formatCount(row.like_count),
+      accessor: (row) => formatCount(row.like_count),
     },
     {
       key: 'crawled_at',

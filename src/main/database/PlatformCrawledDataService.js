@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { extractFacebookGroupSlug } from '../../shared/parseFacebookGraphQL.js';
+import { parseInteractionCount } from '../../shared/facebookInteractionCounts.js';
 
 const DEFAULT_UNKNOWN_AUTHOR = 'unknown_author';
 
@@ -110,12 +111,17 @@ export class PlatformCrawledDataService {
         VALUES (?, ?, ?)
       `);
       const upsertPost = db.prepare(`
-        INSERT OR REPLACE INTO posts (post_id, group_id, author_id, post_link, post_content)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT OR REPLACE INTO posts (
+          post_id, group_id, author_id, post_link, post_content, post_date,
+          like_count, share_count, comment_count
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       const upsertComment = db.prepare(`
-        INSERT OR REPLACE INTO comments (comment_id, post_id, author_id, comment_content)
-        VALUES (?, ?, ?, ?)
+        INSERT OR REPLACE INTO comments (
+          comment_id, post_id, author_id, comment_content, like_count
+        )
+        VALUES (?, ?, ?, ?, ?)
       `);
 
       const saveTx = db.transaction(() => {
@@ -137,6 +143,10 @@ export class PlatformCrawledDataService {
           postAuthorId,
           normalizedPost.post_link || '',
           normalizedPost.post_content || '',
+          normalizedPost.post_date || null,
+          normalizedPost.like_count,
+          normalizedPost.share_count,
+          normalizedPost.comment_count,
         );
 
         (normalizedPost.comments || []).forEach((comment, index) => {
@@ -162,6 +172,7 @@ export class PlatformCrawledDataService {
             normalizedPost.post_id,
             commentAuthorId,
             comment?.comment_content || '',
+            parseInteractionCount(comment?.like_count),
           );
         });
       });
@@ -324,11 +335,15 @@ export class PlatformCrawledDataService {
         p.author_id,
         p.post_link,
         p.post_content,
+        p.post_date,
+        p.like_count,
+        p.share_count,
+        p.comment_count,
         p.crawled_at,
         g.group_name,
         a.author_name,
         a.author_name AS post_author,
-        (SELECT COUNT(*) FROM comments c WHERE c.post_id = p.post_id) AS comment_count
+        (SELECT COUNT(*) FROM comments c WHERE c.post_id = p.post_id) AS crawled_comment_count
       FROM posts p
       LEFT JOIN groups g ON g.group_id = p.group_id
       LEFT JOIN authors a ON a.author_id = p.author_id
@@ -347,7 +362,7 @@ export class PlatformCrawledDataService {
       params.push(like, like, like, like);
     }
 
-    sql += ' ORDER BY p.crawled_at DESC LIMIT ? OFFSET ?';
+    sql += ' ORDER BY COALESCE(p.post_date, p.crawled_at) DESC LIMIT ? OFFSET ?';
     params.push(limit, offset);
 
     return db.prepare(sql).all(...params);
@@ -369,6 +384,7 @@ export class PlatformCrawledDataService {
         c.post_id,
         c.author_id,
         c.comment_content,
+        c.like_count,
         c.crawled_at,
         a.author_name,
         a.author_name AS comment_author,
@@ -447,6 +463,10 @@ export function initFacebookSchema(db) {
       author_id TEXT NOT NULL,
       post_link TEXT,
       post_content TEXT,
+      post_date TEXT,
+      like_count INTEGER NOT NULL DEFAULT 0,
+      share_count INTEGER NOT NULL DEFAULT 0,
+      comment_count INTEGER NOT NULL DEFAULT 0,
       crawled_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (group_id) REFERENCES groups(group_id),
       FOREIGN KEY (author_id) REFERENCES authors(author_id)
@@ -457,11 +477,38 @@ export function initFacebookSchema(db) {
       post_id TEXT NOT NULL,
       author_id TEXT NOT NULL,
       comment_content TEXT,
+      like_count INTEGER NOT NULL DEFAULT 0,
       crawled_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (post_id) REFERENCES posts(post_id),
       FOREIGN KEY (author_id) REFERENCES authors(author_id)
     );
   `);
+
+  migrateFacebookSchema(db);
+}
+
+function migrateFacebookSchema(db) {
+  const postColumns = db.prepare('PRAGMA table_info(posts)').all();
+  const postColumnNames = new Set(postColumns.map((col) => col.name));
+
+  if (!postColumnNames.has('post_date')) {
+    db.exec('ALTER TABLE posts ADD COLUMN post_date TEXT');
+  }
+  if (!postColumnNames.has('like_count')) {
+    db.exec('ALTER TABLE posts ADD COLUMN like_count INTEGER NOT NULL DEFAULT 0');
+  }
+  if (!postColumnNames.has('share_count')) {
+    db.exec('ALTER TABLE posts ADD COLUMN share_count INTEGER NOT NULL DEFAULT 0');
+  }
+  if (!postColumnNames.has('comment_count')) {
+    db.exec('ALTER TABLE posts ADD COLUMN comment_count INTEGER NOT NULL DEFAULT 0');
+  }
+
+  const commentColumns = db.prepare('PRAGMA table_info(comments)').all();
+  const commentColumnNames = new Set(commentColumns.map((col) => col.name));
+  if (!commentColumnNames.has('like_count')) {
+    db.exec('ALTER TABLE comments ADD COLUMN like_count INTEGER NOT NULL DEFAULT 0');
+  }
 }
 
 /**
@@ -493,12 +540,17 @@ function normalizePlatform(platform) {
 }
 
 function normalizeFacebookPostInput(postData = {}) {
+  const postDate = postData.post_date ? String(postData.post_date).trim() : '';
   return {
     post_id: postData.post_id ? String(postData.post_id) : '',
     post_author: postData.post_author ? String(postData.post_author) : '',
     author_link: postData.author_link ? String(postData.author_link) : null,
     post_link: postData.post_link ? String(postData.post_link) : '',
     post_content: postData.post_content ? String(postData.post_content) : '',
+    post_date: postDate || null,
+    like_count: parseInteractionCount(postData.like_count),
+    share_count: parseInteractionCount(postData.share_count),
+    comment_count: parseInteractionCount(postData.comment_count),
     comments: Array.isArray(postData.comments) ? postData.comments : [],
   };
 }

@@ -11,6 +11,8 @@ export const defaultSettings = {
   'automation.maxRetries': 3,
   'automation.screenshotOnError': true,
   'execution.browserCloseDelayMs': 5000,
+  'facebook.crawlGroupScenarioId': '',
+  'facebook.crawlCommentScenarioId': '',
 };
 
 export const fetchSettings = createAsyncThunk(

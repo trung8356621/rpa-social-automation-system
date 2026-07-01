@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft,
   ArrowRight,
@@ -16,6 +16,7 @@ import {
   X,
 } from 'lucide-react';
 import { useTranslation } from '../i18n';
+import { resolveVariableTemplate } from '@shared/variableTemplate.js';
 
 function readBounds(element) {
   if (!element) return null;
@@ -36,6 +37,7 @@ export default function CrawlBrowserPreview({
   scenarioId,
   browserProfileId,
   targetUrl,
+  scenarioVariables = [],
   browserProfileOptions = [],
   onBrowserProfileChange,
   activeViewport,
@@ -156,10 +158,15 @@ export default function CrawlBrowserPreview({
     });
   }, []);
 
-  useEffect(() => {
-    if (!state.attached || !targetUrl || !window.electronAPI?.navigateCrawlPreview) return undefined;
+  const resolvedTargetUrl = useMemo(
+    () => resolveVariableTemplate(targetUrl || '', scenarioVariables),
+    [scenarioVariables, targetUrl],
+  );
 
-    const desiredUrl = normalizePreviewUrl(targetUrl);
+  useEffect(() => {
+    if (!state.attached || !resolvedTargetUrl || !window.electronAPI?.navigateCrawlPreview) return undefined;
+
+    const desiredUrl = normalizePreviewUrl(resolvedTargetUrl);
     const currentUrl = normalizePreviewUrl(state.url);
     if (!desiredUrl || desiredUrl === currentUrl) return undefined;
 
@@ -170,10 +177,12 @@ export default function CrawlBrowserPreview({
       }).then((next) => {
         if (next?.url) setUrlInput(next.url);
         if (next) setState(next);
-      }).catch(() => {});
+      }).catch((err) => {
+        setError(err?.message || t('scenarioEditor.crawlPreview.actionFailed'));
+      });
     }, 200);
     return () => clearTimeout(timer);
-  }, [scenarioId, state.attached, state.url, targetUrl]);
+  }, [resolvedTargetUrl, scenarioId, state.attached, state.url, t, targetUrl]);
 
   useEffect(() => {
     const host = hostRef.current;

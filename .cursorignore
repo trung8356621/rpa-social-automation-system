@@ -1,0 +1,8 @@
+# Cấm Cursor quét thư mục build và thư mục lưu database/log
+node_modules/
+dist/
+build/
+*.db
+*.db-journal
+logs/
+.git/

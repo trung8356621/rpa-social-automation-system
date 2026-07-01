@@ -5,7 +5,7 @@ const uiSlice = createSlice({
   initialState: {
     sidebarOpen: true,
     currentView: 'scenarios', // 'scenarios' | 'facebookData'
-    facebookDataPage: 'posts', // 'posts' | 'members' | 'groups'
+    facebookDataPage: 'studio', // 'studio' | 'settings'
     currentPage: 'dashboard',
     modalOpen: null, // null | 'createScenario' | 'confirmDelete' | 'executionDetail'
     modalData: null,

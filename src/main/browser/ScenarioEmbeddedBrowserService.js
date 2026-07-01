@@ -14,10 +14,23 @@ import { getCrawlExtractionScript } from '../rpa/CardExtractorScript.js';
 import { buildPreviewPartition, invalidateProfileCookieCache, syncProfileCookiesToSession } from './ProfileCookieSync.js';
 import { RequestCatchingPreviewBridge } from './RequestCatchingPreviewBridge.js';
 import { RequestCatchingDumpService } from '../rpa/RequestCatchingDumpService.js';
+import { parseFacebookGraphQLBatch } from '../../shared/parseFacebookGraphQL.js';
+import { crawlConditionMatched } from '../../shared/crawlStopCondition.js';
+import {
+  isCrawlScrollAtBottom,
+  isCrawlScrollStuck,
+  runCrawlScrollStep,
+} from '../../shared/crawlScroll.js';
+import { resolveVariableTemplate } from '../rpa/VariableResolver.js';
+
+const RUN_CRAWL_SCROLL_STEP = runCrawlScrollStep.toString();
+const IS_CRAWL_SCROLL_AT_BOTTOM = isCrawlScrollAtBottom.toString();
+const IS_CRAWL_SCROLL_STUCK = isCrawlScrollStuck.toString();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const CRAWL_DESIGN_PRELOAD = path.join(__dirname, '..', '..', 'preload', 'crawl-design-preload.cjs');
+const PREVIEW_AUTOSCROLL_MAX = 30;
 
 class ScenarioEmbeddedBrowserService {
   constructor({ getMainWindow, dbService, browserProfileService } = {}) {
@@ -41,6 +54,7 @@ class ScenarioEmbeddedBrowserService {
     this.requestCatchingBridge = new RequestCatchingPreviewBridge();
     this.requestCatchingAutoConfig = null;
     this._requestCatchingPageUrl = '';
+    this._previewScrollStopRequested = false;
     this._onRequestCatchingNavigateHandler = null;
   }
 
@@ -74,6 +88,14 @@ class ScenarioEmbeddedBrowserService {
     }
 
     return trimmed;
+  }
+
+  _resolveVariables(rawUrl, scenarioId) {
+    const trimmed = String(rawUrl || '').trim();
+    if (!trimmed || !scenarioId || !this.dbService) return trimmed;
+
+    const variableMap = this.dbService.buildVariableMap(scenarioId, null);
+    return resolveVariableTemplate(trimmed, variableMap);
   }
 
   _resolveUserDataDir(scenarioId, browserProfileId) {
@@ -156,6 +178,7 @@ class ScenarioEmbeddedBrowserService {
         crawlMeta: cfg.crawlMeta,
         requestCatchingFilters: cfg.requestCatchingFilters || {},
       });
+      await this._runPreviewAutoscroll(cfg.crawlMeta || {});
     } catch (error) {
       console.warn('[RC] auto-start failed:', error.message);
     }
@@ -557,6 +580,36 @@ class ScenarioEmbeddedBrowserService {
       || 'facebook';
     const listenOnly = payload.listenOnly === true;
     const win = this._getWindow();
+    const crawlMeta = payload.crawlMeta || this.requestCatchingAutoConfig?.crawlMeta || {};
+    const infinite = crawlMeta.infinity_scroll || {};
+    const shouldCheckStopCondition = infinite.enabled && infinite.stop_mode === 'condition';
+    const scenarioId = payload.scenarioId
+      || this.requestCatchingAutoConfig?.scenarioId
+      || null;
+    const resolvedCondition = {
+      ...infinite.condition,
+      value: this._resolveVariables(String(infinite.condition?.value ?? ''), scenarioId),
+    };
+    this._previewScrollStopRequested = false;
+
+    const checkCapturedStopCondition = (items = []) => {
+      if (!shouldCheckStopCondition || this._previewScrollStopRequested) return;
+      if (!Array.isArray(items) || !items.length) return;
+
+      const pageUrl = this._requestCatchingPageUrl
+        || this.view?.webContents?.getURL()
+        || '';
+      const variableMap = this.dbService?.buildVariableMap(scenarioId, null);
+      const parsedPosts = parseFacebookGraphQLBatch(items, {
+        targetUrl: pageUrl,
+        variables: variableMap,
+      });
+      if (crawlConditionMatched(parsedPosts, resolvedCondition)) {
+        this._previewScrollStopRequested = true;
+        console.log('[RC] Infinity scroll stop condition matched (post_date threshold reached)');
+        void this.stopRequestCatching();
+      }
+    };
 
     const result = await this.requestCatchingBridge.start(
       this.view.webContents,
@@ -585,6 +638,8 @@ class ScenarioEmbeddedBrowserService {
           }
         },
         onCapture: async (items, meta) => {
+          checkCapturedStopCondition(items);
+
           if (!win || win.isDestroyed()) return;
           const scenarioId = payload.scenarioId
             || this.requestCatchingAutoConfig?.scenarioId
@@ -603,6 +658,7 @@ class ScenarioEmbeddedBrowserService {
               itemCount: meta?.itemCount || items.length,
               label: meta?.label || '',
               timestamp: new Date().toISOString(),
+              scrollStopped: this._previewScrollStopRequested,
             });
           }
         },
@@ -624,14 +680,20 @@ class ScenarioEmbeddedBrowserService {
       }
     }
 
-    await this._runPreviewAutoscroll(
-      payload.crawlMeta || this.requestCatchingAutoConfig?.crawlMeta || {},
-    );
+    await this._runPreviewAutoscroll(crawlMeta);
 
     return {
       ...result,
       attached: true,
+      scrollStoppedByCondition: this._previewScrollStopRequested,
     };
+  }
+
+  async _executeCrawlScroll(webContents, distance, mode = 'scroll') {
+    if (!webContents || webContents.isDestroyed()) return null;
+    return webContents.executeJavaScript(
+      `(${RUN_CRAWL_SCROLL_STEP})(${Number(distance) || 0}, ${JSON.stringify(mode)})`,
+    ).catch(() => null);
   }
 
   async _runPreviewAutoscroll(crawlMeta = {}) {
@@ -644,21 +706,52 @@ class ScenarioEmbeddedBrowserService {
 
     const scrollDistance = Math.max(100, Number(autoscroll.distance_px) || 600);
     const scrollDelay = Math.max(100, Number(autoscroll.delay_ms) || 500);
-    const maxScrolls = infinite.enabled
-      ? Math.max(1, Math.min(30, Number(infinite.max_scrolls) || 10))
+    const configuredMax = infinite.enabled
+      ? Math.max(1, Number(infinite.max_scrolls) || 30)
       : 5;
+    const maxScrolls = Math.min(PREVIEW_AUTOSCROLL_MAX, configuredMax);
     const timeoutMs = Math.max(1000, Number(infinite.timeout_ms) || 30000);
     const startedAt = Date.now();
 
     const { webContents } = this.view;
-    await webContents.executeJavaScript('window.scrollTo(0, 0)').catch(() => {});
+    let previousState = await this._executeCrawlScroll(webContents, 0, 'reset');
     await new Promise((resolve) => { setTimeout(resolve, scrollDelay); });
 
     for (let index = 0; index < maxScrolls; index += 1) {
+      if (this._previewScrollStopRequested) break;
       if (infinite.enabled && Date.now() - startedAt >= timeoutMs) break;
 
-      await webContents.executeJavaScript(`window.scrollBy(0, ${scrollDistance})`).catch(() => {});
+      const nextState = await this._executeCrawlScroll(webContents, scrollDistance, 'scroll');
       await new Promise((resolve) => { setTimeout(resolve, scrollDelay); });
+
+      if (this._previewScrollStopRequested) break;
+
+      if (nextState && previousState) {
+        const atBottom = await webContents.executeJavaScript(
+          `(${IS_CRAWL_SCROLL_AT_BOTTOM})(${JSON.stringify(nextState)})`,
+        ).catch(() => false);
+        const didNotMove = await webContents.executeJavaScript(
+          `(${IS_CRAWL_SCROLL_STUCK})(${JSON.stringify(previousState)}, ${JSON.stringify(nextState)})`,
+        ).catch(() => false);
+        if (!infinite.enabled && atBottom && didNotMove) break;
+      }
+
+      previousState = nextState;
+    }
+
+    if (infinite.enabled || autoscroll.enabled) {
+      await new Promise((resolve) => { setTimeout(resolve, 4000); });
+    }
+
+    if (this._previewScrollStopRequested) {
+      await this.stopRequestCatching();
+      const win = this._getWindow();
+      if (win && !win.isDestroyed()) {
+        win.webContents.send('request-catching:scroll-stopped', {
+          reason: 'condition',
+          timestamp: new Date().toISOString(),
+        });
+      }
     }
   }
 
@@ -707,8 +800,35 @@ class ScenarioEmbeddedBrowserService {
     const currentUrl = this.view.webContents.getURL() || '';
     if (url === currentUrl) return this.getState();
 
-    this.view.webContents.loadURL(url);
+    await this._loadUrlWithFacebookPostCheck(url, payload.scenarioId);
     return this.getState();
+  }
+
+  _resolvePostIdFromScenario(scenarioId) {
+    if (!scenarioId || !this.dbService) return '';
+    const map = this.dbService.buildVariableMap(scenarioId, null);
+    return String(map.get('post_id') || '').trim();
+  }
+
+  async _loadUrlWithFacebookPostCheck(url, scenarioId) {
+    const { webContents } = this.view;
+    webContents.loadURL(url);
+    await this._waitForMainFrameReady(webContents, 15000);
+
+    const postId = this._resolvePostIdFromScenario(scenarioId);
+    if (!postId || !String(url).includes('facebook.com')) return;
+
+    const hasPostInUrl = () => String(webContents.getURL() || '').includes(postId);
+    if (hasPostInUrl()) return;
+
+    const deadline = Date.now() + 12000;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => { setTimeout(resolve, 600); });
+      if (hasPostInUrl()) return;
+    }
+
+    webContents.loadURL(url);
+    await this._waitForMainFrameReady(webContents, 15000);
   }
 
   async reload() {

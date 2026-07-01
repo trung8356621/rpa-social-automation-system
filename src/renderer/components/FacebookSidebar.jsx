@@ -1,0 +1,106 @@
+import React, { useState } from 'react';
+import { createPortal } from 'react-dom';
+import { useDispatch, useSelector } from 'react-redux';
+import { Facebook, Settings, Table2 } from 'lucide-react';
+import { setFacebookDataPage } from '../slices/uiSlice';
+import { useTranslation } from '../i18n';
+
+const facebookNavItemDefs = [
+  { id: 'studio', icon: Table2, labelKey: 'facebookData.nav.studio' },
+  { id: 'settings', icon: Settings, labelKey: 'facebookData.nav.settings' },
+];
+
+function NavItem({ item, isActive, onClick, onMouseEnter, onMouseLeave, onFocus, onBlur }) {
+  const Icon = item.icon;
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      onMouseEnter={onMouseEnter}
+      onMouseLeave={onMouseLeave}
+      onFocus={onFocus}
+      onBlur={onBlur}
+      className={`flex h-10 w-full items-center justify-center rounded-lg transition-colors ${
+        isActive
+          ? 'bg-[#2f80ed] text-white shadow-sm shadow-[#2f80ed]/30'
+          : 'text-[#9aa7b7] hover:bg-[#202b3a] hover:text-white'
+      }`}
+    >
+      <Icon className="h-5 w-5 shrink-0" />
+    </button>
+  );
+}
+
+function SidebarTooltip({ tip }) {
+  if (!tip) return null;
+
+  return createPortal(
+    <div
+      role="tooltip"
+      className="pointer-events-none fixed z-[9999] -translate-y-1/2 whitespace-nowrap rounded-md border border-[#3d5068] bg-[#1a2433] px-2.5 py-1.5 text-xs font-medium text-[#e8eef7] shadow-xl shadow-black/50"
+      style={{ top: tip.top, left: tip.left }}
+    >
+      {tip.label}
+      <span className="absolute -left-1 top-1/2 h-2 w-2 -translate-y-1/2 rotate-45 border-b border-l border-[#3d5068] bg-[#1a2433]" />
+    </div>,
+    document.body,
+  );
+}
+
+export default function FacebookSidebar() {
+  const dispatch = useDispatch();
+  const { t } = useTranslation();
+  const { facebookDataPage } = useSelector((state) => state.ui);
+  const [hoverTip, setHoverTip] = useState(null);
+
+  const navItems = facebookNavItemDefs.map((item) => ({
+    ...item,
+    label: t(item.labelKey),
+  }));
+
+  const showTip = (event, label) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    setHoverTip({
+      label,
+      top: rect.top + rect.height / 2,
+      left: rect.right + 10,
+    });
+  };
+
+  const hideTip = () => setHoverTip(null);
+
+  return (
+    <>
+      <aside className="relative z-30 h-full w-[72px] shrink-0 border-r border-[#2e3b4e] bg-[#151f2d]">
+        <div className="flex h-full flex-col">
+          <div className="flex h-16 items-center justify-center border-b border-[#2e3b4e]">
+            <div
+              className="flex h-10 w-10 items-center justify-center rounded-lg bg-[#1877f2] text-white"
+              onMouseEnter={(event) => showTip(event, t('facebookData.brandName'))}
+              onMouseLeave={hideTip}
+            >
+              <Facebook className="h-5 w-5" />
+            </div>
+          </div>
+
+          <nav className="flex-1 space-y-1 overflow-y-auto px-3 py-4">
+            {navItems.map((item) => (
+              <NavItem
+                key={item.id}
+                item={item}
+                isActive={facebookDataPage === item.id}
+                onClick={() => dispatch(setFacebookDataPage(item.id))}
+                onMouseEnter={(event) => showTip(event, item.label)}
+                onMouseLeave={hideTip}
+                onFocus={(event) => showTip(event, item.label)}
+                onBlur={hideTip}
+              />
+            ))}
+          </nav>
+        </div>
+      </aside>
+      <SidebarTooltip tip={hoverTip} />
+    </>
+  );
+}

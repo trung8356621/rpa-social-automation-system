@@ -15,6 +15,7 @@ import SettingsPage from './pages/SettingsPage';
 import BrowserProfilesPage from './pages/BrowserProfilesPage';
 import DataProfilesPage from './pages/DataProfilesPage';
 import FacebookDataPage from './pages/FacebookDataPage';
+import FacebookDataSettingsPage from './pages/FacebookDataSettingsPage';
 import TasksPage from './pages/TasksPage';
 import ProxiesView from './views/ProxiesView';
 import {
@@ -22,6 +23,7 @@ import {
   isSlaveBuild,
   SLAVE_ALLOWED_PAGES,
 } from './utils/appRole';
+import FacebookSidebar from './components/FacebookSidebar';
 
 function useExecutionListener() {
   const dispatch = useDispatch();
@@ -78,7 +80,7 @@ function useEnforceBuildRoleLayout() {
 }
 
 export default function App() {
-  const { currentPage, currentView } = useSelector((state) => state.ui);
+  const { currentPage, currentView, facebookDataPage } = useSelector((state) => state.ui);
 
   useBootstrapApp();
   useExecutionListener();
@@ -86,10 +88,14 @@ export default function App() {
   useEnforceBuildRoleLayout();
 
   const showFacebookDataStudio = isMasterBuild && currentView === 'facebookData';
-  const showSidebar = !showFacebookDataStudio;
+  const showScenarioSidebar = !showFacebookDataStudio;
+  const showFacebookSidebar = showFacebookDataStudio;
 
   const renderPage = () => {
     if (showFacebookDataStudio) {
+      if (facebookDataPage === 'settings') {
+        return <FacebookDataSettingsPage />;
+      }
       return <FacebookDataPage />;
     }
 
@@ -125,7 +131,8 @@ export default function App() {
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-[#111827] text-[#eef2f7]">
       <GlobalHeader />
       <div className="flex min-h-0 flex-1 overflow-hidden">
-        {showSidebar && <Sidebar />}
+        {showScenarioSidebar && <Sidebar />}
+        {showFacebookSidebar && <FacebookSidebar />}
         <main className="min-w-0 flex-1 overflow-x-hidden overflow-y-auto">
           {renderPage()}
         </main>

@@ -214,6 +214,7 @@ export default function RequestCatchingScenarioEditorContent({
   scenarioMeta,
   onScenarioMetaChange,
   onExitRequestCatchingMode,
+  scenarioVariables = [],
 }) {
   const { t } = useTranslation();
   const [viewMode, setViewMode] = useState('capture');
@@ -266,8 +267,11 @@ export default function RequestCatchingScenarioEditorContent({
   }, [crawledData, discovered]);
 
   const finalResultData = useMemo(
-    () => parseFacebookGraphQLBatch(allRawObjects, { targetUrl: resolvedTargetUrl }),
-    [allRawObjects, resolvedTargetUrl],
+    () => parseFacebookGraphQLBatch(allRawObjects, {
+      targetUrl: resolvedTargetUrl,
+      variables: scenarioVariables,
+    }),
+    [allRawObjects, resolvedTargetUrl, scenarioVariables],
   );
 
   const finalResultPreview = useMemo(() => {
@@ -661,7 +665,8 @@ export default function RequestCatchingScenarioEditorContent({
           <CrawlBrowserPreview
             scenarioId={currentScenarioId}
             browserProfileId={browserProfileId}
-            targetUrl={resolvedTargetUrl}
+            targetUrl={targetUrl || defaultTargetUrl || ''}
+            scenarioVariables={scenarioVariables}
             browserProfileOptions={browserProfileOptions}
             onBrowserProfileChange={onBrowserProfileChange}
             activeViewport={activeViewport}

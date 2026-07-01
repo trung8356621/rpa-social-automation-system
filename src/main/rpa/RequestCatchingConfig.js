@@ -9,6 +9,9 @@ export const REQUEST_CATCHING_PLATFORM_CONFIG = {
     postDataIncludes: [
       'GroupCometFeedRegularStoriesQuery',
       'ProfileCometContextualProfileRootQuery',
+      'CommentsListComponentsPaginationQuery',
+      'CometUFICommentsProviderPaginationQuery',
+      'comment_rendering_instance',
       'groupID',
     ],
     requestHeaders: {},

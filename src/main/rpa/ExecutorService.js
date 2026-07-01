@@ -6,8 +6,18 @@ import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer';
 import { getCrawlExtractionScript } from './CardExtractorScript.js';
 import { parseFacebookGraphQLBatch } from '../../shared/parseFacebookGraphQL.js';
-import { RequestCatchingDumpService } from './RequestCatchingDumpService.js';
-import { resolveVariableTemplate } from './VariableResolver.js';
+import { crawlConditionMatched } from '../../shared/crawlStopCondition.js';
+import {
+  isCrawlScrollAtBottom,
+  isCrawlScrollStuck,
+  runCrawlScrollStep,
+  shouldStopCrawlScrollEarly,
+} from '../../shared/crawlScroll.js';
+import {
+  mergeRequestCatchingRawObjects,
+  RequestCatchingPuppeteerCapture,
+} from './RequestCatchingPuppeteerCapture.js';
+import { resolveScenarioTargetUrl, resolveVariableTemplate } from './VariableResolver.js';
 import { ensureRememberMeChecked, isCheckboxAlreadyChecked, resolveGuestSessionDir, resolveSessionStartUrl } from '../browser/BrowserSessionPaths.js';
 
 const DEFAULT_ACTION_DELAY_MS = 300;
@@ -23,13 +33,14 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 class ExecutorService {
-  constructor({ dbService, browserProfileService, sendTelemetry, cacheRoot, appDataPath } = {}) {
+  constructor({ dbService, browserProfileService, sendTelemetry, cacheRoot, appDataPath, platformCrawledDataService } = {}) {
     if (!dbService) {
       throw new Error('[Executor] dbService is required.');
     }
 
     this.dbService = dbService;
     this.browserProfileService = browserProfileService || null;
+    this.platformCrawledDataService = platformCrawledDataService || null;
     this.sendTelemetry = sendTelemetry || (() => {});
     this.cacheRoot = cacheRoot || path.join(__dirname, '..', '..', '..', 'cache');
     this.appDataPath = appDataPath || null;
@@ -43,6 +54,7 @@ class ExecutorService {
     this._executionViewport = null;
     this._releaseDirLock = null;
     this._crawlResults = [];
+    this._requestCatchingCapture = null;
   }
 
   async startScenario(scenarioId, options = {}) {
@@ -119,9 +131,7 @@ class ExecutorService {
         started_at: this._executionStartedAt,
       });
 
-      if (!isRequestCatching) {
-        await this._launchBrowser(scenario, options);
-      }
+      await this._launchBrowser(scenario, options);
 
       if (!isRequestCatching && scenarioType !== 'prepare') {
         await this._ensureSessionReady(scenario, executionId);
@@ -474,7 +484,13 @@ class ExecutorService {
 
   _resolveStartUrl(scenario) {
     const scenarioUrl = String(scenario?.target_url || '').trim();
-    if (scenarioUrl) return this._resolveVariables(scenarioUrl);
+    if (scenarioUrl) {
+      const map = this._variableMap || this.dbService.buildVariableMap(
+        scenario?.id,
+        this._currentSampleId,
+      );
+      return resolveScenarioTargetUrl(scenarioUrl, map);
+    }
 
     const firstNavigate = (scenario?.steps || []).find((step) => step.action_type === 'navigate');
     if (!firstNavigate) return null;
@@ -482,7 +498,13 @@ class ExecutorService {
     const anchor = firstNavigate.target_anchor || {};
     const config = anchor.action_config || {};
     const url = String(config.url || anchor.url || '').trim();
-    return url ? this._resolveVariables(url) : null;
+    if (!url) return null;
+
+    const map = this._variableMap || this.dbService.buildVariableMap(
+      scenario?.id,
+      this._currentSampleId,
+    );
+    return resolveScenarioTargetUrl(url, map);
   }
 
   async _navigateToScenarioStart(scenario) {
@@ -495,6 +517,42 @@ class ExecutorService {
     });
     await ensureRememberMeChecked(this.page);
     await this._sleep(400);
+    await this._verifyFacebookPostNavigation(scenario, startUrl);
+  }
+
+  async _verifyFacebookPostNavigation(scenario, expectedUrl) {
+    const platform = String(scenario?.platform || '').trim().toLowerCase();
+    if (platform !== 'facebook' || !this.page || this.page.isClosed()) return;
+
+    const map = this._variableMap || this.dbService.buildVariableMap(
+      scenario?.id,
+      this._currentSampleId,
+    );
+    const postId = String(map.get('post_id') || '').trim();
+    if (!postId) return;
+
+    const hasPostInUrl = () => String(this.page.url() || '').includes(postId);
+    if (hasPostInUrl()) return;
+
+    const deadline = Date.now() + 12000;
+    while (Date.now() < deadline) {
+      await this._sleep(600);
+      if (hasPostInUrl()) return;
+    }
+
+    console.warn(`[Executor] Retrying navigation to post_id ${postId}`);
+    await this.page.goto(expectedUrl, {
+      waitUntil: 'domcontentloaded',
+      timeout: 60000,
+    });
+    await ensureRememberMeChecked(this.page);
+    await this._sleep(1200);
+
+    if (!hasPostInUrl()) {
+      throw new Error(
+        `Khong dieu huong duoc toi post_id ${postId}. URL hien tai: ${this.page.url()}`,
+      );
+    }
   }
 
   async _ensureSessionReady(scenario, executionId) {
@@ -703,33 +761,96 @@ class ExecutorService {
   }
 
   async _executeRequestCatching(scenario) {
-    return this._executeRequestCatchingFromDump(scenario);
+    return this._executeRequestCatchingLive(scenario);
   }
 
-  async _executeRequestCatchingFromDump(scenario) {
+  async _executeRequestCatchingLive(scenario) {
+    if (!this.page || this.page.isClosed()) {
+      throw new Error('Trang browser khong san sang cho request_catching.');
+    }
+
     const platform = String(scenario?.platform || 'facebook').trim().toLowerCase() || 'facebook';
-    const session = await RequestCatchingDumpService.loadSession(scenario.id);
-    const dumpPath = session.dumpPath || RequestCatchingDumpService.resolveScenarioDir(scenario.id);
-    const rawCaptured = Array.isArray(session.crawledData) ? session.crawledData : [];
+    const map = this._variableMap || this.dbService.buildVariableMap(
+      scenario?.id,
+      this._currentSampleId,
+    );
+    const targetUrl = resolveScenarioTargetUrl(String(scenario?.target_url || '').trim(), map)
+      || this.page.url()
+      || '';
+    const crawlMeta = getCrawlMeta(scenario?.scenario_meta);
+    const infinite = crawlMeta.infinity_scroll || {};
+    const resolvedCondition = {
+      ...infinite.condition,
+      value: this._resolveVariables(String(infinite.condition?.value ?? '')),
+    };
+    const customFilters = scenario?.scenario_meta?.request_catching?.filters || {};
+    const rawCaptured = [];
+    let scrollStopRequested = false;
+
+    const shouldCheckStopCondition = infinite.enabled && infinite.stop_mode === 'condition';
+
+    const capture = new RequestCatchingPuppeteerCapture();
+    this._requestCatchingCapture = capture;
+
+    try {
+      await capture.start(this.page, platform, {
+        customFilters,
+        onCapture: (items) => {
+          const merged = mergeRequestCatchingRawObjects(rawCaptured, items);
+          rawCaptured.length = 0;
+          rawCaptured.push(...merged);
+
+          if (!shouldCheckStopCondition || scrollStopRequested) return;
+
+          const parsedBatch = parseFacebookGraphQLBatch(items, { targetUrl, variables: map });
+          if (crawlConditionMatched(parsedBatch, resolvedCondition)) {
+            scrollStopRequested = true;
+            console.log('[Executor] Request catching stop condition matched — stopping scroll');
+          }
+        },
+      });
+
+      await this._navigateToScenarioStart(scenario);
+      await this._sleep(1500);
+      await this._runRequestCatchingScroll(crawlMeta, () => scrollStopRequested);
+      await this._waitForRequestCatchingSettle();
+    } finally {
+      await capture.stop();
+      this._requestCatchingCapture = null;
+    }
 
     if (!rawCaptured.length) {
       throw new Error(
-        `Khong co du lieu dump cho request_catching. Dat file JSON vao: ${dumpPath}`,
+        'Khong bat duoc GraphQL nao trong phien chay. Kiem tra URL dich, dang nhap Facebook, va bo loc request.',
       );
     }
 
-    const cleaned = parseFacebookGraphQLBatch(rawCaptured, {
-      targetUrl: scenario?.target_url || '',
-    });
+    const cleaned = parseFacebookGraphQLBatch(rawCaptured, { targetUrl, variables: map });
+
+    let facebookDbSave = null;
+    if (platform === 'facebook' && this.platformCrawledDataService) {
+      facebookDbSave = this.platformCrawledDataService.saveFacebookPostsBatch(
+        cleaned.filter((post) => post?.post_id),
+        { group_link: targetUrl },
+        { platform: 'facebook' },
+      );
+      console.log(
+        `[Executor] Facebook DB save: ${facebookDbSave.saved} saved, ${facebookDbSave.failed} failed`,
+      );
+    }
+
     const payload = {
       step_index: 1,
       widget_label: 'request_catching',
       platform,
-      source: 'debug_dumps',
-      dump_path: dumpPath,
+      source: 'live_browser',
+      page_url: this.page && !this.page.isClosed() ? this.page.url() : targetUrl,
       raw_object_count: rawCaptured.length,
+      raw_captured: rawCaptured,
       capture_count: cleaned.length,
       crawledData: cleaned,
+      facebook_db_save: facebookDbSave,
+      scroll_stopped_by_condition: scrollStopRequested,
       cards: cleaned.map((item, index) => ({
         card_index: index,
         data: item,
@@ -740,6 +861,63 @@ class ExecutorService {
     return payload;
   }
 
+  async _waitForRequestCatchingSettle() {
+    if (!this.page || this.page.isClosed()) return;
+
+    try {
+      await Promise.race([
+        this.page.waitForNetworkIdle({ idleTime: 800, timeout: 10000 }),
+        this._sleep(5000),
+      ]);
+    } catch {
+      await this._sleep(4000);
+    }
+  }
+
+  async _runRequestCatchingScroll(crawlMeta = {}, shouldStop = () => false) {
+    if (!this.page || this.page.isClosed()) return;
+
+    const autoscroll = crawlMeta.autoscroll || {};
+    const infinite = crawlMeta.infinity_scroll || {};
+    const scrollDistance = Math.max(100, Number(autoscroll.distance_px) || 600);
+    const scrollDelay = Math.max(100, Number(autoscroll.delay_ms) || 500);
+    const shouldScroll = autoscroll.enabled || infinite.enabled;
+
+    if (!shouldScroll) {
+      await this._sleep(Math.max(2000, scrollDelay * 2));
+      return;
+    }
+
+    let previousState = await this.page.evaluate(runCrawlScrollStep, 0, 'reset');
+    await this._sleep(scrollDelay);
+
+    const startedAt = Date.now();
+    const timeoutMs = Math.max(1000, Number(infinite.timeout_ms) || 30000);
+    const maxScrolls = infinite.enabled
+      ? Math.max(1, Math.min(200, Number(infinite.max_scrolls) || 30))
+      : 5;
+
+    for (let scrollIndex = 0; scrollIndex < maxScrolls; scrollIndex += 1) {
+      if (shouldStop()) break;
+      if (infinite.enabled && Date.now() - startedAt >= timeoutMs) break;
+
+      const nextState = await this.page.evaluate(runCrawlScrollStep, scrollDistance, 'scroll');
+      await this._sleep(scrollDelay);
+
+      if (shouldStop()) break;
+
+      const atBottom = await this.page.evaluate(isCrawlScrollAtBottom, nextState);
+      const didNotMove = await this.page.evaluate(isCrawlScrollStuck, previousState, nextState);
+      if (shouldStopCrawlScrollEarly({
+        infiniteEnabled: infinite.enabled,
+        atBottom,
+        didNotMove,
+      })) break;
+
+      previousState = nextState;
+    }
+  }
+
   async _extractCrawlWithScroll(anchor, maxCards, crawlMeta = {}) {
     const autoscroll = crawlMeta.autoscroll || {};
     const infinite = crawlMeta.infinity_scroll || {};
@@ -748,7 +926,7 @@ class ExecutorService {
     const shouldScroll = autoscroll.enabled || infinite.enabled;
 
     if (shouldScroll) {
-      await this.page.evaluate(() => window.scrollTo(0, 0));
+      await this.page.evaluate(runCrawlScrollStep, 0, 'reset');
       await this._sleep(scrollDelay);
     }
 
@@ -762,8 +940,7 @@ class ExecutorService {
     const maxScrolls = infinite.enabled
       ? Math.max(1, Math.min(200, Number(infinite.max_scrolls) || 30))
       : 200;
-    let previousHeight = 0;
-    let previousY = -1;
+    let previousState = await this.page.evaluate(runCrawlScrollStep, 0, 'reset');
 
     for (let scrollIndex = 0; scrollIndex < maxScrolls; scrollIndex += 1) {
       if (infinite.stop_mode === 'condition' && crawlConditionMatched(latest?.sample_dump, infinite.condition)) {
@@ -773,28 +950,22 @@ class ExecutorService {
         break;
       }
 
-      await this.page.evaluate((distance) => {
-        window.scrollBy(0, distance);
-      }, scrollDistance);
+      const nextState = await this.page.evaluate(runCrawlScrollStep, scrollDistance, 'scroll');
       await this._sleep(scrollDelay);
 
-      const scrollState = await this.page.evaluate(() => {
-        return {
-          y: window.scrollY,
-          innerHeight: window.innerHeight || 0,
-          height: document.documentElement.scrollHeight || document.body.scrollHeight || 0,
-        };
-      });
       latest = await this.page.evaluate(getCrawlExtractionScript(anchor, maxCards));
       accumulatedCards.add(latest?.sample_dump);
 
-      const atBottom = scrollState.y + scrollState.innerHeight >= scrollState.height - 2;
-      const didNotMove = scrollState.y === previousY && scrollState.height === previousHeight;
-      if (atBottom && didNotMove) {
+      const atBottom = await this.page.evaluate(isCrawlScrollAtBottom, nextState);
+      const didNotMove = await this.page.evaluate(isCrawlScrollStuck, previousState, nextState);
+      if (shouldStopCrawlScrollEarly({
+        infiniteEnabled: infinite.enabled,
+        atBottom,
+        didNotMove,
+      })) {
         break;
       }
-      previousHeight = scrollState.height;
-      previousY = scrollState.y;
+      previousState = nextState;
     }
 
     latest = {
@@ -1144,6 +1315,11 @@ class ExecutorService {
       await this._waitBeforeBrowserClose();
     }
 
+    if (this._requestCatchingCapture) {
+      await this._requestCatchingCapture.stop().catch(() => {});
+      this._requestCatchingCapture = null;
+    }
+
     await this._closeBrowserAndWait();
 
     // Release the per-userDataDir lock so the next queued executor can proceed.
@@ -1287,24 +1463,102 @@ function isRequestCatchingScenario(scenario) {
 }
 
 function buildRequestCatchingExecutionResult(scenario, crawlResults = []) {
-  const rawCrawledData = [];
-  (Array.isArray(crawlResults) ? crawlResults : []).forEach((result) => {
-    if (Array.isArray(result?.crawledData)) {
-      rawCrawledData.push(...result.crawledData);
+  const results = Array.isArray(crawlResults) ? crawlResults : [];
+  const rawGraphQlObjects = [];
+  const parsedPosts = [];
+  let rawObjectCount = 0;
+
+  results.forEach((result) => {
+    rawObjectCount += Number(result?.raw_object_count) || 0;
+
+    const crawledItems = Array.isArray(result?.crawledData) ? result.crawledData : [];
+    const alreadyParsed = crawledItems.length > 0 && isParsedFacebookPost(crawledItems[0]);
+
+    if (alreadyParsed) {
+      parsedPosts.push(...crawledItems);
+      return;
     }
+
+    if (Array.isArray(result?.raw_captured)) {
+      rawGraphQlObjects.push(...result.raw_captured);
+    }
+
+    crawledItems.forEach((item) => {
+      if (isParsedFacebookPost(item)) {
+        parsedPosts.push(item);
+      } else {
+        rawGraphQlObjects.push(item);
+      }
+    });
   });
 
-  const crawledData = parseFacebookGraphQLBatch(rawCrawledData, {
-    targetUrl: scenario?.target_url || '',
+  const targetUrl = results.map((result) => result?.page_url).find(Boolean)
+    || scenario?.target_url
+    || '';
+
+  const parsedFromRaw = parseFacebookGraphQLBatch(rawGraphQlObjects, {
+    targetUrl,
   });
+
+  const crawledData = mergeParsedFacebookPosts(parsedPosts, parsedFromRaw);
+
+  if (!rawObjectCount) {
+    rawObjectCount = rawGraphQlObjects.length || crawledData.length;
+  }
+
+  const facebookDbSave = results.map((result) => result?.facebook_db_save).find(Boolean) || null;
 
   return {
     scenario_type: 'request_catching',
     platform: scenario?.platform || 'facebook',
     capture_count: crawledData.length,
-    raw_object_count: rawCrawledData.length,
+    raw_object_count: rawObjectCount,
     crawledData,
+    facebook_db_save: facebookDbSave,
   };
+}
+
+function isParsedFacebookPost(item) {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) return false;
+  if (item.data && typeof item.data === 'object') return false;
+  return Boolean(item.post_id || item.post_content || item.post_author);
+}
+
+function mergeParsedFacebookPosts(primary = [], secondary = []) {
+  const merged = new Map();
+
+  [...primary, ...secondary].forEach((post) => {
+    if (!post || typeof post !== 'object') return;
+    const key = post.post_id || `story:${String(post.post_content || '').slice(0, 120)}`;
+    if (!key || key === 'story:') return;
+
+    if (!merged.has(key)) {
+      merged.set(key, { ...post, comments: [...(post.comments || [])] });
+      return;
+    }
+
+    const existing = merged.get(key);
+    if (!existing.post_content && post.post_content) existing.post_content = post.post_content;
+    if (!existing.post_author && post.post_author) existing.post_author = post.post_author;
+    if (!existing.author_link && post.author_link) existing.author_link = post.author_link;
+    if (!existing.post_link && post.post_link) existing.post_link = post.post_link;
+    if (!existing.post_date && post.post_date) existing.post_date = post.post_date;
+    if (!existing.post_id && post.post_id) existing.post_id = post.post_id;
+
+    const seen = new Set(
+      (existing.comments || []).map((comment) => comment.comment_id
+        || `${comment.comment_author || ''}::${comment.comment_content || ''}`),
+    );
+    (post.comments || []).forEach((comment) => {
+      const dedupeKey = comment.comment_id
+        || `${comment.comment_author || ''}::${comment.comment_content || ''}`;
+      if (seen.has(dedupeKey)) return;
+      seen.add(dedupeKey);
+      existing.comments.push(comment);
+    });
+  });
+
+  return Array.from(merged.values());
 }
 
 function buildCrawlExecutionResult(crawlResults = [], resultType = 'simple') {
@@ -1436,53 +1690,6 @@ function getCrawlMeta(meta = {}) {
       },
     },
   };
-}
-
-function crawlConditionMatched(cards = [], condition = {}) {
-  const field = String(condition?.field || '').trim();
-  if (!field || !Array.isArray(cards)) return false;
-
-  return cards.some((card) => {
-    const data = normalizeCrawlCardData(card);
-    const value = data && typeof data === 'object' && !Array.isArray(data)
-      ? data[field]
-      : undefined;
-    return compareCrawlValues(value, condition.operator, condition.value);
-  });
-}
-
-function compareCrawlValues(left, operator = '<', right) {
-  if (left === undefined || left === null || right === undefined || right === null || right === '') {
-    return false;
-  }
-
-  const leftComparable = toComparableValue(left);
-  const rightComparable = toComparableValue(right);
-
-  switch (operator) {
-    case '<': return leftComparable < rightComparable;
-    case '<=': return leftComparable <= rightComparable;
-    case '>': return leftComparable > rightComparable;
-    case '>=': return leftComparable >= rightComparable;
-    case '!=': return leftComparable !== rightComparable;
-    case '=':
-    default:
-      return leftComparable === rightComparable;
-  }
-}
-
-function toComparableValue(value) {
-  const text = String(value).trim();
-  const dateText = text.includes('/') && !text.includes('-')
-    ? text.split('/').reverse().join('-')
-    : text;
-  const timestamp = Date.parse(dateText);
-  if (!Number.isNaN(timestamp) && /[/-]\d{1,2}[/-]/.test(text)) {
-    return timestamp;
-  }
-  const number = Number(text.replace(/,/g, ''));
-  if (!Number.isNaN(number) && text !== '') return number;
-  return text.toLowerCase();
 }
 
 const SCENARIO_RESULT_TYPES = new Set(['simple', 'list']);

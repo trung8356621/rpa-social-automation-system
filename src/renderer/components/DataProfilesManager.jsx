@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Loader2, Plus, Save, Trash2, X } from 'lucide-react';
 import { useTranslation } from '../i18n';
+import { isSystemVariableProfile } from '../../shared/facebookCrawlConfig.js';
 
 function createRowId() {
   return typeof crypto !== 'undefined' && crypto.randomUUID
@@ -129,6 +130,8 @@ export default function DataProfilesManager({
     () => keyRows.map((row) => String(row.key || '').trim()).filter(Boolean),
     [keyRows],
   );
+
+  const isSelectedSystemProfile = isSystemVariableProfile(selectedProfileId);
 
   const sampleDisplayRows = useMemo(
     () => templateKeys.map((key) => ({ key, value: sampleValueMap[key] ?? '' })),
@@ -341,16 +344,23 @@ export default function DataProfilesManager({
                     )}
                   >
                     {profile.name}
+                    {profile.is_system ? (
+                      <span className="ml-1 rounded bg-slate-700 px-1.5 py-0.5 text-[10px] uppercase">
+                        {t('dataProfiles.manager.systemProfile')}
+                      </span>
+                    ) : null}
                     <span className="ml-1 text-[10px] opacity-70">({profile.keys?.length || 0})</span>
                   </button>
-                  <button
-                    type="button"
-                    onClick={() => handleDeleteProfile(profile.id)}
-                    className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-red-950 hover:text-red-300"
-                    title={t('dataProfiles.manager.deleteProfile')}
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </button>
+                  {!profile.is_system ? (
+                    <button
+                      type="button"
+                      onClick={() => handleDeleteProfile(profile.id)}
+                      className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-red-950 hover:text-red-300"
+                      title={t('dataProfiles.manager.deleteProfile')}
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </button>
+                  ) : null}
                 </div>
               ))}
             </div>
@@ -361,6 +371,11 @@ export default function DataProfilesManager({
       <div className="min-h-0 overflow-y-auto rounded-xl border border-slate-700 bg-slate-900/50 p-4">
         {selectedProfileId ? (
           <div className="space-y-6">
+            {isSelectedSystemProfile ? (
+              <p className="rounded-lg border border-slate-700 bg-slate-900/70 px-3 py-2 text-xs text-slate-400">
+                {t('dataProfiles.manager.systemProfileLocked')}
+              </p>
+            ) : null}
             <div>
               <label className="mb-4 block">
                 <span className="mb-1 block text-sm font-medium text-slate-300">{t('dataProfiles.manager.nameLabel')}</span>
@@ -369,6 +384,7 @@ export default function DataProfilesManager({
                   onChange={(event) => setDraft({ name: event.target.value })}
                   className="input-field h-10"
                   placeholder={t('dataProfiles.manager.namePlaceholderExample')}
+                  disabled={isSelectedSystemProfile}
                 />
               </label>
 
@@ -377,16 +393,18 @@ export default function DataProfilesManager({
                   <span className="block text-sm font-medium text-slate-300">{t('dataProfiles.manager.skeletonSection')}</span>
                   <span className="text-xs text-slate-500">{t('dataProfiles.manager.skeletonHint')}</span>
                 </div>
-                <div className="flex items-center gap-2">
-                  <button type="button" onClick={addKeyRow} className="inline-flex h-8 items-center gap-1 rounded-lg border border-slate-600 px-3 text-xs text-slate-200 hover:bg-slate-800">
-                    <Plus className="h-3.5 w-3.5" />
-                    {t('common.add')}
-                  </button>
-                  <button type="button" onClick={handleSaveProfile} disabled={saving} className="inline-flex h-8 items-center gap-1 rounded-lg bg-slate-700 px-3 text-xs text-white hover:bg-slate-600 disabled:opacity-60">
-                    <Save className="h-3.5 w-3.5" />
-                    {t('common.save')}
-                  </button>
-                </div>
+                {!isSelectedSystemProfile ? (
+                  <div className="flex items-center gap-2">
+                    <button type="button" onClick={addKeyRow} className="inline-flex h-8 items-center gap-1 rounded-lg border border-slate-600 px-3 text-xs text-slate-200 hover:bg-slate-800">
+                      <Plus className="h-3.5 w-3.5" />
+                      {t('common.add')}
+                    </button>
+                    <button type="button" onClick={handleSaveProfile} disabled={saving} className="inline-flex h-8 items-center gap-1 rounded-lg bg-slate-700 px-3 text-xs text-white hover:bg-slate-600 disabled:opacity-60">
+                      <Save className="h-3.5 w-3.5" />
+                      {t('common.save')}
+                    </button>
+                  </div>
+                ) : null}
               </div>
 
               <div className="space-y-2">
@@ -397,10 +415,15 @@ export default function DataProfilesManager({
                       onChange={(event) => updateKeyRow(index, { key: event.target.value })}
                       className="input-field h-9 text-sm"
                       placeholder={t('variables.field.key')}
+                      readOnly={isSelectedSystemProfile}
                     />
-                    <button type="button" onClick={() => removeKeyRow(index)} className="flex h-9 w-9 items-center justify-center rounded-lg text-slate-400 hover:bg-red-950 hover:text-red-300" title={t('variables.delete')}>
-                      <Trash2 className="h-4 w-4" />
-                    </button>
+                    {!isSelectedSystemProfile ? (
+                      <button type="button" onClick={() => removeKeyRow(index)} className="flex h-9 w-9 items-center justify-center rounded-lg text-slate-400 hover:bg-red-950 hover:text-red-300" title={t('variables.delete')}>
+                        <Trash2 className="h-4 w-4" />
+                      </button>
+                    ) : (
+                      <span className="flex h-9 w-9 items-center justify-center text-slate-600">—</span>
+                    )}
                   </div>
                 ))}
               </div>

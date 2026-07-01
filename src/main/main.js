@@ -202,7 +202,9 @@ function registerDatabaseHandlers() {
   });
 
   ipcMain.handle('settings:save', (_event, settings) => {
-    return withDefaultSettings(dbService.saveSettings(settings));
+    const saved = withDefaultSettings(dbService.saveSettings(settings));
+    dbService.syncFacebookCrawlScenarioBindings(saved);
+    return saved;
   });
 
   // ===== Facebook Crawled Data (platform SQLite, master only) =====
@@ -793,6 +795,7 @@ function registerDatabaseHandlers() {
     const executor = new ExecutorService({
       dbService,
       browserProfileService,
+      platformCrawledDataService,
       appDataPath: app.getPath('userData'),
       cacheRoot: path.join(app.getPath('userData'), 'cache'),
       sendTelemetry: (telemetryPayload) => {
@@ -825,6 +828,8 @@ function withDefaultSettings(settings) {
     'browser.userDataDir':
       settings['browser.userDataDir'] || path.join(app.getPath('userData'), 'browser-data'),
     'execution.browserCloseDelayMs': Number(settings['execution.browserCloseDelayMs']) || 5000,
+    'facebook.crawlGroupScenarioId': settings['facebook.crawlGroupScenarioId'] || '',
+    'facebook.crawlCommentScenarioId': settings['facebook.crawlCommentScenarioId'] || '',
   };
 }
 
@@ -949,6 +954,7 @@ app.whenReady().then(() => {
   dbService = new DatabaseService(app.getPath('userData'));
   dbService.open();
   dbService.initSchema();
+  dbService.syncFacebookCrawlScenarioBindings(withDefaultSettings(dbService.getSettings()));
   if (isMasterBuild) {
     platformCrawledDataService = new PlatformCrawledDataService(app.getPath('userData'));
     console.log('[Main] PlatformCrawledDataService đã sẵn sàng (master build)');

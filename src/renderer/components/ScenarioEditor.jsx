@@ -2360,6 +2360,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
           scenarioMeta={scenarioMeta}
           onScenarioMetaChange={(nextMeta) => updateScenarioDraft({ nextScenarioMeta: nextMeta })}
           onExitRequestCatchingMode={handleExitRequestCatchingMode}
+          scenarioVariables={scenarioVariables}
         />
       ) : (
         <StandardScenarioEditorContent

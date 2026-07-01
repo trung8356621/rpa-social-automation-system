@@ -2,6 +2,13 @@ import Database from 'better-sqlite3';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import fs from 'node:fs';
+import {
+  FACEBOOK_CRAWL_COMMENT_PROFILE_ID,
+  FACEBOOK_CRAWL_GROUP_PROFILE_ID,
+  FACEBOOK_CRAWL_SETTINGS,
+  isSystemVariableProfile,
+  SYSTEM_FACEBOOK_VARIABLE_PROFILES,
+} from '../../shared/facebookCrawlConfig.js';
 
 /**
  * DatabaseService — Service quản lý toàn bộ tương tác với cơ sở dữ liệu SQLite.
@@ -253,6 +260,7 @@ class DatabaseService {
     this._migrateScenarioVariablesTable();
     this._migrateVariableProfilesTables();
     this._migrateLocalVariablesAndSamples();
+    this._seedSystemFacebookVariableProfiles();
     this._migrateScenarioColumnsToMeta();
     this._migrateExecutionLogsProfileColumns();
 
@@ -315,6 +323,9 @@ class DatabaseService {
     if (!variableProfileColumns.some((col) => col.name === 'variables_json')) {
       this.db.exec("ALTER TABLE variable_profiles ADD COLUMN variables_json TEXT NOT NULL DEFAULT '[]'");
     }
+    if (!variableProfileColumns.some((col) => col.name === 'is_system')) {
+      this.db.exec('ALTER TABLE variable_profiles ADD COLUMN is_system INTEGER NOT NULL DEFAULT 0');
+    }
 
     const dataProfilesTable = this.db
       .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='data_profiles'")
@@ -366,6 +377,37 @@ class DatabaseService {
       this.db.exec('DROP TABLE IF EXISTS data_profiles');
     } else {
       this.db.exec('DROP TABLE IF EXISTS profile_variable_values');
+    }
+  }
+
+  _seedSystemFacebookVariableProfiles() {
+    const now = new Date().toISOString();
+    const insertProfile = this.db.prepare(`
+      INSERT OR IGNORE INTO variable_profiles (id, name, variables_json, is_system, is_dirty, updated_at)
+      VALUES (?, ?, ?, 1, 0, ?)
+    `);
+    const updateProfile = this.db.prepare(`
+      UPDATE variable_profiles
+      SET name = ?, variables_json = ?, is_system = 1, updated_at = ?
+      WHERE id = ?
+    `);
+
+    for (const profile of SYSTEM_FACEBOOK_VARIABLE_PROFILES) {
+      const variablesJson = serializeTemplateKeys(profile.keys.map((key) => ({ key })));
+      insertProfile.run(profile.id, profile.name, variablesJson, now);
+      updateProfile.run(profile.name, variablesJson, now, profile.id);
+    }
+  }
+
+  syncFacebookCrawlScenarioBindings(settings = {}) {
+    const groupScenarioId = String(settings[FACEBOOK_CRAWL_SETTINGS.groupScenarioId] || '').trim();
+    const commentScenarioId = String(settings[FACEBOOK_CRAWL_SETTINGS.commentScenarioId] || '').trim();
+
+    if (groupScenarioId) {
+      this.setScenarioVariableProfileId(groupScenarioId, FACEBOOK_CRAWL_GROUP_PROFILE_ID);
+    }
+    if (commentScenarioId) {
+      this.setScenarioVariableProfileId(commentScenarioId, FACEBOOK_CRAWL_COMMENT_PROFILE_ID);
     }
   }
 
@@ -599,6 +641,7 @@ class DatabaseService {
           id             TEXT PRIMARY KEY,
           name           TEXT NOT NULL UNIQUE,
           variables_json TEXT NOT NULL DEFAULT '[]',
+          is_system      INTEGER NOT NULL DEFAULT 0,
           is_dirty       INTEGER NOT NULL DEFAULT 1,
           updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
         );
@@ -1047,11 +1090,23 @@ class DatabaseService {
     const json = serializeVariableEntries(variables);
 
     this.setScenarioMetaValue(scenarioId, 'local_variables', json);
-    this.db.prepare(`
-      UPDATE scenarios
-      SET is_dirty = 1, updated_at = ?
-      WHERE id = ?
-    `).run(now, scenarioId);
+    const hasLocalVariablesColumn = this.db
+      .prepare('PRAGMA table_info(scenarios)')
+      .all()
+      .some((col) => col.name === 'local_variables');
+    if (hasLocalVariablesColumn) {
+      this.db.prepare(`
+        UPDATE scenarios
+        SET local_variables = ?, is_dirty = 1, updated_at = ?
+        WHERE id = ?
+      `).run(json, now, scenarioId);
+    } else {
+      this.db.prepare(`
+        UPDATE scenarios
+        SET is_dirty = 1, updated_at = ?
+        WHERE id = ?
+      `).run(now, scenarioId);
+    }
 
     return this.getScenarioLocalVariables(scenarioId);
   }
@@ -1151,15 +1206,16 @@ class DatabaseService {
   getVariableProfiles() {
     return this.db
       .prepare(`
-        SELECT id, name, variables_json, updated_at
+        SELECT id, name, variables_json, is_system, updated_at
         FROM variable_profiles
-        ORDER BY name ASC
+        ORDER BY is_system DESC, name ASC
       `)
       .all()
       .map((profile) => ({
         id: profile.id,
         name: profile.name,
         updated_at: profile.updated_at,
+        is_system: Boolean(profile.is_system),
         keys: normalizeTemplateKeys(profile.variables_json).map((item) => item.key),
         variables: normalizeTemplateKeys(profile.variables_json),
       }));
@@ -1167,7 +1223,7 @@ class DatabaseService {
 
   getVariableProfileById(profileId) {
     const profile = this.db
-      .prepare('SELECT id, name, variables_json, updated_at FROM variable_profiles WHERE id = ?')
+      .prepare('SELECT id, name, variables_json, is_system, updated_at FROM variable_profiles WHERE id = ?')
       .get(profileId);
     if (!profile) return null;
 
@@ -1176,6 +1232,7 @@ class DatabaseService {
       id: profile.id,
       name: profile.name,
       updated_at: profile.updated_at,
+      is_system: Boolean(profile.is_system),
       keys: keys.map((item) => item.key),
       variables: keys,
     };
@@ -1185,6 +1242,15 @@ class DatabaseService {
     const id = profile.id || crypto.randomUUID();
     const name = String(profile.name || '').trim();
     const now = new Date().toISOString();
+    const existingById = profile.id
+      ? this.db.prepare('SELECT id, name, variables_json, is_system FROM variable_profiles WHERE id = ?').get(profile.id)
+      : null;
+    const isSystemProfile = Boolean(existingById?.is_system) || isSystemVariableProfile(id);
+
+    if (isSystemProfile) {
+      throw new Error('Khong the chinh sua ho so bien he thong.');
+    }
+
     const hasKeys = Array.isArray(profile.keys)
       || Array.isArray(profile.variables)
       || Array.isArray(profile.values);
@@ -1200,27 +1266,21 @@ class DatabaseService {
       .prepare('SELECT id FROM variable_profiles WHERE name = ?')
       .get(name);
 
-    if (profile.id) {
-      const existingById = this.db
-        .prepare('SELECT id, name, variables_json FROM variable_profiles WHERE id = ?')
-        .get(profile.id);
-
-      if (existingById) {
-        if (existingByName && existingByName.id !== profile.id) {
-          throw new Error('Da ton tai ho so voi ten nay.');
-        }
-
-        this.db.prepare(`
-          UPDATE variable_profiles
-          SET name = ?,
-              variables_json = COALESCE(?, variables_json),
-              is_dirty = 1,
-              updated_at = ?
-          WHERE id = ?
-        `).run(name, variablesJson, now, profile.id);
-
-        return this.getVariableProfileById(profile.id);
+    if (profile.id && existingById) {
+      if (existingByName && existingByName.id !== profile.id) {
+        throw new Error('Da ton tai ho so voi ten nay.');
       }
+
+      this.db.prepare(`
+        UPDATE variable_profiles
+        SET name = ?,
+            variables_json = COALESCE(?, variables_json),
+            is_dirty = 1,
+            updated_at = ?
+        WHERE id = ?
+      `).run(name, variablesJson, now, profile.id);
+
+      return this.getVariableProfileById(profile.id);
     }
 
     if (existingByName) {
@@ -1252,6 +1312,10 @@ class DatabaseService {
   }
 
   deleteVariableProfile(id) {
+    if (isSystemVariableProfile(id)) {
+      throw new Error('Khong the xoa ho so bien he thong.');
+    }
+
     this.db.prepare(`
       UPDATE scenarios_meta
       SET meta_value = NULL, updated_at = ?
@@ -1664,9 +1728,30 @@ class DatabaseService {
           }
         }
       }
+    } else {
+      this._mergeVariableProfileSampleDefaults(scenarioId, resolved);
     }
 
     return resolved;
+  }
+
+  _mergeVariableProfileSampleDefaults(scenarioId, resolved) {
+    const profileId = this.getScenarioMeta(scenarioId).variable_profile_id;
+    if (!profileId) return;
+
+    const samples = this.getVariableProfileSamples(profileId);
+    if (!samples.length) return;
+
+    const preferred = samples.find((sample) => sample.name === 'Default') || samples[0];
+    for (const item of preferred.variables || []) {
+      const key = String(item.key || '').trim();
+      if (!key) continue;
+      const value = item.value ?? '';
+      if (value === '') continue;
+      if (!resolved.has(key) || resolved.get(key) === '') {
+        resolved.set(key, value);
+      }
+    }
   }
 
   buildResolvedVariables(scenarioId, sampleId = null) {

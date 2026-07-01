@@ -1,3 +1,11 @@
+import { enrichFacebookCrawlPosts } from './facebookCrawlConfig.js';
+import {
+  mergeInteractionStats,
+  parseInteractionCount,
+  pickFeedbackStats,
+  pickReactionCount,
+} from './facebookInteractionCounts.js';
+
 const DEFAULT_POST_AUTHOR = 'Không rõ nguồn';
 const DEFAULT_GROUP_SLUG = 'wordpressvnteam';
 
@@ -23,6 +31,17 @@ export function buildFacebookPostLink(postId, groupSlug = DEFAULT_GROUP_SLUG) {
   if (!postId) return '';
   const slug = String(groupSlug || DEFAULT_GROUP_SLUG).trim() || DEFAULT_GROUP_SLUG;
   return `https://www.facebook.com/groups/${slug}/posts/${postId}/`;
+}
+
+export function extractFacebookPostId(urlOrId = '') {
+  const text = String(urlOrId || '').trim();
+  if (!text) return '';
+
+  const fromUrl = text.match(/\/posts\/(\d+)/i);
+  if (fromUrl?.[1]) return fromUrl[1];
+
+  if (/^\d+$/.test(text)) return text;
+  return '';
 }
 
 function isAnonymousAuthorName(name) {
@@ -167,6 +186,46 @@ function pickPostId(node) {
   return node?.post_id || node?.fbid || node?.legacy_fbid || node?.id || null;
 }
 
+function pickStoryCreationTime(story) {
+  if (!story || typeof story !== 'object') return null;
+
+  const paths = [
+    story?.creation_time,
+    story?.comet_sections?.metadata?.story?.creation_time,
+    story?.comet_sections?.context_layout?.story?.comet_sections?.metadata?.story?.creation_time,
+    story?.feedback?.creation_time,
+    story?.attached_story?.creation_time,
+    story?.comet_sections?.timestamp?.story?.creation_time,
+  ];
+
+  for (const candidate of paths) {
+    if (candidate == null || candidate === '') continue;
+    const num = Number(candidate);
+    if (Number.isFinite(num) && num > 0) return num;
+  }
+
+  return null;
+}
+
+/**
+ * Convert Facebook UNIX timestamp (seconds or ms) to YYYY-MM-DD (local date).
+ * @param {number|string|null|undefined} unixValue
+ * @returns {string|null}
+ */
+export function formatFacebookPostDate(unixValue) {
+  const ts = Number(unixValue);
+  if (!Number.isFinite(ts) || ts <= 0) return null;
+
+  const ms = ts > 1e12 ? ts : ts * 1000;
+  const date = new Date(ms);
+  if (Number.isNaN(date.getTime())) return null;
+
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
 function pickStoryMessageText(story) {
   if (!story || typeof story !== 'object') return '';
 
@@ -196,6 +255,9 @@ function extractPostFromStory(story, groupSlug = DEFAULT_GROUP_SLUG) {
     const author_link = pickStoryAuthorLink(story);
     const post_content = pickStoryMessageText(story);
     const post_link = post_id ? buildFacebookPostLink(post_id, groupSlug) : '';
+    const creationTime = pickStoryCreationTime(story);
+    const post_date = formatFacebookPostDate(creationTime);
+    const feedbackStats = pickFeedbackStats(story?.feedback || story);
 
     if (!post_content && !post_id) return null;
 
@@ -205,6 +267,10 @@ function extractPostFromStory(story, groupSlug = DEFAULT_GROUP_SLUG) {
       author_link,
       post_link,
       post_content,
+      post_date,
+      like_count: feedbackStats.like_count,
+      share_count: feedbackStats.share_count,
+      comment_count: feedbackStats.comment_count,
       comments: [],
     };
   } catch {
@@ -212,8 +278,32 @@ function extractPostFromStory(story, groupSlug = DEFAULT_GROUP_SLUG) {
   }
 }
 
+function looksLikeCommentNode(comment) {
+  if (!comment || typeof comment !== 'object') return false;
+  if (comment.__typename === 'Comment') return true;
+
+  const text = (
+    comment?.body?.text
+    || comment?.preferred_body?.text
+    || ''
+  ).trim();
+  const hasAuthor = Boolean(
+    comment?.author?.name
+    || comment?.actor?.name,
+  );
+
+  return Boolean(text && hasAuthor && comment?.id);
+}
+
+function pickPostIdFromFeedbackNode(node) {
+  const id = node?.id || node?.legacy_fbid || '';
+  const decoded = looksLikeBase64GraphQlId(id) ? decodeBase64Ascii(id) : id;
+  const match = String(decoded || '').match(/(\d{10,})/);
+  return match?.[1] || '';
+}
+
 function extractCommentFromNode(comment) {
-  if (!comment || comment.__typename !== 'Comment') return null;
+  if (!looksLikeCommentNode(comment)) return null;
 
   try {
     const comment_content = (
@@ -229,10 +319,97 @@ function extractCommentFromNode(comment) {
       comment_author: pickCommentAuthor(comment),
       comment_content,
       created_time: comment?.created_time ?? comment?.timestamp ?? null,
+      like_count: pickReactionCount(comment),
     };
   } catch {
     return null;
   }
+}
+
+function mergeCommentFields(existing, incoming) {
+  if (!existing || !incoming) return;
+  if (!existing.comment_id && incoming.comment_id) existing.comment_id = incoming.comment_id;
+  if (!existing.created_time && incoming.created_time != null) {
+    existing.created_time = incoming.created_time;
+  }
+  const nextLikes = parseInteractionCount(incoming.like_count);
+  const currentLikes = parseInteractionCount(existing.like_count);
+  if (nextLikes > currentLikes) existing.like_count = nextLikes;
+}
+
+function registerComment(parsed, ctx) {
+  if (!parsed?.comment_content) return;
+
+  const dedupeKey = parsed.comment_id
+    || `${parsed.comment_author || ''}::${parsed.comment_content}`;
+  const bucket = ctx.activePostKey && ctx.postsByKey.has(ctx.activePostKey)
+    ? ctx.postsByKey.get(ctx.activePostKey).comments
+    : ctx.orphanComments;
+
+  if (ctx.seenComments.has(dedupeKey)) {
+    const existing = bucket.find((item) => (
+      (parsed.comment_id && item.comment_id === parsed.comment_id)
+      || `${item.comment_author || ''}::${item.comment_content}` === dedupeKey
+    ));
+    if (existing) mergeCommentFields(existing, parsed);
+    return;
+  }
+
+  ctx.seenComments.add(dedupeKey);
+  const commentItem = {
+    comment_author: parsed.comment_author,
+    comment_content: parsed.comment_content,
+    like_count: parseInteractionCount(parsed.like_count),
+  };
+  if (parsed.comment_id) commentItem.comment_id = parsed.comment_id;
+  if (parsed.created_time != null) commentItem.created_time = parsed.created_time;
+  bucket.push(commentItem);
+}
+
+function applyFeedbackToContext(feedback, ctx) {
+  if (!feedback || typeof feedback !== 'object') return;
+
+  const stats = pickFeedbackStats(feedback);
+  const postId = pickPostIdFromFeedbackNode(feedback);
+
+  if (postId) {
+    const key = postId;
+    if (!ctx.postsByKey.has(key)) {
+      ctx.postsByKey.set(key, {
+        ...createEmptyPost(ctx.groupSlug),
+        post_id: postId,
+        post_link: buildFacebookPostLink(postId, ctx.groupSlug),
+        ...stats,
+        comments: [],
+      });
+    } else {
+      Object.assign(
+        ctx.postsByKey.get(key),
+        mergeInteractionStats(ctx.postsByKey.get(key), stats),
+      );
+    }
+    ctx.activePostKey = key;
+    return;
+  }
+
+  if (ctx.activePostKey && ctx.postsByKey.has(ctx.activePostKey)) {
+    Object.assign(
+      ctx.postsByKey.get(ctx.activePostKey),
+      mergeInteractionStats(ctx.postsByKey.get(ctx.activePostKey), stats),
+    );
+  }
+}
+
+function extractCommentsFromEdges(node, ctx) {
+  if (!node || !Array.isArray(node.edges) || !node.edges.length) return;
+
+  const sample = node.edges[0]?.node;
+  if (!looksLikeCommentNode(sample)) return;
+
+  node.edges.forEach((edge) => {
+    const parsed = extractCommentFromNode(edge?.node);
+    if (parsed) registerComment(parsed, ctx);
+  });
 }
 
 const COMMENT_CONTEXT_KEYS = new Set([
@@ -259,34 +436,24 @@ function walkGraph(node, ctx, depth = 0, inCommentContext = false) {
       const key = post.post_id || `story:${post.post_content.slice(0, 120)}`;
       if (!ctx.postsByKey.has(key)) {
         ctx.postsByKey.set(key, { ...post, comments: [] });
+      } else {
+        mergePostFields(ctx.postsByKey.get(key), post);
       }
       ctx.activePostKey = key;
     }
   }
 
-  if (node.__typename === 'Comment') {
-    const parsed = extractCommentFromNode(node);
-    if (parsed) {
-      const dedupeKey = parsed.comment_id || `${parsed.comment_author || ''}::${parsed.comment_content}`;
-      if (!ctx.seenComments.has(dedupeKey)) {
-        ctx.seenComments.add(dedupeKey);
-        const commentItem = {
-          comment_author: parsed.comment_author,
-          comment_content: parsed.comment_content,
-        };
-        if (parsed.comment_id) commentItem.comment_id = parsed.comment_id;
-        if (parsed.created_time != null) commentItem.created_time = parsed.created_time;
+  if (node.__typename === 'Feedback') {
+    applyFeedbackToContext(node, ctx);
+  }
 
-        const bucket = ctx.activePostKey && ctx.postsByKey.has(ctx.activePostKey)
-          ? ctx.postsByKey.get(ctx.activePostKey).comments
-          : ctx.orphanComments;
-        bucket.push(commentItem);
-      }
-    }
-    return;
+  if (node.__typename === 'Comment' || looksLikeCommentNode(node)) {
+    const parsed = extractCommentFromNode(node);
+    if (parsed) registerComment(parsed, ctx);
   }
 
   if (Array.isArray(node.edges)) {
+    extractCommentsFromEdges(node, ctx);
     node.edges.forEach((edge) => {
       if (edge?.node) {
         walkGraph(edge.node, ctx, depth + 1, true);
@@ -316,6 +483,10 @@ function createEmptyPost(groupSlug) {
     author_link: null,
     post_link: '',
     post_content: '',
+    post_date: null,
+    like_count: 0,
+    share_count: 0,
+    comment_count: 0,
     comments: [],
     ...(groupSlug ? { _group_slug: groupSlug } : {}),
   };
@@ -377,6 +548,8 @@ function mergePostFields(existing, incoming) {
   if (!existing.author_link && incoming.author_link) existing.author_link = incoming.author_link;
   if (!existing.post_link && incoming.post_link) existing.post_link = incoming.post_link;
   if (!existing.post_id && incoming.post_id) existing.post_id = incoming.post_id;
+  if (!existing.post_date && incoming.post_date) existing.post_date = incoming.post_date;
+  Object.assign(existing, mergeInteractionStats(existing, incoming));
 }
 
 /**
@@ -395,9 +568,19 @@ export function parseFacebookGraphQLBatch(rawObjects, options = {}) {
       if (!comment?.comment_content) return;
       const dedupeKey = comment.comment_id
         || `${comment.comment_author || ''}::${comment.comment_content}`;
-      if (seenComments.has(dedupeKey)) return;
+      if (seenComments.has(dedupeKey)) {
+        const existing = targetComments.find((item) => (
+          (comment.comment_id && item.comment_id === comment.comment_id)
+          || `${item.comment_author || ''}::${item.comment_content}` === dedupeKey
+        ));
+        if (existing) mergeCommentFields(existing, comment);
+        return;
+      }
       seenComments.add(dedupeKey);
-      targetComments.push(comment);
+      targetComments.push({
+        ...comment,
+        like_count: parseInteractionCount(comment.like_count),
+      });
     });
   };
 
@@ -446,5 +629,5 @@ export function parseFacebookGraphQLBatch(rawObjects, options = {}) {
     });
   }
 
-  return results;
+  return enrichFacebookCrawlPosts(results, options);
 }
