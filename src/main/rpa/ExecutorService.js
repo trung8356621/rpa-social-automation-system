@@ -5,11 +5,22 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer';
 import { getCrawlExtractionScript } from './CardExtractorScript.js';
-import { parseFacebookGraphQLBatch } from '../../shared/parseFacebookGraphQL.js';
-import { crawlConditionMatched } from '../../shared/crawlStopCondition.js';
+import {
+  applyFacebookCommentCrawlMetaOverrides,
+  applyFacebookCrawlSettingsToMeta,
+  isFacebookCommentCrawlUrl,
+} from '../../shared/facebookCrawlConfig.js';
+import {
+  countParsedFacebookComments,
+  getExpectedFacebookCommentCount,
+  parseFacebookGraphQLBatch,
+} from '../../shared/parseFacebookGraphQL.js';
+import { crawlConditionShouldStopScroll } from '../../shared/crawlStopCondition.js';
 import {
   isCrawlScrollAtBottom,
   isCrawlScrollStuck,
+  resolveCrawlScrollContext,
+  resolveCrawlScrollLoopConfig,
   runCrawlScrollStep,
   shouldStopCrawlScrollEarly,
 } from '../../shared/crawlScroll.js';
@@ -24,6 +35,20 @@ const DEFAULT_ACTION_DELAY_MS = 300;
 const DEFAULT_BROWSER_CLOSE_DELAY_MS = 5000;
 const MIN_BROWSER_CLOSE_DELAY_MS = 1000;
 const MAX_BROWSER_CLOSE_DELAY_MS = 120000;
+
+function buildPuppeteerProxyLaunchArgs(proxy) {
+  if (!proxy?.ip || !proxy?.port) return [];
+  const protocol = String(proxy.protocol || 'http').replace(/:$/, '');
+  return [`--proxy-server=${protocol}://${proxy.ip}:${proxy.port}`];
+}
+
+async function applyPageProxyAuth(page, proxy) {
+  if (!proxy?.username || !page) return;
+  await page.authenticate({
+    username: proxy.username,
+    password: proxy.password || '',
+  });
+}
 
 // Module-level lock: prevents two executors from launching Chrome against the
 // same userDataDir simultaneously. Maps dir → resolve-fn of the pending lock.
@@ -102,6 +127,13 @@ class ExecutorService {
       this._failedStepIndex = null;
 
       this._variableMap = this.dbService.buildVariableMap(scenarioId, this._currentSampleId);
+      if (Array.isArray(options.runtimeVariables)) {
+        options.runtimeVariables.forEach((item) => {
+          const key = String(item?.key || '').trim();
+          if (!key) return;
+          this._variableMap.set(key, item?.value ?? '');
+        });
+      }
       if (this._currentSampleId) {
         console.log(
           `[Executor] Sample "${variableSampleName || this._currentSampleId}" `
@@ -439,24 +471,32 @@ class ExecutorService {
     }
 
     const headless = options.headless === true;
+    const proxyId = options.proxyId ?? null;
+    const proxyConfig = proxyId ? this.dbService.getProxyById?.(proxyId) : null;
+    const launchArgs = [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--disable-blink-features=AutomationControlled',
+      `--window-size=${viewport.width},${viewport.height}`,
+      ...buildPuppeteerProxyLaunchArgs(proxyConfig),
+    ];
     this.browser = await puppeteer.launch({
       headless,
       userDataDir,
       defaultViewport: viewport,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--disable-blink-features=AutomationControlled',
-        `--window-size=${viewport.width},${viewport.height}`,
-      ],
+      args: launchArgs,
     });
 
     const existingPages = await this.browser.pages();
     this.page = existingPages[0] || await this.browser.newPage();
     for (const extraPage of existingPages.slice(1)) {
       await extraPage.close().catch(() => {});
+    }
+
+    if (proxyConfig) {
+      await applyPageProxyAuth(this.page, proxyConfig);
     }
 
     this.page.setDefaultTimeout(30000);
@@ -777,7 +817,15 @@ class ExecutorService {
     const targetUrl = resolveScenarioTargetUrl(String(scenario?.target_url || '').trim(), map)
       || this.page.url()
       || '';
-    const crawlMeta = getCrawlMeta(scenario?.scenario_meta);
+    const crawlMeta = (() => {
+      const base = applyFacebookCrawlSettingsToMeta(
+        getCrawlMeta(scenario?.scenario_meta),
+        this.dbService.getSettings(),
+      );
+      return isFacebookCommentCrawlUrl(targetUrl)
+        ? applyFacebookCommentCrawlMetaOverrides(base)
+        : base;
+    })();
     const infinite = crawlMeta.infinity_scroll || {};
     const resolvedCondition = {
       ...infinite.condition,
@@ -785,9 +833,41 @@ class ExecutorService {
     };
     const customFilters = scenario?.scenario_meta?.request_catching?.filters || {};
     const rawCaptured = [];
-    let scrollStopRequested = false;
+    let conditionStopPending = false;
+    const scrollProgress = { completedBatches: 0 };
+    const commentCrawlProgress = { lastCount: 0, stagnantBatches: 0 };
 
-    const shouldCheckStopCondition = infinite.enabled && infinite.stop_mode === 'condition';
+    const isSinglePostCrawl = isFacebookCommentCrawlUrl(targetUrl);
+    const shouldCheckStopCondition = infinite.enabled
+      && infinite.stop_mode === 'condition'
+      && !isSinglePostCrawl;
+
+    const shouldStopCommentCrawl = () => {
+      if (!isSinglePostCrawl) return false;
+
+      const parsed = parseFacebookGraphQLBatch(rawCaptured, { targetUrl, variables: map });
+      const count = countParsedFacebookComments(parsed);
+      const expected = getExpectedFacebookCommentCount(parsed);
+
+      if (count > commentCrawlProgress.lastCount) {
+        commentCrawlProgress.lastCount = count;
+        commentCrawlProgress.stagnantBatches = 0;
+      } else {
+        commentCrawlProgress.stagnantBatches += 1;
+      }
+
+      if (expected > 0 && count >= expected) {
+        console.log(`[Executor] Comment crawl complete: ${count}/${expected}`);
+        return true;
+      }
+
+      if (commentCrawlProgress.stagnantBatches >= 4) {
+        console.log(`[Executor] Comment crawl stalled at ${count} comments (expected ${expected || '?'})`);
+        return true;
+      }
+
+      return false;
+    };
 
     const capture = new RequestCatchingPuppeteerCapture();
     this._requestCatchingCapture = capture;
@@ -800,19 +880,29 @@ class ExecutorService {
           rawCaptured.length = 0;
           rawCaptured.push(...merged);
 
-          if (!shouldCheckStopCondition || scrollStopRequested) return;
+          if (!shouldCheckStopCondition || conditionStopPending) return;
 
           const parsedBatch = parseFacebookGraphQLBatch(items, { targetUrl, variables: map });
-          if (crawlConditionMatched(parsedBatch, resolvedCondition)) {
-            scrollStopRequested = true;
-            console.log('[Executor] Request catching stop condition matched — stopping scroll');
+          if (crawlConditionShouldStopScroll(parsedBatch, resolvedCondition)) {
+            conditionStopPending = true;
+            console.log('[Executor] Stop condition matched — finishing current scroll batch before stopping');
           }
         },
       });
 
       await this._navigateToScenarioStart(scenario);
       await this._sleep(1500);
-      await this._runRequestCatchingScroll(crawlMeta, () => scrollStopRequested);
+      await this._runRequestCatchingScroll(
+        crawlMeta,
+        () => false,
+        targetUrl,
+        (loopConfig) => {
+          if (shouldStopCommentCrawl()) return true;
+          return conditionStopPending
+            && scrollProgress.completedBatches >= (loopConfig?.minBatchesBeforeConditionStop || 1);
+        },
+        scrollProgress,
+      );
       await this._waitForRequestCatchingSettle();
     } finally {
       await capture.stop();
@@ -829,10 +919,13 @@ class ExecutorService {
 
     let facebookDbSave = null;
     if (platform === 'facebook' && this.platformCrawledDataService) {
-      facebookDbSave = this.platformCrawledDataService.saveFacebookPostsBatch(
+      facebookDbSave = await this.platformCrawledDataService.saveFacebookPostsBatch(
         cleaned.filter((post) => post?.post_id),
         { group_link: targetUrl },
-        { platform: 'facebook' },
+        {
+          platform: 'facebook',
+          supplement: isSinglePostCrawl,
+        },
       );
       console.log(
         `[Executor] Facebook DB save: ${facebookDbSave.saved} saved, ${facebookDbSave.failed} failed`,
@@ -850,7 +943,7 @@ class ExecutorService {
       capture_count: cleaned.length,
       crawledData: cleaned,
       facebook_db_save: facebookDbSave,
-      scroll_stopped_by_condition: scrollStopRequested,
+      scroll_stopped_by_condition: conditionStopPending,
       cards: cleaned.map((item, index) => ({
         card_index: index,
         data: item,
@@ -861,55 +954,110 @@ class ExecutorService {
     return payload;
   }
 
+  async _waitForScrollBatchSettle(settleMs = 4000) {
+    const waitMs = Math.max(3000, Number(settleMs) || 4000);
+    const startedAt = Date.now();
+
+    if (!this.page || this.page.isClosed()) {
+      await this._sleep(waitMs);
+      return;
+    }
+
+    try {
+      await this.page.waitForNetworkIdle({ idleTime: 900, timeout: waitMs });
+    } catch {
+      // Ignore network-idle timeout — minimum wait below still applies.
+    }
+
+    const elapsed = Date.now() - startedAt;
+    if (elapsed < waitMs) {
+      await this._sleep(waitMs - elapsed);
+    }
+  }
+
   async _waitForRequestCatchingSettle() {
     if (!this.page || this.page.isClosed()) return;
 
     try {
       await Promise.race([
-        this.page.waitForNetworkIdle({ idleTime: 800, timeout: 10000 }),
-        this._sleep(5000),
+        this.page.waitForNetworkIdle({ idleTime: 1000, timeout: 15000 }),
+        this._sleep(8000),
       ]);
     } catch {
-      await this._sleep(4000);
+      await this._sleep(6000);
     }
   }
 
-  async _runRequestCatchingScroll(crawlMeta = {}, shouldStop = () => false) {
+  async _runRequestCatchingScroll(
+    crawlMeta = {},
+    shouldStop = () => false,
+    targetUrl = '',
+    shouldStopAfterSettle = () => false,
+    scrollProgress = null,
+  ) {
     if (!this.page || this.page.isClosed()) return;
 
     const autoscroll = crawlMeta.autoscroll || {};
     const infinite = crawlMeta.infinity_scroll || {};
-    const scrollDistance = Math.max(100, Number(autoscroll.distance_px) || 600);
-    const scrollDelay = Math.max(100, Number(autoscroll.delay_ms) || 500);
     const shouldScroll = autoscroll.enabled || infinite.enabled;
+    const scrollContext = resolveCrawlScrollContext(targetUrl || this.page.url());
 
     if (!shouldScroll) {
-      await this._sleep(Math.max(2000, scrollDelay * 2));
+      await this._sleep(Math.max(2000, Number(autoscroll.delay_ms) || 500) * 2);
       return;
     }
 
-    let previousState = await this.page.evaluate(runCrawlScrollStep, 0, 'reset');
-    await this._sleep(scrollDelay);
+    const loop = resolveCrawlScrollLoopConfig(crawlMeta, scrollContext);
+
+    let previousState = scrollContext === 'comments'
+      ? await this.page.evaluate(runCrawlScrollStep, 0, 'reset', scrollContext)
+      : await this.page.evaluate(runCrawlScrollStep, 0, 'read', scrollContext);
+    await this._sleep(loop.initialDelayMs);
 
     const startedAt = Date.now();
-    const timeoutMs = Math.max(1000, Number(infinite.timeout_ms) || 30000);
-    const maxScrolls = infinite.enabled
-      ? Math.max(1, Math.min(200, Number(infinite.max_scrolls) || 30))
-      : 5;
+    let totalScrolls = 0;
 
-    for (let scrollIndex = 0; scrollIndex < maxScrolls; scrollIndex += 1) {
+    for (let batchIndex = 0; batchIndex < loop.maxBatches; batchIndex += 1) {
       if (shouldStop()) break;
-      if (infinite.enabled && Date.now() - startedAt >= timeoutMs) break;
+      if (loop.infiniteEnabled && Date.now() - startedAt >= loop.timeoutMs) break;
 
-      const nextState = await this.page.evaluate(runCrawlScrollStep, scrollDistance, 'scroll');
-      await this._sleep(scrollDelay);
+      const remainingScrolls = loop.maxScrolls - totalScrolls;
+      const batchSize = Math.min(loop.scrollsPerBatch, remainingScrolls);
+      if (batchSize <= 0) break;
+
+      console.log(`[Executor] Scroll batch ${batchIndex + 1}/${loop.maxBatches} (${batchSize} scrolls)`);
+
+      let nextState = previousState;
+      for (let scrollIndex = 0; scrollIndex < batchSize; scrollIndex += 1) {
+        if (shouldStop()) break;
+
+        nextState = await this.page.evaluate(
+          runCrawlScrollStep,
+          loop.scrollDistance,
+          'scroll',
+          scrollContext,
+        );
+        totalScrolls += 1;
+
+        if (scrollIndex < batchSize - 1) {
+          await this._sleep(loop.betweenScrollMs);
+        }
+      }
 
       if (shouldStop()) break;
+
+      await this._waitForScrollBatchSettle(loop.settleMs);
+
+      if (scrollProgress) {
+        scrollProgress.completedBatches += 1;
+      }
+
+      if (shouldStop() || shouldStopAfterSettle(loop)) break;
 
       const atBottom = await this.page.evaluate(isCrawlScrollAtBottom, nextState);
       const didNotMove = await this.page.evaluate(isCrawlScrollStuck, previousState, nextState);
       if (shouldStopCrawlScrollEarly({
-        infiniteEnabled: infinite.enabled,
+        infiniteEnabled: loop.infiniteEnabled,
         atBottom,
         didNotMove,
       })) break;

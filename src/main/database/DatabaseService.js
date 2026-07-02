@@ -1850,6 +1850,11 @@ class DatabaseService {
       .all();
   }
 
+  getProxyById(id) {
+    if (!id) return null;
+    return this.db.prepare('SELECT * FROM proxies WHERE id = ?').get(id) || null;
+  }
+
   /**
    * Lưu hoặc cập nhật một proxy.
    * Nếu proxy có id → UPDATE, nếu không → INSERT.

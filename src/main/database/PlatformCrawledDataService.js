@@ -2,10 +2,19 @@ import Database from 'better-sqlite3';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { extractFacebookGroupSlug } from '../../shared/parseFacebookGraphQL.js';
 import { parseInteractionCount } from '../../shared/facebookInteractionCounts.js';
+import {
+  parseFacebookMediaUrls,
+  serializeFacebookMediaUrls,
+} from '../../shared/facebookMediaExtract.js';
+import { FacebookPostImageDownloader } from '../media/FacebookPostImageDownloader.js';
 
 const DEFAULT_UNKNOWN_AUTHOR = 'unknown_author';
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const DEFAULT_PROJECT_ROOT = path.join(__dirname, '..', '..', '..');
 
 /**
  * PlatformCrawledDataService — SQLite riêng cho dữ liệu cào theo từng nền tảng.
@@ -18,16 +27,33 @@ const DEFAULT_UNKNOWN_AUTHOR = 'unknown_author';
 export class PlatformCrawledDataService {
   /**
    * @param {string} appDataPath - Thư mục userData của Electron (tương đương ./data/ trong app).
+   * @param {{ projectRoot?: string }} [options]
    */
-  constructor(appDataPath) {
+  constructor(appDataPath, options = {}) {
     if (!appDataPath) {
       throw new Error('[PlatformCrawledDataService] appDataPath is required.');
     }
 
     this.appDataPath = appDataPath;
+    this.projectRoot = options.projectRoot || DEFAULT_PROJECT_ROOT;
     this.dataDir = path.join(appDataPath, 'data');
+    this.postImageDownloader = new FacebookPostImageDownloader({
+      projectRoot: this.projectRoot,
+    });
     /** @type {Map<string, Database.Database>} */
     this.connections = new Map();
+  }
+
+  resolveFacebookMediaFileUrl(relativePath = '') {
+    const absolutePath = this.postImageDownloader.resolveAbsolutePath(relativePath);
+    if (!absolutePath || !fs.existsSync(absolutePath)) return '';
+    return `rpa-cache://file/${Buffer.from(absolutePath).toString('base64url')}`;
+  }
+
+  resolveFacebookMediaAbsolutePath(relativePath = '') {
+    const absolutePath = this.postImageDownloader.resolveAbsolutePath(relativePath);
+    if (!absolutePath || !fs.existsSync(absolutePath)) return '';
+    return absolutePath;
   }
 
   /**
@@ -82,12 +108,13 @@ export class PlatformCrawledDataService {
    * @param {string} [options.platform='facebook']
    * @returns {{ success: boolean, post_id?: string, error?: string }}
    */
-  saveFacebookPostWithComments(postData, groupInfo = {}, options = {}) {
+  async saveFacebookPostWithComments(postData, groupInfo = {}, options = {}) {
     const platform = options.platform || 'facebook';
+    const supplement = options.supplement === true;
 
     try {
       const db = this.connectPlatformDatabase(platform);
-      const normalizedPost = normalizeFacebookPostInput(postData);
+      let normalizedPost = normalizeFacebookPostInput(postData);
       const normalizedGroup = normalizeFacebookGroupInfo(groupInfo, normalizedPost);
 
       if (!normalizedPost.post_id) {
@@ -97,10 +124,63 @@ export class PlatformCrawledDataService {
         return { success: false, error: 'group_id is required' };
       }
 
-      const postAuthorId = resolveFacebookAuthorId(
+      const existingPost = db.prepare(`
+        SELECT
+          post_id,
+          group_id,
+          author_id,
+          post_link,
+          post_content,
+          post_date,
+          like_count,
+          share_count,
+          comment_count,
+          post_images,
+          local_image_path
+        FROM posts
+        WHERE post_id = ?
+      `).get(normalizedPost.post_id);
+
+      const existingAuthor = existingPost?.author_id
+        ? db.prepare('SELECT author_id, author_name, author_link FROM authors WHERE author_id = ?')
+          .get(existingPost.author_id)
+        : null;
+
+      if (supplement && existingPost) {
+        normalizedPost = mergeSupplementFacebookPostFields(
+          existingPost,
+          existingAuthor,
+          normalizedPost,
+        );
+      }
+
+      let localImagePath = String(existingPost?.local_image_path || normalizedPost.local_image_path || '').trim();
+      const imageUrls = parseFacebookMediaUrls(normalizedPost.post_images);
+      if (!localImagePath && imageUrls.length) {
+        const downloadedPath = await this.postImageDownloader.downloadPostImage(
+          normalizedPost.post_id,
+          imageUrls,
+        );
+        if (downloadedPath) {
+          localImagePath = downloadedPath;
+        }
+      }
+      normalizedPost.local_image_path = localImagePath;
+      if (localImagePath) {
+        normalizedPost.post_images = '';
+      }
+
+      let postAuthorId = resolveFacebookAuthorId(
         normalizedPost.author_link,
         normalizedPost.post_author,
       );
+      if (
+        supplement
+        && existingPost?.author_id
+        && isUnknownFacebookAuthorName(normalizedPost.post_author)
+      ) {
+        postAuthorId = existingPost.author_id;
+      }
 
       const upsertGroup = db.prepare(`
         INSERT OR REPLACE INTO groups (group_id, group_name, group_link)
@@ -113,15 +193,15 @@ export class PlatformCrawledDataService {
       const upsertPost = db.prepare(`
         INSERT OR REPLACE INTO posts (
           post_id, group_id, author_id, post_link, post_content, post_date,
-          like_count, share_count, comment_count
+          like_count, share_count, comment_count, post_images, local_image_path
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       const upsertComment = db.prepare(`
         INSERT OR REPLACE INTO comments (
-          comment_id, post_id, author_id, comment_content, like_count
+          comment_id, post_id, author_id, comment_content, like_count, comment_images
         )
-        VALUES (?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?)
       `);
 
       const saveTx = db.transaction(() => {
@@ -147,6 +227,8 @@ export class PlatformCrawledDataService {
           normalizedPost.like_count,
           normalizedPost.share_count,
           normalizedPost.comment_count,
+          normalizedPost.post_images || '',
+          normalizedPost.local_image_path || '',
         );
 
         (normalizedPost.comments || []).forEach((comment, index) => {
@@ -173,6 +255,7 @@ export class PlatformCrawledDataService {
             commentAuthorId,
             comment?.comment_content || '',
             parseInteractionCount(comment?.like_count),
+            serializeFacebookMediaUrls(comment?.comment_images),
           );
         });
       });
@@ -196,8 +279,9 @@ export class PlatformCrawledDataService {
    * @param {object} [options]
    * @returns {{ success: boolean, saved: number, failed: number, errors: string[] }}
    */
-  saveFacebookPostsBatch(posts = [], groupInfo = {}, options = {}) {
+  async saveFacebookPostsBatch(posts = [], groupInfo = {}, options = {}) {
     const platform = options.platform || 'facebook';
+    const supplement = options.supplement === true;
     const errors = [];
     let saved = 0;
     let failed = 0;
@@ -213,15 +297,18 @@ export class PlatformCrawledDataService {
       };
     }
 
-    (Array.isArray(posts) ? posts : []).forEach((post) => {
-      const result = this.saveFacebookPostWithComments(post, groupInfo, { platform });
+    for (const post of (Array.isArray(posts) ? posts : [])) {
+      const result = await this.saveFacebookPostWithComments(post, groupInfo, {
+        platform,
+        supplement,
+      });
       if (result.success) {
         saved += 1;
       } else {
         failed += 1;
         if (result.error) errors.push(result.error);
       }
-    });
+    }
 
     return {
       success: failed === 0,
@@ -339,10 +426,13 @@ export class PlatformCrawledDataService {
         p.like_count,
         p.share_count,
         p.comment_count,
+        p.post_images,
+        p.local_image_path,
         p.crawled_at,
         g.group_name,
         a.author_name,
         a.author_name AS post_author,
+        a.author_link,
         (SELECT COUNT(*) FROM comments c WHERE c.post_id = p.post_id) AS crawled_comment_count
       FROM posts p
       LEFT JOIN groups g ON g.group_id = p.group_id
@@ -365,7 +455,10 @@ export class PlatformCrawledDataService {
     sql += ' ORDER BY COALESCE(p.post_date, p.crawled_at) DESC LIMIT ? OFFSET ?';
     params.push(limit, offset);
 
-    return db.prepare(sql).all(...params);
+    return db.prepare(sql).all(...params).map((row) => ({
+      ...row,
+      post_images: row.local_image_path ? '' : row.post_images,
+    }));
   }
 
   /**
@@ -385,9 +478,11 @@ export class PlatformCrawledDataService {
         c.author_id,
         c.comment_content,
         c.like_count,
+        c.comment_images,
         c.crawled_at,
         a.author_name,
         a.author_name AS comment_author,
+        a.author_link,
         p.post_link,
         p.post_content
       FROM comments c
@@ -509,6 +604,22 @@ function migrateFacebookSchema(db) {
   if (!commentColumnNames.has('like_count')) {
     db.exec('ALTER TABLE comments ADD COLUMN like_count INTEGER NOT NULL DEFAULT 0');
   }
+  if (!postColumnNames.has('post_images')) {
+    db.exec('ALTER TABLE posts ADD COLUMN post_images TEXT');
+  }
+  if (!postColumnNames.has('local_image_path')) {
+    db.exec('ALTER TABLE posts ADD COLUMN local_image_path TEXT');
+  }
+  if (!commentColumnNames.has('comment_images')) {
+    db.exec('ALTER TABLE comments ADD COLUMN comment_images TEXT');
+  }
+
+  db.exec(`
+    UPDATE posts
+    SET post_images = ''
+    WHERE TRIM(COALESCE(local_image_path, '')) != ''
+      AND TRIM(COALESCE(post_images, '')) != ''
+  `);
 }
 
 /**
@@ -551,8 +662,64 @@ function normalizeFacebookPostInput(postData = {}) {
     like_count: parseInteractionCount(postData.like_count),
     share_count: parseInteractionCount(postData.share_count),
     comment_count: parseInteractionCount(postData.comment_count),
+    post_images: serializeFacebookMediaUrls(postData.post_images),
+    local_image_path: postData.local_image_path ? String(postData.local_image_path).trim() : '',
     comments: Array.isArray(postData.comments) ? postData.comments : [],
   };
+}
+
+const UNKNOWN_AUTHOR_NAMES = new Set([
+  'không rõ nguồn',
+  'unknown',
+  'unknown_author',
+  'unknown author',
+]);
+
+function isUnknownFacebookAuthorName(name = '') {
+  const normalized = String(name || '').trim().toLowerCase();
+  return !normalized || UNKNOWN_AUTHOR_NAMES.has(normalized);
+}
+
+function mergeSupplementFacebookPostFields(existingPost = {}, existingAuthor = null, incoming = {}) {
+  const merged = { ...incoming };
+
+  if (!String(merged.post_content || '').trim()) {
+    merged.post_content = existingPost.post_content || '';
+  }
+  if (!merged.post_date) {
+    merged.post_date = existingPost.post_date || null;
+  }
+  if (!String(merged.post_link || '').trim()) {
+    merged.post_link = existingPost.post_link || '';
+  }
+  if (!String(merged.local_image_path || '').trim()) {
+    merged.local_image_path = existingPost.local_image_path || '';
+  }
+  if (!String(merged.post_images || '').trim()) {
+    merged.post_images = existingPost.post_images || '';
+  }
+
+  if (isUnknownFacebookAuthorName(merged.post_author)) {
+    merged.post_author = existingAuthor?.author_name || existingPost.post_author || merged.post_author;
+    merged.author_link = existingAuthor?.author_link || merged.author_link || null;
+  } else if (!merged.author_link) {
+    merged.author_link = existingAuthor?.author_link || null;
+  }
+
+  merged.like_count = Math.max(
+    parseInteractionCount(merged.like_count),
+    parseInteractionCount(existingPost.like_count),
+  );
+  merged.share_count = Math.max(
+    parseInteractionCount(merged.share_count),
+    parseInteractionCount(existingPost.share_count),
+  );
+  merged.comment_count = Math.max(
+    parseInteractionCount(merged.comment_count),
+    parseInteractionCount(existingPost.comment_count),
+  );
+
+  return merged;
 }
 
 function normalizeFacebookGroupInfo(groupInfo = {}, postData = {}) {
@@ -616,6 +783,7 @@ function resolveFacebookCommentId(postId, comment = {}, index = 0) {
     postId,
     comment?.comment_author || '',
     comment?.comment_content || '',
+    serializeFacebookMediaUrls(comment?.comment_images),
     index,
   ].join('|');
 

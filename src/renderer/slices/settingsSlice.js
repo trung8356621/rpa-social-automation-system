@@ -13,6 +13,9 @@ export const defaultSettings = {
   'execution.browserCloseDelayMs': 5000,
   'facebook.crawlGroupScenarioId': '',
   'facebook.crawlCommentScenarioId': '',
+  'facebook.crawlScrollSettleSeconds': 4,
+  'facebook.crawlBrowserProfileId': '',
+  'facebook.crawlProxyId': '',
 };
 
 export const fetchSettings = createAsyncThunk(

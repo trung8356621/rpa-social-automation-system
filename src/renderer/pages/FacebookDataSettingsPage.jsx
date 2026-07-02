@@ -8,6 +8,7 @@ import {
   FACEBOOK_CRAWL_COMMENT_PROFILE_ID,
   FACEBOOK_CRAWL_GROUP_PROFILE_ID,
   FACEBOOK_CRAWL_SETTINGS,
+  DEFAULT_FACEBOOK_CRAWL_SCROLL_SETTLE_SECONDS,
 } from '../../shared/facebookCrawlConfig.js';
 
 const CRAWL_SCENARIO_TYPES = new Set(['crawl', 'request_catching']);
@@ -57,6 +58,8 @@ export default function FacebookDataSettingsPage() {
   const { values, loading, saving, saved, error } = useSelector((state) => state.settings);
   const [scenarios, setScenarios] = useState([]);
   const [variableProfiles, setVariableProfiles] = useState([]);
+  const [browserProfileOptions, setBrowserProfileOptions] = useState([]);
+  const [proxyOptions, setProxyOptions] = useState([]);
   const [loadingConfig, setLoadingConfig] = useState(true);
 
   useEffect(() => {
@@ -69,18 +72,24 @@ export default function FacebookDataSettingsPage() {
     const loadConfig = async () => {
       setLoadingConfig(true);
       try {
-        const [scenarioItems, profileItems] = await Promise.all([
+        const [scenarioItems, profileItems, browserProfiles, proxies] = await Promise.all([
           window.electronAPI?.getScenarios?.() || [],
           window.electronAPI?.getVariableProfiles?.() || [],
+          window.electronAPI?.listAppBrowserProfiles?.() || [],
+          window.electronAPI?.getProxies?.() || [],
         ]);
         if (!cancelled) {
           setScenarios(Array.isArray(scenarioItems) ? scenarioItems : []);
           setVariableProfiles(Array.isArray(profileItems) ? profileItems : []);
+          setBrowserProfileOptions(Array.isArray(browserProfiles) ? browserProfiles : []);
+          setProxyOptions(Array.isArray(proxies) ? proxies : []);
         }
       } catch {
         if (!cancelled) {
           setScenarios([]);
           setVariableProfiles([]);
+          setBrowserProfileOptions([]);
+          setProxyOptions([]);
         }
       } finally {
         if (!cancelled) setLoadingConfig(false);
@@ -200,6 +209,75 @@ export default function FacebookDataSettingsPage() {
                 </select>
                 <p className="mt-1 text-xs text-[#6f7d90]">
                   {t('facebookData.settings.crawlCommentScenarioHint')}
+                </p>
+              </Field>
+            </div>
+
+            <div className="space-y-4 rounded-xl border border-[#2e3b4e] bg-[#151f2d] p-4">
+              <h3 className="text-sm font-semibold text-white">
+                {t('facebookData.settings.browserProxyTitle')}
+              </h3>
+
+              <Field label={t('facebookData.settings.crawlBrowserProfile')}>
+                <select
+                  value={values[FACEBOOK_CRAWL_SETTINGS.crawlBrowserProfileId] || ''}
+                  onChange={(event) => setValue(
+                    FACEBOOK_CRAWL_SETTINGS.crawlBrowserProfileId,
+                    event.target.value,
+                  )}
+                  className="select-field max-w-xl"
+                >
+                  <option value="">{t('facebookData.settings.noBrowserProfile')}</option>
+                  {browserProfileOptions.map((profile) => (
+                    <option key={profile.id} value={profile.id}>
+                      {profile.display_name}
+                    </option>
+                  ))}
+                </select>
+                <p className="mt-1 text-xs text-[#6f7d90]">
+                  {t('facebookData.settings.crawlBrowserProfileHint')}
+                </p>
+              </Field>
+
+              <Field label={t('facebookData.settings.crawlProxy')}>
+                <select
+                  value={values[FACEBOOK_CRAWL_SETTINGS.crawlProxyId] || ''}
+                  onChange={(event) => setValue(
+                    FACEBOOK_CRAWL_SETTINGS.crawlProxyId,
+                    event.target.value,
+                  )}
+                  className="select-field max-w-xl"
+                >
+                  <option value="">{t('facebookData.settings.noProxy')}</option>
+                  {proxyOptions.map((proxy) => (
+                    <option key={proxy.id} value={proxy.id}>
+                      {proxy.name} ({proxy.protocol || 'http'}://{proxy.ip}:{proxy.port})
+                    </option>
+                  ))}
+                </select>
+                <p className="mt-1 text-xs text-[#6f7d90]">
+                  {t('facebookData.settings.crawlProxyHint')}
+                </p>
+              </Field>
+            </div>
+
+            <div className="space-y-4 rounded-xl border border-[#2e3b4e] bg-[#151f2d] p-4">
+              <Field label={t('facebookData.settings.scrollSettleSeconds')}>
+                <input
+                  type="number"
+                  min={1}
+                  max={120}
+                  step={1}
+                  value={Number(values[FACEBOOK_CRAWL_SETTINGS.scrollSettleSeconds])
+                    || DEFAULT_FACEBOOK_CRAWL_SCROLL_SETTLE_SECONDS}
+                  onChange={(event) => setValue(
+                    FACEBOOK_CRAWL_SETTINGS.scrollSettleSeconds,
+                    Math.max(1, Math.min(120, Number(event.target.value) || DEFAULT_FACEBOOK_CRAWL_SCROLL_SETTLE_SECONDS)),
+                  )}
+                  className="input-field max-w-xs"
+                />
+                <p className="mt-1 text-xs text-[#6f7d90]">
+                  {t('facebookData.settings.scrollSettleSecondsHint')}
                 </p>
               </Field>
             </div>

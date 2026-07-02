@@ -22,6 +22,26 @@ export function crawlConditionMatched(items = [], condition = {}) {
   });
 }
 
+/**
+ * Stop infinity scroll only when every parsed post in the batch matches the condition.
+ * Avoids stopping after the first batch when the feed mixes new and old posts.
+ */
+export function crawlConditionShouldStopScroll(parsedItems = [], condition = {}) {
+  const field = String(condition?.field || '').trim();
+  if (!field || !Array.isArray(parsedItems) || !parsedItems.length) return false;
+
+  const candidates = parsedItems
+    .map((item) => normalizeConditionItem(item))
+    .filter((data) => data && typeof data === 'object' && !Array.isArray(data))
+    .filter((data) => data[field] != null && (data.post_id || data.post_content || data.post_date));
+
+  if (!candidates.length) return false;
+
+  return candidates.every((data) => (
+    compareCrawlValues(data[field], condition.operator, condition.value)
+  ));
+}
+
 export function compareCrawlValues(left, operator = '<', right) {
   if (left === undefined || left === null || right === undefined || right === null || right === '') {
     return false;

@@ -23,6 +23,7 @@ import { isMasterBuild } from './appRoleConfig.js';
 // Dùng fileURLToPath(import.meta.url) để tính đường dẫn tuyệt đối từ URL của file hiện tại.
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const PROJECT_ROOT = path.join(__dirname, '..', '..');
 
 /** @type {BrowserWindow|null} */
 let mainWindow = null;
@@ -227,6 +228,21 @@ function registerDatabaseHandlers() {
   ipcMain.handle('facebook-data:list-posts', (_event, options = {}) => {
     assertMasterFacebookDataAccess();
     return platformCrawledDataService.listFacebookPosts(options);
+  });
+
+  ipcMain.handle('facebook-data:resolve-media-url', (_event, relativePath = '') => {
+    assertMasterFacebookDataAccess();
+    return platformCrawledDataService.resolveFacebookMediaFileUrl(relativePath);
+  });
+
+  ipcMain.handle('facebook-data:open-media-file', async (_event, relativePath = '') => {
+    assertMasterFacebookDataAccess();
+    const absolutePath = platformCrawledDataService.resolveFacebookMediaAbsolutePath(relativePath);
+    if (!absolutePath) {
+      return { success: false, error: 'Media file not found.' };
+    }
+    const openError = await shell.openPath(absolutePath);
+    return openError ? { success: false, error: openError } : { success: true };
   });
 
   ipcMain.handle('facebook-data:list-comments', (_event, options = {}) => {
@@ -786,6 +802,10 @@ function registerDatabaseHandlers() {
         height: Number(payload.viewport.height),
       }
       : null;
+    const runtimeVariables = Array.isArray(payload?.runtimeVariables)
+      ? payload.runtimeVariables
+      : null;
+    const proxyId = typeof payload === 'object' ? payload?.proxyId || null : null;
     if (!scenarioId) {
       console.error('[Main] Thiếu scenarioId khi chạy kịch bản');
       return;
@@ -811,9 +831,11 @@ function registerDatabaseHandlers() {
     executor.startScenario(scenarioId, {
       executionId,
       browserProfileId,
+      proxyId,
       sampleId,
       headless,
       viewport,
+      runtimeVariables,
     })
       .then((result) => console.log(`[Main] Thực thi ${executionId} hoàn tất:`, result))
       .catch((err) => console.error(`[Main] Lỗi thực thi ${executionId}:`, err.message))
@@ -830,6 +852,9 @@ function withDefaultSettings(settings) {
     'execution.browserCloseDelayMs': Number(settings['execution.browserCloseDelayMs']) || 5000,
     'facebook.crawlGroupScenarioId': settings['facebook.crawlGroupScenarioId'] || '',
     'facebook.crawlCommentScenarioId': settings['facebook.crawlCommentScenarioId'] || '',
+    'facebook.crawlScrollSettleSeconds': Number(settings['facebook.crawlScrollSettleSeconds']) || 4,
+    'facebook.crawlBrowserProfileId': settings['facebook.crawlBrowserProfileId'] || '',
+    'facebook.crawlProxyId': settings['facebook.crawlProxyId'] || '',
   };
 }
 
@@ -904,6 +929,7 @@ function registerCacheProtocol() {
       const allowedRoots = [
         path.join(app.getPath('userData'), 'cache'),
         path.join(settings['browser.userDataDir'] || path.join(app.getPath('userData'), 'browser-data'), 'storage'),
+        path.join(PROJECT_ROOT, 'facebook_media'),
       ].map((item) => {
         const resolved = path.resolve(item);
         return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
@@ -920,7 +946,8 @@ function registerCacheProtocol() {
         '.png': 'image/png',
         '.jpg': 'image/jpeg',
         '.jpeg': 'image/jpeg',
-        '.json': 'application/json',
+        '.webp': 'image/webp',
+        '.gif': 'image/gif',
         '.txt': 'text/plain',
       };
       const contentType = mimeTypes[ext] || 'application/octet-stream';
@@ -956,7 +983,9 @@ app.whenReady().then(() => {
   dbService.initSchema();
   dbService.syncFacebookCrawlScenarioBindings(withDefaultSettings(dbService.getSettings()));
   if (isMasterBuild) {
-    platformCrawledDataService = new PlatformCrawledDataService(app.getPath('userData'));
+    platformCrawledDataService = new PlatformCrawledDataService(app.getPath('userData'), {
+      projectRoot: PROJECT_ROOT,
+    });
     console.log('[Main] PlatformCrawledDataService đã sẵn sàng (master build)');
   } else {
     console.log('[Main] Slave build — PlatformCrawledDataService bị vô hiệu hóa');

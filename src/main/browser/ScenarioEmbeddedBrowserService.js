@@ -15,17 +15,21 @@ import { buildPreviewPartition, invalidateProfileCookieCache, syncProfileCookies
 import { RequestCatchingPreviewBridge } from './RequestCatchingPreviewBridge.js';
 import { RequestCatchingDumpService } from '../rpa/RequestCatchingDumpService.js';
 import { parseFacebookGraphQLBatch } from '../../shared/parseFacebookGraphQL.js';
-import { crawlConditionMatched } from '../../shared/crawlStopCondition.js';
+import { crawlConditionShouldStopScroll } from '../../shared/crawlStopCondition.js';
 import {
   isCrawlScrollAtBottom,
   isCrawlScrollStuck,
+  resolveCrawlScrollContext,
+  resolveCrawlScrollLoopConfig,
   runCrawlScrollStep,
+  shouldStopCrawlScrollEarly,
 } from '../../shared/crawlScroll.js';
 import { resolveVariableTemplate } from '../rpa/VariableResolver.js';
 
 const RUN_CRAWL_SCROLL_STEP = runCrawlScrollStep.toString();
 const IS_CRAWL_SCROLL_AT_BOTTOM = isCrawlScrollAtBottom.toString();
 const IS_CRAWL_SCROLL_STUCK = isCrawlScrollStuck.toString();
+const SHOULD_STOP_CRAWL_SCROLL_EARLY = shouldStopCrawlScrollEarly.toString();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -178,7 +182,6 @@ class ScenarioEmbeddedBrowserService {
         crawlMeta: cfg.crawlMeta,
         requestCatchingFilters: cfg.requestCatchingFilters || {},
       });
-      await this._runPreviewAutoscroll(cfg.crawlMeta || {});
     } catch (error) {
       console.warn('[RC] auto-start failed:', error.message);
     }
@@ -582,7 +585,9 @@ class ScenarioEmbeddedBrowserService {
     const win = this._getWindow();
     const crawlMeta = payload.crawlMeta || this.requestCatchingAutoConfig?.crawlMeta || {};
     const infinite = crawlMeta.infinity_scroll || {};
-    const shouldCheckStopCondition = infinite.enabled && infinite.stop_mode === 'condition';
+    const shouldCheckStopCondition = infinite.enabled
+      && infinite.stop_mode === 'condition'
+      && !/\/posts\/\d+/i.test(payload.url || this.view?.webContents?.getURL() || '');
     const scenarioId = payload.scenarioId
       || this.requestCatchingAutoConfig?.scenarioId
       || null;
@@ -591,9 +596,11 @@ class ScenarioEmbeddedBrowserService {
       value: this._resolveVariables(String(infinite.condition?.value ?? ''), scenarioId),
     };
     this._previewScrollStopRequested = false;
+    let conditionStopPending = false;
+    const scrollProgress = { completedBatches: 0 };
 
     const checkCapturedStopCondition = (items = []) => {
-      if (!shouldCheckStopCondition || this._previewScrollStopRequested) return;
+      if (!shouldCheckStopCondition || conditionStopPending) return;
       if (!Array.isArray(items) || !items.length) return;
 
       const pageUrl = this._requestCatchingPageUrl
@@ -604,10 +611,9 @@ class ScenarioEmbeddedBrowserService {
         targetUrl: pageUrl,
         variables: variableMap,
       });
-      if (crawlConditionMatched(parsedPosts, resolvedCondition)) {
-        this._previewScrollStopRequested = true;
-        console.log('[RC] Infinity scroll stop condition matched (post_date threshold reached)');
-        void this.stopRequestCatching();
+      if (crawlConditionShouldStopScroll(parsedPosts, resolvedCondition)) {
+        conditionStopPending = true;
+        console.log('[RC] Stop condition matched — finishing current scroll batch before stopping');
       }
     };
 
@@ -680,7 +686,15 @@ class ScenarioEmbeddedBrowserService {
       }
     }
 
-    await this._runPreviewAutoscroll(crawlMeta);
+    await this._runPreviewAutoscroll(
+      crawlMeta,
+      payload.url || this.view.webContents.getURL(),
+      (loopConfig) => (
+        conditionStopPending
+        && scrollProgress.completedBatches >= (loopConfig?.minBatchesBeforeConditionStop || 1)
+      ),
+      scrollProgress,
+    );
 
     return {
       ...result,
@@ -689,14 +703,24 @@ class ScenarioEmbeddedBrowserService {
     };
   }
 
-  async _executeCrawlScroll(webContents, distance, mode = 'scroll') {
+  async _executeCrawlScroll(webContents, distance, mode = 'scroll', scrollContext = 'auto') {
     if (!webContents || webContents.isDestroyed()) return null;
     return webContents.executeJavaScript(
-      `(${RUN_CRAWL_SCROLL_STEP})(${Number(distance) || 0}, ${JSON.stringify(mode)})`,
+      `(${RUN_CRAWL_SCROLL_STEP})(${Number(distance) || 0}, ${JSON.stringify(mode)}, ${JSON.stringify(scrollContext)})`,
     ).catch(() => null);
   }
 
-  async _runPreviewAutoscroll(crawlMeta = {}) {
+  async _waitForPreviewScrollSettle(_webContents, settleMs = 4000) {
+    const waitMs = Math.max(3000, Number(settleMs) || 4000);
+    await new Promise((resolve) => { setTimeout(resolve, waitMs); });
+  }
+
+  async _runPreviewAutoscroll(
+    crawlMeta = {},
+    targetUrl = '',
+    shouldStopAfterSettle = () => false,
+    scrollProgress = null,
+  ) {
     if (!this.view) return;
 
     const autoscroll = crawlMeta.autoscroll || {};
@@ -704,25 +728,63 @@ class ScenarioEmbeddedBrowserService {
     const shouldScroll = autoscroll.enabled || infinite.enabled;
     if (!shouldScroll) return;
 
-    const scrollDistance = Math.max(100, Number(autoscroll.distance_px) || 600);
-    const scrollDelay = Math.max(100, Number(autoscroll.delay_ms) || 500);
+    const pageUrl = targetUrl || this.view.webContents.getURL() || '';
+    const scrollContext = resolveCrawlScrollContext(pageUrl);
+    const loop = resolveCrawlScrollLoopConfig(crawlMeta, scrollContext);
     const configuredMax = infinite.enabled
       ? Math.max(1, Number(infinite.max_scrolls) || 30)
       : 5;
     const maxScrolls = Math.min(PREVIEW_AUTOSCROLL_MAX, configuredMax);
-    const timeoutMs = Math.max(1000, Number(infinite.timeout_ms) || 30000);
+    const maxBatches = Math.ceil(maxScrolls / loop.scrollsPerBatch);
     const startedAt = Date.now();
 
     const { webContents } = this.view;
-    let previousState = await this._executeCrawlScroll(webContents, 0, 'reset');
-    await new Promise((resolve) => { setTimeout(resolve, scrollDelay); });
+    let previousState = scrollContext === 'comments'
+      ? await this._executeCrawlScroll(webContents, 0, 'reset', scrollContext)
+      : await this._executeCrawlScroll(webContents, 0, 'read', scrollContext);
+    await new Promise((resolve) => { setTimeout(resolve, loop.initialDelayMs); });
 
-    for (let index = 0; index < maxScrolls; index += 1) {
+    let totalScrolls = 0;
+
+    for (let batchIndex = 0; batchIndex < maxBatches; batchIndex += 1) {
       if (this._previewScrollStopRequested) break;
-      if (infinite.enabled && Date.now() - startedAt >= timeoutMs) break;
+      if (loop.infiniteEnabled && Date.now() - startedAt >= loop.timeoutMs) break;
 
-      const nextState = await this._executeCrawlScroll(webContents, scrollDistance, 'scroll');
-      await new Promise((resolve) => { setTimeout(resolve, scrollDelay); });
+      const remainingScrolls = maxScrolls - totalScrolls;
+      const batchSize = Math.min(loop.scrollsPerBatch, remainingScrolls);
+      if (batchSize <= 0) break;
+
+      console.log(`[RC] Scroll batch ${batchIndex + 1}/${maxBatches} (${batchSize} scrolls)`);
+
+      let nextState = previousState;
+      for (let scrollIndex = 0; scrollIndex < batchSize; scrollIndex += 1) {
+        if (this._previewScrollStopRequested) break;
+
+        nextState = await this._executeCrawlScroll(
+          webContents,
+          loop.scrollDistance,
+          'scroll',
+          scrollContext,
+        );
+        totalScrolls += 1;
+
+        if (scrollIndex < batchSize - 1) {
+          await new Promise((resolve) => { setTimeout(resolve, loop.betweenScrollMs); });
+        }
+      }
+
+      if (this._previewScrollStopRequested) break;
+
+      await this._waitForPreviewScrollSettle(webContents, loop.settleMs);
+
+      if (scrollProgress) {
+        scrollProgress.completedBatches += 1;
+      }
+
+      if (shouldStopAfterSettle(loop)) {
+        this._previewScrollStopRequested = true;
+        break;
+      }
 
       if (this._previewScrollStopRequested) break;
 
@@ -733,14 +795,21 @@ class ScenarioEmbeddedBrowserService {
         const didNotMove = await webContents.executeJavaScript(
           `(${IS_CRAWL_SCROLL_STUCK})(${JSON.stringify(previousState)}, ${JSON.stringify(nextState)})`,
         ).catch(() => false);
-        if (!infinite.enabled && atBottom && didNotMove) break;
+        const stopEarly = await webContents.executeJavaScript(
+          `(${SHOULD_STOP_CRAWL_SCROLL_EARLY})(${JSON.stringify({
+            infiniteEnabled: loop.infiniteEnabled,
+            atBottom,
+            didNotMove,
+          })})`,
+        ).catch(() => false);
+        if (stopEarly) break;
       }
 
       previousState = nextState;
     }
 
-    if (infinite.enabled || autoscroll.enabled) {
-      await new Promise((resolve) => { setTimeout(resolve, 4000); });
+    if (loop.infiniteEnabled || autoscroll.enabled) {
+      await this._waitForPreviewScrollSettle(webContents, Math.min(loop.settleMs, 5000));
     }
 
     if (this._previewScrollStopRequested) {

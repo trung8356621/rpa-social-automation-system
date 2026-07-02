@@ -14,7 +14,83 @@ export const FACEBOOK_CRAWL_COMMENT_VARIABLES = ['group_id', 'post_id'];
 export const FACEBOOK_CRAWL_SETTINGS = {
   groupScenarioId: 'facebook.crawlGroupScenarioId',
   commentScenarioId: 'facebook.crawlCommentScenarioId',
+  scrollSettleSeconds: 'facebook.crawlScrollSettleSeconds',
+  crawlBrowserProfileId: 'facebook.crawlBrowserProfileId',
+  crawlProxyId: 'facebook.crawlProxyId',
 };
+
+export const DEFAULT_FACEBOOK_CRAWL_SCROLL_SETTLE_SECONDS = 4;
+
+export function readFacebookCrawlLaunchOptions(settings = {}) {
+  const browserProfileId = String(settings[FACEBOOK_CRAWL_SETTINGS.crawlBrowserProfileId] || '').trim();
+  const proxyId = String(settings[FACEBOOK_CRAWL_SETTINGS.crawlProxyId] || '').trim();
+  return {
+    browserProfileId: browserProfileId || null,
+    proxyId: proxyId || null,
+  };
+}
+
+export function readFacebookCrawlScrollSettleMs(settings = {}) {
+  const seconds = Number(settings[FACEBOOK_CRAWL_SETTINGS.scrollSettleSeconds]);
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return DEFAULT_FACEBOOK_CRAWL_SCROLL_SETTLE_SECONDS * 1000;
+  }
+  return Math.max(1000, Math.min(120000, Math.round(seconds * 1000)));
+}
+
+export function applyFacebookCrawlSettingsToMeta(crawlMeta = {}, settings = {}) {
+  const settleMs = readFacebookCrawlScrollSettleMs(settings);
+  return {
+    ...crawlMeta,
+    infinity_scroll: {
+      ...(crawlMeta.infinity_scroll || {}),
+      settle_ms: settleMs,
+    },
+  };
+}
+
+/** True when target URL is a single group post (comment crawl). */
+export function isFacebookCommentCrawlUrl(url = '') {
+  return /\/posts\/\d+/i.test(String(url || '').trim());
+}
+
+/**
+ * Comment crawls must load every comment — no date stop condition, longer scroll budget.
+ */
+export function applyFacebookCommentCrawlMetaOverrides(crawlMeta = {}) {
+  const autoscroll = crawlMeta.autoscroll || {};
+  const infinite = crawlMeta.infinity_scroll || {};
+
+  return {
+    ...crawlMeta,
+    autoscroll: {
+      ...autoscroll,
+      enabled: true,
+      distance_px: Math.max(400, Number(autoscroll.distance_px) || 600),
+      delay_ms: Math.max(300, Number(autoscroll.delay_ms) || 500),
+    },
+    infinity_scroll: {
+      ...infinite,
+      enabled: true,
+      stop_mode: 'timeout',
+      max_scrolls: Math.max(200, Number(infinite.max_scrolls) || 0),
+      timeout_ms: Math.max(180000, Number(infinite.timeout_ms) || 0),
+      settle_ms: Math.max(4000, Number(infinite.settle_ms) || 0),
+      condition: {
+        field: '',
+        operator: '<',
+        value: '',
+      },
+    },
+  };
+}
+
+export function readVariableSampleValue(samples = [], key = '', preferredName = 'Default') {
+  if (!Array.isArray(samples) || !key) return '';
+  const sample = samples.find((item) => item?.name === preferredName) || samples[0];
+  const entry = (sample?.variables || []).find((item) => item?.key === key);
+  return String(entry?.value ?? '').trim();
+}
 
 export const SYSTEM_FACEBOOK_VARIABLE_PROFILES = [
   {
@@ -111,6 +187,19 @@ export function enrichFacebookCrawlPosts(posts, options = {}) {
       ...(groupId ? { _group_slug: groupId } : {}),
     };
   });
+}
+
+/**
+ * Parse group_id from a Facebook group URL.
+ * @param {string} url - e.g. https://www.facebook.com/groups/295931577185665/
+ * @returns {{ group_id: string }}
+ */
+export function parseFacebookGroupLink(url = '') {
+  const text = String(url || '').trim();
+  const match = text.match(/facebook\.com\/groups\/([^/?#]+)/i);
+  return {
+    group_id: match?.[1] ? String(match[1]).trim() : '',
+  };
 }
 
 /**

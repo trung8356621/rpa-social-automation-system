@@ -1,5 +1,9 @@
 import { enrichFacebookCrawlPosts } from './facebookCrawlConfig.js';
 import {
+  extractFacebookMediaUrls,
+  mergeFacebookMediaUrls,
+} from './facebookMediaExtract.js';
+import {
   mergeInteractionStats,
   parseInteractionCount,
   pickFeedbackStats,
@@ -246,6 +250,28 @@ function pickStoryMessageText(story) {
   return '';
 }
 
+function collectPostImagesFromStory(story) {
+  const images = mergeFacebookMediaUrls([], extractFacebookMediaUrls(story));
+
+  const visit = (node, depth = 0) => {
+    if (!node || typeof node !== 'object' || depth > 10) return;
+    if (node.__typename === 'StoryAttachment' || node.__typename === 'Photo') {
+      mergeFacebookMediaUrls(images, extractFacebookMediaUrls(node));
+      return;
+    }
+    if (Array.isArray(node)) {
+      node.forEach((item) => visit(item, depth + 1));
+      return;
+    }
+    Object.values(node).forEach((value) => {
+      if (value && typeof value === 'object') visit(value, depth + 1);
+    });
+  };
+
+  visit(story?.comet_sections, 0);
+  return images;
+}
+
 function extractPostFromStory(story, groupSlug = DEFAULT_GROUP_SLUG) {
   if (!story || story.__typename !== 'Story') return null;
 
@@ -258,8 +284,9 @@ function extractPostFromStory(story, groupSlug = DEFAULT_GROUP_SLUG) {
     const creationTime = pickStoryCreationTime(story);
     const post_date = formatFacebookPostDate(creationTime);
     const feedbackStats = pickFeedbackStats(story?.feedback || story);
+    const post_images = collectPostImagesFromStory(story);
 
-    if (!post_content && !post_id) return null;
+    if (!post_content && !post_id && !post_images.length) return null;
 
     return {
       post_id: post_id || null,
@@ -268,6 +295,7 @@ function extractPostFromStory(story, groupSlug = DEFAULT_GROUP_SLUG) {
       post_link,
       post_content,
       post_date,
+      post_images,
       like_count: feedbackStats.like_count,
       share_count: feedbackStats.share_count,
       comment_count: feedbackStats.comment_count,
@@ -291,8 +319,9 @@ function looksLikeCommentNode(comment) {
     comment?.author?.name
     || comment?.actor?.name,
   );
+  const hasMedia = extractFacebookMediaUrls(comment).length > 0;
 
-  return Boolean(text && hasAuthor && comment?.id);
+  return Boolean(comment?.id && hasAuthor && (text || hasMedia));
 }
 
 function pickPostIdFromFeedbackNode(node) {
@@ -311,13 +340,15 @@ function extractCommentFromNode(comment) {
       || comment?.preferred_body?.text
       || ''
     ).trim();
+    const comment_images = extractFacebookMediaUrls(comment);
 
-    if (!comment_content) return null;
+    if (!comment_content && !comment_images.length) return null;
 
     return {
       comment_id: comment?.id || comment?.legacy_fbid || null,
       comment_author: pickCommentAuthor(comment),
       comment_content,
+      comment_images,
       created_time: comment?.created_time ?? comment?.timestamp ?? null,
       like_count: pickReactionCount(comment),
     };
@@ -335,13 +366,26 @@ function mergeCommentFields(existing, incoming) {
   const nextLikes = parseInteractionCount(incoming.like_count);
   const currentLikes = parseInteractionCount(existing.like_count);
   if (nextLikes > currentLikes) existing.like_count = nextLikes;
+  existing.comment_images = mergeFacebookMediaUrls(
+    existing.comment_images || [],
+    incoming.comment_images || [],
+  );
+}
+
+function buildCommentDedupeKey(parsed = {}) {
+  if (parsed.comment_id) return parsed.comment_id;
+  const imageKey = (parsed.comment_images || []).join('|');
+  return `${parsed.comment_author || ''}::${parsed.comment_content || ''}::${imageKey}`;
+}
+
+function hasCommentPayload(parsed = {}) {
+  return Boolean(parsed.comment_content || (parsed.comment_images || []).length);
 }
 
 function registerComment(parsed, ctx) {
-  if (!parsed?.comment_content) return;
+  if (!hasCommentPayload(parsed)) return;
 
-  const dedupeKey = parsed.comment_id
-    || `${parsed.comment_author || ''}::${parsed.comment_content}`;
+  const dedupeKey = buildCommentDedupeKey(parsed);
   const bucket = ctx.activePostKey && ctx.postsByKey.has(ctx.activePostKey)
     ? ctx.postsByKey.get(ctx.activePostKey).comments
     : ctx.orphanComments;
@@ -349,7 +393,7 @@ function registerComment(parsed, ctx) {
   if (ctx.seenComments.has(dedupeKey)) {
     const existing = bucket.find((item) => (
       (parsed.comment_id && item.comment_id === parsed.comment_id)
-      || `${item.comment_author || ''}::${item.comment_content}` === dedupeKey
+      || buildCommentDedupeKey(item) === dedupeKey
     ));
     if (existing) mergeCommentFields(existing, parsed);
     return;
@@ -358,11 +402,12 @@ function registerComment(parsed, ctx) {
   ctx.seenComments.add(dedupeKey);
   const commentItem = {
     comment_author: parsed.comment_author,
-    comment_content: parsed.comment_content,
+    comment_content: parsed.comment_content || '',
     like_count: parseInteractionCount(parsed.like_count),
   };
   if (parsed.comment_id) commentItem.comment_id = parsed.comment_id;
   if (parsed.created_time != null) commentItem.created_time = parsed.created_time;
+  if (parsed.comment_images?.length) commentItem.comment_images = [...parsed.comment_images];
   bucket.push(commentItem);
 }
 
@@ -484,6 +529,7 @@ function createEmptyPost(groupSlug) {
     post_link: '',
     post_content: '',
     post_date: null,
+    post_images: [],
     like_count: 0,
     share_count: 0,
     comment_count: 0,
@@ -549,6 +595,10 @@ function mergePostFields(existing, incoming) {
   if (!existing.post_link && incoming.post_link) existing.post_link = incoming.post_link;
   if (!existing.post_id && incoming.post_id) existing.post_id = incoming.post_id;
   if (!existing.post_date && incoming.post_date) existing.post_date = incoming.post_date;
+  existing.post_images = mergeFacebookMediaUrls(
+    existing.post_images || [],
+    incoming.post_images || [],
+  );
   Object.assign(existing, mergeInteractionStats(existing, incoming));
 }
 
@@ -565,13 +615,12 @@ export function parseFacebookGraphQLBatch(rawObjects, options = {}) {
 
   const mergeComments = (targetComments, incoming = []) => {
     incoming.forEach((comment) => {
-      if (!comment?.comment_content) return;
-      const dedupeKey = comment.comment_id
-        || `${comment.comment_author || ''}::${comment.comment_content}`;
+      if (!hasCommentPayload(comment)) return;
+      const dedupeKey = buildCommentDedupeKey(comment);
       if (seenComments.has(dedupeKey)) {
         const existing = targetComments.find((item) => (
           (comment.comment_id && item.comment_id === comment.comment_id)
-          || `${item.comment_author || ''}::${item.comment_content}` === dedupeKey
+          || buildCommentDedupeKey(item) === dedupeKey
         ));
         if (existing) mergeCommentFields(existing, comment);
         return;
@@ -580,6 +629,7 @@ export function parseFacebookGraphQLBatch(rawObjects, options = {}) {
       targetComments.push({
         ...comment,
         like_count: parseInteractionCount(comment.like_count),
+        comment_images: mergeFacebookMediaUrls([], comment.comment_images || []),
       });
     });
   };
@@ -630,4 +680,37 @@ export function parseFacebookGraphQLBatch(rawObjects, options = {}) {
   }
 
   return enrichFacebookCrawlPosts(results, options);
+}
+
+/**
+ * Count unique comments across parsed post batch results.
+ */
+export function countParsedFacebookComments(parsedPosts = []) {
+  if (!Array.isArray(parsedPosts)) return 0;
+
+  const seen = new Set();
+  let count = 0;
+
+  for (const post of parsedPosts) {
+    for (const comment of (post?.comments || [])) {
+      const key = comment?.comment_id
+        || `${comment?.comment_author || ''}::${comment?.comment_content || ''}`;
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      count += 1;
+    }
+  }
+
+  return count;
+}
+
+/**
+ * Read the highest comment_count reported by Facebook feedback in a parsed batch.
+ */
+export function getExpectedFacebookCommentCount(parsedPosts = []) {
+  if (!Array.isArray(parsedPosts)) return 0;
+
+  return parsedPosts.reduce((max, post) => (
+    Math.max(max, parseInteractionCount(post?.comment_count) || 0)
+  ), 0);
 }

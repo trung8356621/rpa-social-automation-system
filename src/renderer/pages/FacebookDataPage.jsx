@@ -1,9 +1,25 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Download, Copy, ExternalLink, Loader2, RefreshCw } from 'lucide-react';
-import { useDispatch } from 'react-redux';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Download, Copy, ExternalLink, ImageIcon, Loader2, MessagesSquare, Play, RefreshCw, X } from 'lucide-react';
+import { useDispatch, useSelector } from 'react-redux';
 import { useTranslation } from '../i18n';
 import { buildCsvContent } from '../utils/exportTableCsv';
 import { showToast } from '../slices/uiSlice';
+import { fetchSettings } from '../slices/settingsSlice';
+import { startLocalCampaign } from '../slices/executionSlice';
+import { parseFacebookMediaUrls } from '../../shared/facebookMediaExtract.js';
+import {
+  buildFacebookCommentCrawlVariables,
+  buildFacebookGroupCrawlVariables,
+  FACEBOOK_CRAWL_GROUP_PROFILE_ID,
+  FACEBOOK_CRAWL_SETTINGS,
+  parseFacebookGroupLink,
+  parseFacebookPostLink,
+  readFacebookCrawlLaunchOptions,
+  readVariableSampleValue,
+} from '../../shared/facebookCrawlConfig.js';
+
+const THUMB_CLASS = 'h-12 w-12 shrink-0 rounded border border-[#2e3b4e] object-cover bg-[#151f2d]';
+const MAX_VISIBLE_THUMBS = 4;
 
 const PLATFORM_OPTIONS = [
   { id: 'facebook', labelKey: 'facebookData.studio.platforms.facebook' },
@@ -20,6 +36,211 @@ function formatCount(value) {
   const count = Number(value);
   if (!Number.isFinite(count) || count < 0) return '0';
   return String(Math.floor(count));
+}
+
+function MediaThumbPlaceholder({ className = THUMB_CLASS }) {
+  return (
+    <div className={`${className} flex items-center justify-center text-[#6f7d90]`}>
+      <ImageIcon className="h-4 w-4" aria-hidden />
+    </div>
+  );
+}
+
+function LocalMediaThumb({ relativePath, alt = '', className = THUMB_CLASS, onPreview }) {
+  const [src, setSrc] = useState('');
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    const pathValue = String(relativePath || '').trim();
+
+    if (!pathValue || !window.electronAPI?.resolveFacebookMediaUrl) {
+      setSrc('');
+      setFailed(false);
+      return undefined;
+    }
+
+    setFailed(false);
+    window.electronAPI.resolveFacebookMediaUrl(pathValue)
+      .then((url) => {
+        if (!cancelled) setSrc(url || '');
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setSrc('');
+          setFailed(true);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [relativePath]);
+
+  if (failed) return <MediaThumbPlaceholder className={className} />;
+  if (!src) {
+    return <div className={`${className} animate-pulse bg-[#243041]`} aria-hidden />;
+  }
+
+  return (
+    <ClickableMediaThumb
+      src={src}
+      alt={alt}
+      className={className}
+      onPreview={onPreview}
+      previewPayload={{
+        src,
+        alt,
+        relativePath,
+        externalUrl: null,
+      }}
+    />
+  );
+}
+
+function RemoteMediaThumb({ url, alt = '', className = THUMB_CLASS, onPreview }) {
+  const [failed, setFailed] = useState(false);
+
+  if (!url || failed) {
+    return <MediaThumbPlaceholder className={className} />;
+  }
+
+  return (
+    <ClickableMediaThumb
+      src={url}
+      alt={alt}
+      className={className}
+      onPreview={onPreview}
+      previewPayload={{
+        src: url,
+        alt,
+        relativePath: null,
+        externalUrl: url,
+      }}
+      onError={() => setFailed(true)}
+    />
+  );
+}
+
+function ClickableMediaThumb({
+  src,
+  alt = '',
+  className = THUMB_CLASS,
+  onPreview,
+  previewPayload,
+  onError,
+}) {
+  return (
+    <button
+      type="button"
+      title={alt}
+      className={`${className} cursor-pointer overflow-hidden p-0 transition hover:ring-2 hover:ring-[#2f80ed]/60`}
+      onClick={(event) => {
+        event.stopPropagation();
+        onPreview?.(previewPayload);
+      }}
+    >
+      <img
+        src={src}
+        alt={alt}
+        loading="lazy"
+        referrerPolicy="no-referrer"
+        className="h-full w-full object-cover"
+        onError={onError}
+      />
+    </button>
+  );
+}
+
+function ImagePreviewModal({ image, onClose, onOpenExternal, t }) {
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [onClose]);
+
+  if (!image?.src) return null;
+
+  const canOpenExternal = Boolean(image.externalUrl || image.relativePath);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4"
+      onClick={onClose}
+    >
+      <div
+        className="flex max-h-[92vh] max-w-[92vw] flex-col"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <p className="truncate text-sm text-[#c7d2e0]">{image.alt || t('facebookData.studio.columns.localImage')}</p>
+          <button
+            type="button"
+            onClick={onClose}
+            className="inline-flex h-8 w-8 items-center justify-center rounded border border-[#3a4a61] text-[#c7d2e0] hover:border-[#5b7ec7] hover:text-white"
+            aria-label={t('common.close')}
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        <div className="flex min-h-0 flex-1 items-center justify-center overflow-auto rounded-lg border border-[#2e3b4e] bg-[#0f172a] p-2">
+          <img
+            src={image.src}
+            alt={image.alt || ''}
+            referrerPolicy="no-referrer"
+            className="max-h-[75vh] max-w-[88vw] object-contain"
+          />
+        </div>
+        {canOpenExternal ? (
+          <div className="mt-3 flex justify-end gap-2">
+            <button type="button" onClick={onClose} className="btn-secondary">
+              {t('common.close')}
+            </button>
+            <button type="button" onClick={onOpenExternal} className="btn-primary">
+              {image.externalUrl
+                ? t('facebookData.studio.openImageLink')
+                : t('facebookData.studio.openImageFile')}
+            </button>
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function MediaThumbnails({ localPath, mediaValue, alt = '', max = MAX_VISIBLE_THUMBS, onPreview }) {
+  const hasLocal = Boolean(String(localPath || '').trim());
+  if (hasLocal) {
+    return (
+      <LocalMediaThumb relativePath={localPath} alt={alt} onPreview={onPreview} />
+    );
+  }
+
+  const remoteUrls = parseFacebookMediaUrls(mediaValue);
+  const visibleRemote = remoteUrls.slice(0, max);
+  const hiddenCount = Math.max(0, remoteUrls.length - visibleRemote.length);
+
+  if (!remoteUrls.length) return '—';
+
+  return (
+    <div className="flex flex-wrap items-center gap-1">
+      {visibleRemote.map((url, index) => (
+        <RemoteMediaThumb
+          key={`${url}-${index}`}
+          url={url}
+          alt={alt ? `${alt} ${index + 1}` : ''}
+          onPreview={onPreview}
+        />
+      ))}
+      {hiddenCount > 0 ? (
+        <span className="rounded border border-[#2e3b4e] bg-[#151f2d] px-1.5 py-0.5 text-[10px] text-[#9aa7b7]">
+          +{hiddenCount}
+        </span>
+      ) : null}
+    </div>
+  );
 }
 
 function truncateText(value, max = 180) {
@@ -83,10 +304,43 @@ function StudioTable({
   );
 }
 
+function iconActionButtonClassName() {
+  return 'inline-flex h-7 w-7 shrink-0 items-center justify-center rounded border border-[#2f3a4d] text-[#9eb4d6] hover:border-[#3f6fd6] hover:text-[#c7ddff]';
+}
+
+function AuthorCell({ name, authorLink, onOpenLink, t }) {
+  const displayName = name || '—';
+  if (!authorLink) return displayName;
+
+  return (
+    <div className="inline-flex items-center gap-1.5">
+      <span className="min-w-0 truncate">{displayName}</span>
+      <button
+        type="button"
+        title={t('facebookData.studio.openAuthorLink')}
+        aria-label={t('facebookData.studio.openAuthorLink')}
+        onClick={(event) => {
+          event.stopPropagation();
+          onOpenLink(authorLink);
+        }}
+        className={iconActionButtonClassName()}
+      >
+        <ExternalLink className="h-3.5 w-3.5" />
+      </button>
+    </div>
+  );
+}
+
 export default function FacebookDataPage() {
   const dispatch = useDispatch();
   const { t, language } = useTranslation();
+  const settings = useSelector((state) => state.settings.values);
+  const liveStatus = useSelector((state) => state.executions.liveStatus);
   const dateLocale = language === 'en' ? 'en-US' : 'vi-VN';
+
+  const pendingCrawlRef = useRef(null);
+  const lastHandledExecutionRef = useRef('');
+  const selectedPostIdRef = useRef('');
 
   const [platform, setPlatform] = useState('facebook');
   const [selectedGroupId, setSelectedGroupId] = useState('');
@@ -99,7 +353,15 @@ export default function FacebookDataPage() {
   const [loadingPosts, setLoadingPosts] = useState(false);
   const [loadingComments, setLoadingComments] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [crawlingGroup, setCrawlingGroup] = useState(false);
+  const [crawlGroupLink, setCrawlGroupLink] = useState('');
+  const [crawlingPostId, setCrawlingPostId] = useState('');
+  const [previewImage, setPreviewImage] = useState(null);
   const [error, setError] = useState('');
+
+  useEffect(() => {
+    dispatch(fetchSettings());
+  }, [dispatch]);
 
   const loadGroups = useCallback(async () => {
     if (!window.electronAPI?.listFacebookGroups) return;
@@ -133,6 +395,11 @@ export default function FacebookDataPage() {
         ...item,
       }));
       setPosts(nextPosts);
+      setSelectedPost((prev) => {
+        if (!prev?.post_id) return prev;
+        return nextPosts.find((item) => item.post_id === prev.post_id) || prev;
+      });
+      return nextPosts;
     } catch (loadError) {
       setError(loadError.message || t('facebookData.toast.loadFailed'));
       setPosts([]);
@@ -177,6 +444,59 @@ export default function FacebookDataPage() {
   }, [t]);
 
   useEffect(() => {
+    selectedPostIdRef.current = selectedPost?.post_id || '';
+  }, [selectedPost?.post_id]);
+
+  const groupCrawlScenarioId = String(settings[FACEBOOK_CRAWL_SETTINGS.groupScenarioId] || '').trim();
+  const commentCrawlScenarioId = String(settings[FACEBOOK_CRAWL_SETTINGS.commentScenarioId] || '').trim();
+
+  useEffect(() => {
+    if (!liveStatus?.executionId) return;
+
+    const terminalTypes = new Set(['execution:completed', 'execution:failed']);
+    if (!terminalTypes.has(liveStatus.type)) return;
+
+    const scenarioId = String(liveStatus.scenarioId || '').trim();
+    const isGroupCrawl = groupCrawlScenarioId && scenarioId === groupCrawlScenarioId;
+    const isCommentCrawl = commentCrawlScenarioId && scenarioId === commentCrawlScenarioId;
+    if (!isGroupCrawl && !isCommentCrawl) return;
+
+    const handledKey = `${liveStatus.executionId}:${liveStatus.type}`;
+    if (lastHandledExecutionRef.current === handledKey) return;
+    lastHandledExecutionRef.current = handledKey;
+
+    const refreshCrawledData = async () => {
+      await loadGroups();
+      await loadPosts();
+
+      const targetPostId = pendingCrawlRef.current?.postId || selectedPostIdRef.current;
+      if (targetPostId && (isCommentCrawl || selectedPostIdRef.current === targetPostId)) {
+        await loadComments(targetPostId);
+      }
+
+      pendingCrawlRef.current = null;
+
+      if (liveStatus.type === 'execution:completed') {
+        dispatch(showToast({
+          type: 'success',
+          message: t('facebookData.toast.crawlDataRefreshed'),
+        }));
+      }
+    };
+
+    refreshCrawledData();
+  }, [
+    commentCrawlScenarioId,
+    dispatch,
+    groupCrawlScenarioId,
+    liveStatus,
+    loadComments,
+    loadGroups,
+    loadPosts,
+    t,
+  ]);
+
+  useEffect(() => {
     loadGroups();
   }, [loadGroups]);
 
@@ -209,6 +529,34 @@ export default function FacebookDataPage() {
     }
   }, [dispatch, t]);
 
+  const handlePreviewImage = useCallback((payload) => {
+    if (!payload?.src) return;
+    setPreviewImage(payload);
+  }, []);
+
+  const handleOpenPreviewExternal = useCallback(async () => {
+    if (!previewImage) return;
+
+    try {
+      if (previewImage.externalUrl) {
+        await openExternalLink(previewImage.externalUrl);
+        return;
+      }
+
+      if (previewImage.relativePath && window.electronAPI?.openFacebookMediaFile) {
+        const result = await window.electronAPI.openFacebookMediaFile(previewImage.relativePath);
+        if (result?.success === false) {
+          throw new Error(result.error || t('facebookData.toast.openLinkFailed'));
+        }
+      }
+    } catch (openError) {
+      dispatch(showToast({
+        type: 'error',
+        message: openError.message || t('facebookData.toast.openLinkFailed'),
+      }));
+    }
+  }, [dispatch, openExternalLink, previewImage, t]);
+
   const copyPostLink = useCallback(async (url) => {
     const target = String(url || '').trim();
     if (!target) return;
@@ -226,11 +574,121 @@ export default function FacebookDataPage() {
     }
   }, [dispatch, t]);
 
+  const handleCrawlGroup = useCallback(async () => {
+    const scenarioId = String(settings[FACEBOOK_CRAWL_SETTINGS.groupScenarioId] || '').trim();
+    if (!scenarioId) {
+      dispatch(showToast({ type: 'error', message: t('facebookData.toast.crawlGroupNoScenario') }));
+      return;
+    }
+
+    const groupLink = String(crawlGroupLink || '').trim();
+    if (!groupLink) {
+      dispatch(showToast({ type: 'error', message: t('facebookData.toast.crawlGroupNoLink') }));
+      return;
+    }
+
+    const parsed = parseFacebookGroupLink(groupLink);
+    if (!parsed.group_id) {
+      dispatch(showToast({ type: 'error', message: t('facebookData.toast.crawlGroupInvalidLink') }));
+      return;
+    }
+
+    setCrawlingGroup(true);
+    try {
+      let lastDate = '';
+      if (window.electronAPI?.getVariableProfileSamples) {
+        const samples = await window.electronAPI.getVariableProfileSamples(FACEBOOK_CRAWL_GROUP_PROFILE_ID);
+        lastDate = readVariableSampleValue(samples, 'last_date');
+      }
+
+      const runtimeVariables = buildFacebookGroupCrawlVariables({
+        groupId: parsed.group_id,
+        lastDate,
+      });
+      const launchOptions = readFacebookCrawlLaunchOptions(settings);
+      pendingCrawlRef.current = { kind: 'group', scenarioId, postId: null, groupId: parsed.group_id };
+
+      const result = await dispatch(startLocalCampaign({
+        scenarioId,
+        runtimeVariables,
+        ...launchOptions,
+      }));
+      if (result.meta.requestStatus === 'fulfilled') {
+        setSelectedGroupId(parsed.group_id);
+        dispatch(showToast({ type: 'info', message: t('facebookData.toast.crawlGroupStarted') }));
+      } else {
+        dispatch(showToast({
+          type: 'error',
+          message: result.payload || t('executions.toast.runFailed'),
+        }));
+      }
+    } finally {
+      setCrawlingGroup(false);
+    }
+  }, [crawlGroupLink, dispatch, settings, t]);
+
+  const handleCrawlComments = useCallback(async (row) => {
+    const scenarioId = String(settings[FACEBOOK_CRAWL_SETTINGS.commentScenarioId] || '').trim();
+    if (!scenarioId) {
+      dispatch(showToast({ type: 'error', message: t('facebookData.toast.crawlCommentsNoScenario') }));
+      return;
+    }
+
+    const postLink = String(row?.post_link || '').trim()
+      || (row?.group_id && row?.post_id
+        ? `https://www.facebook.com/groups/${row.group_id}/posts/${row.post_id}/`
+        : '');
+    if (!postLink) {
+      dispatch(showToast({ type: 'error', message: t('facebookData.toast.crawlCommentsNoLink') }));
+      return;
+    }
+
+    const parsed = parseFacebookPostLink(postLink);
+    if (!parsed.group_id || !parsed.post_id) {
+      dispatch(showToast({ type: 'error', message: t('facebookData.toast.crawlCommentsInvalidLink') }));
+      return;
+    }
+
+    setCrawlingPostId(row.post_id);
+    try {
+      const runtimeVariables = buildFacebookCommentCrawlVariables({
+        postLink,
+        groupId: parsed.group_id,
+        postId: parsed.post_id,
+      });
+      const launchOptions = readFacebookCrawlLaunchOptions(settings);
+      pendingCrawlRef.current = { kind: 'comments', scenarioId, postId: row.post_id };
+
+      const result = await dispatch(startLocalCampaign({
+        scenarioId,
+        runtimeVariables,
+        ...launchOptions,
+      }));
+      if (result.meta.requestStatus === 'fulfilled') {
+        dispatch(showToast({ type: 'info', message: t('facebookData.toast.crawlCommentsStarted') }));
+      } else {
+        dispatch(showToast({
+          type: 'error',
+          message: result.payload || t('executions.toast.runFailed'),
+        }));
+      }
+    } finally {
+      setCrawlingPostId('');
+    }
+  }, [dispatch, settings, t]);
+
   const postColumns = useMemo(() => ([
     {
       key: 'post_author',
       label: t('facebookData.studio.columns.postAuthor'),
-      render: (row) => row.post_author || row.author_name || '—',
+      render: (row) => (
+        <AuthorCell
+          name={row.post_author || row.author_name}
+          authorLink={row.author_link}
+          onOpenLink={openExternalLink}
+          t={t}
+        />
+      ),
       accessor: (row) => row.post_author || row.author_name || '',
     },
     {
@@ -238,6 +696,19 @@ export default function FacebookDataPage() {
       label: t('facebookData.studio.columns.postContent'),
       render: (row) => truncateText(row.post_content, 220),
       accessor: (row) => row.post_content || '',
+    },
+    {
+      key: 'post_images',
+      label: t('facebookData.studio.columns.imageCount'),
+      render: (row) => (
+        <MediaThumbnails
+          localPath={row.local_image_path}
+          mediaValue={row.post_images}
+          alt={row.post_author || row.author_name || t('facebookData.studio.columns.localImage')}
+          onPreview={handlePreviewImage}
+        />
+      ),
+      accessor: (row) => row.local_image_path || parseFacebookMediaUrls(row.post_images).join(' | '),
     },
     {
       key: 'like_count',
@@ -252,39 +723,55 @@ export default function FacebookDataPage() {
       accessor: (row) => formatCount(row.share_count),
     },
     {
-      key: 'comment_count',
-      label: t('facebookData.studio.columns.commentCount'),
-      render: (row) => formatCount(row.comment_count),
-      accessor: (row) => formatCount(row.comment_count),
+      key: 'crawled_comment_count',
+      label: t('facebookData.studio.columns.crawledCommentCount'),
+      render: (row) => formatCount(row.crawled_comment_count),
+      accessor: (row) => formatCount(row.crawled_comment_count),
     },
     {
       key: 'post_link',
       label: t('facebookData.studio.columns.postLink'),
       render: (row) => (
         row.post_link ? (
-          <div className="inline-flex items-center gap-1.5">
+          <div className="inline-flex items-center gap-1">
             <button
               type="button"
+              title={t('facebookData.studio.openLink')}
+              aria-label={t('facebookData.studio.openLink')}
               onClick={(event) => {
                 event.stopPropagation();
                 openExternalLink(row.post_link);
               }}
-              className="inline-flex min-w-0 items-center gap-1 text-left text-[#8ec0ff] hover:underline"
+              className={iconActionButtonClassName()}
             >
-              <span>{truncateText(row.post_link, 56)}</span>
-              <ExternalLink className="h-3.5 w-3.5 shrink-0" />
+              <ExternalLink className="h-3.5 w-3.5" />
             </button>
             <button
               type="button"
-              title={t('facebookData.studio.copyLink')}
-              aria-label={t('facebookData.studio.copyLink')}
+              title={t('facebookData.studio.columns.copyLink')}
+              aria-label={t('facebookData.studio.columns.copyLink')}
               onClick={(event) => {
                 event.stopPropagation();
                 copyPostLink(row.post_link);
               }}
-              className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded border border-[#2f3a4d] text-[#9eb4d6] hover:border-[#3f6fd6] hover:text-[#c7ddff]"
+              className={iconActionButtonClassName()}
             >
               <Copy className="h-3.5 w-3.5" />
+            </button>
+            <button
+              type="button"
+              title={t('facebookData.studio.crawlComments')}
+              aria-label={t('facebookData.studio.crawlComments')}
+              disabled={crawlingPostId === row.post_id}
+              onClick={(event) => {
+                event.stopPropagation();
+                handleCrawlComments(row);
+              }}
+              className={iconActionButtonClassName()}
+            >
+              {crawlingPostId === row.post_id
+                ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                : <MessagesSquare className="h-3.5 w-3.5" />}
             </button>
           </div>
         ) : '—'
@@ -303,13 +790,20 @@ export default function FacebookDataPage() {
       render: (row) => formatDate(row.crawled_at, dateLocale),
       accessor: (row) => formatDate(row.crawled_at, dateLocale),
     },
-  ]), [copyPostLink, dateLocale, openExternalLink, t]);
+  ]), [copyPostLink, crawlingPostId, dateLocale, handleCrawlComments, handlePreviewImage, openExternalLink, t]);
 
   const commentColumns = useMemo(() => ([
     {
       key: 'comment_author',
       label: t('facebookData.studio.columns.commentAuthor'),
-      render: (row) => row.comment_author || row.author_name || '—',
+      render: (row) => (
+        <AuthorCell
+          name={row.comment_author || row.author_name}
+          authorLink={row.author_link}
+          onOpenLink={openExternalLink}
+          t={t}
+        />
+      ),
       accessor: (row) => row.comment_author || row.author_name || '',
     },
     {
@@ -317,6 +811,18 @@ export default function FacebookDataPage() {
       label: t('facebookData.studio.columns.commentContent'),
       render: (row) => truncateText(row.comment_content, 260),
       accessor: (row) => row.comment_content || '',
+    },
+    {
+      key: 'comment_images',
+      label: t('facebookData.studio.columns.imageCount'),
+      render: (row) => (
+        <MediaThumbnails
+          mediaValue={row.comment_images}
+          alt={row.comment_author || row.author_name || t('facebookData.studio.columns.localImage')}
+          onPreview={handlePreviewImage}
+        />
+      ),
+      accessor: (row) => parseFacebookMediaUrls(row.comment_images).join(' | '),
     },
     {
       key: 'like_count',
@@ -330,7 +836,7 @@ export default function FacebookDataPage() {
       render: (row) => formatDate(row.crawled_at, dateLocale),
       accessor: (row) => formatDate(row.crawled_at, dateLocale),
     },
-  ]), [dateLocale, t]);
+  ]), [dateLocale, handlePreviewImage, openExternalLink, t]);
 
   const handleExport = async () => {
     const isPostsTab = activeTab === 'posts';
@@ -383,7 +889,26 @@ export default function FacebookDataPage() {
           <h1 className="page-title">{t('facebookData.studio.title')}</h1>
           <p className="page-subtitle">{t('facebookData.studio.subtitle')}</p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <label className="flex min-w-[220px] flex-1 items-center gap-2">
+            <span className="sr-only">{t('facebookData.studio.crawlGroupLink')}</span>
+            <input
+              type="url"
+              value={crawlGroupLink}
+              onChange={(event) => setCrawlGroupLink(event.target.value)}
+              placeholder={t('facebookData.studio.crawlGroupLinkPlaceholder')}
+              className="input-field h-10 min-w-0 flex-1"
+            />
+          </label>
+          <button
+            type="button"
+            onClick={handleCrawlGroup}
+            disabled={crawlingGroup || !String(crawlGroupLink || '').trim()}
+            className="btn-secondary"
+          >
+            {crawlingGroup ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+            {t('facebookData.studio.crawlGroup')}
+          </button>
           <button
             type="button"
             onClick={() => {
@@ -408,6 +933,14 @@ export default function FacebookDataPage() {
           </button>
         </div>
       </div>
+
+      {String(crawlGroupLink || '').trim() ? (
+        <p className="mb-3 text-xs text-[#9aa7b7]">
+          {t('facebookData.studio.crawlGroupLinkHint', {
+            groupId: parseFacebookGroupLink(crawlGroupLink).group_id || '—',
+          })}
+        </p>
+      ) : null}
 
       <div className="mb-4 grid gap-3 md:grid-cols-2">
         <label className="block">
@@ -534,6 +1067,14 @@ export default function FacebookDataPage() {
           />
         )
       )}
+      {previewImage ? (
+        <ImagePreviewModal
+          image={previewImage}
+          onClose={() => setPreviewImage(null)}
+          onOpenExternal={handleOpenPreviewExternal}
+          t={t}
+        />
+      ) : null}
     </div>
   );
 }

@@ -157,6 +157,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   listFacebookAuthors: (options) => ipcRenderer.invoke('facebook-data:list-authors', options),
   listFacebookPosts: (options) => ipcRenderer.invoke('facebook-data:list-posts', options),
   listFacebookComments: (options) => ipcRenderer.invoke('facebook-data:list-comments', options),
+  resolveFacebookMediaUrl: (relativePath) => ipcRenderer.invoke('facebook-data:resolve-media-url', relativePath),
+  openFacebookMediaFile: (relativePath) => ipcRenderer.invoke('facebook-data:open-media-file', relativePath),
   exportFacebookDataCsv: (payload) => ipcRenderer.invoke('facebook-data:export-csv', payload),
 
   selectDirectory: () => ipcRenderer.invoke('dialog:select-directory'),
