@@ -5,7 +5,6 @@ import { fetchSettings, saveSettings, updateSetting } from '../slices/settingsSl
 import { showToast } from '../slices/uiSlice';
 import { useTranslation } from '../i18n';
 import {
-  FACEBOOK_CRAWL_COMMENT_PROFILE_ID,
   FACEBOOK_CRAWL_GROUP_PROFILE_ID,
   FACEBOOK_CRAWL_SETTINGS,
   DEFAULT_FACEBOOK_CRAWL_SCROLL_SETTLE_SECONDS,
@@ -132,11 +131,6 @@ export default function FacebookDataSettingsPage() {
     [variableProfiles],
   );
 
-  const commentVariableProfile = useMemo(
-    () => variableProfiles.find((profile) => profile.id === FACEBOOK_CRAWL_COMMENT_PROFILE_ID),
-    [variableProfiles],
-  );
-
   return (
     <div className="page-shell">
       <div className="page-header">
@@ -191,26 +185,6 @@ export default function FacebookDataSettingsPage() {
                 </p>
               </Field>
 
-              <Field label={t('facebookData.settings.crawlCommentScenario')}>
-                <select
-                  value={values[FACEBOOK_CRAWL_SETTINGS.commentScenarioId] || ''}
-                  onChange={(event) => setValue(
-                    FACEBOOK_CRAWL_SETTINGS.commentScenarioId,
-                    event.target.value,
-                  )}
-                  className="select-field max-w-xl"
-                >
-                  <option value="">{t('facebookData.settings.noScenario')}</option>
-                  {crawlScenarioOptions.map((scenario) => (
-                    <option key={scenario.id} value={scenario.id}>
-                      {scenario.name}
-                    </option>
-                  ))}
-                </select>
-                <p className="mt-1 text-xs text-[#6f7d90]">
-                  {t('facebookData.settings.crawlCommentScenarioHint')}
-                </p>
-              </Field>
             </div>
 
             <div className="space-y-4 rounded-xl border border-[#2e3b4e] bg-[#151f2d] p-4">
@@ -298,15 +272,6 @@ export default function FacebookDataSettingsPage() {
                 systemBadge={t('facebookData.settings.systemProfile')}
               />
 
-              <SystemVariableProfileCard
-                title={t('facebookData.settings.commentProfileTitle')}
-                profile={commentVariableProfile}
-                variableHints={[
-                  { key: 'group_id', hint: t('facebookData.settings.variables.groupIdFromPost') },
-                  { key: 'post_id', hint: t('facebookData.settings.variables.postId') },
-                ]}
-                systemBadge={t('facebookData.settings.systemProfile')}
-              />
             </div>
           </div>
         )}

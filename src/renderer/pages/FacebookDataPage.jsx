@@ -1,5 +1,5 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Download, Copy, ExternalLink, ImageIcon, Loader2, MessagesSquare, Play, RefreshCw, X } from 'lucide-react';
+﻿import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Download, Copy, ExternalLink, ImageIcon, Loader2, Play, RefreshCw, Search, Trash2, X } from 'lucide-react';
 import { useDispatch, useSelector } from 'react-redux';
 import { useTranslation } from '../i18n';
 import { buildCsvContent } from '../utils/exportTableCsv';
@@ -8,8 +8,8 @@ import { fetchSettings } from '../slices/settingsSlice';
 import { startLocalCampaign } from '../slices/executionSlice';
 import { parseFacebookMediaUrls } from '../../shared/facebookMediaExtract.js';
 import {
-  buildFacebookCommentCrawlVariables,
   buildFacebookGroupCrawlVariables,
+  buildFacebookSinglePostCrawlVariables,
   FACEBOOK_CRAWL_GROUP_PROFILE_ID,
   FACEBOOK_CRAWL_SETTINGS,
   parseFacebookGroupLink,
@@ -17,6 +17,11 @@ import {
   readFacebookCrawlLaunchOptions,
   readVariableSampleValue,
 } from '../../shared/facebookCrawlConfig.js';
+import {
+  normalizeFacebookCrawlDateInput,
+  toFacebookCrawlDateDisplay,
+} from '../../shared/facebookDateFormat.js';
+import FacebookDatePicker from '../components/FacebookDatePicker.jsx';
 
 const THUMB_CLASS = 'h-12 w-12 shrink-0 rounded border border-[#2e3b4e] object-cover bg-[#151f2d]';
 const MAX_VISIBLE_THUMBS = 4;
@@ -26,7 +31,7 @@ const PLATFORM_OPTIONS = [
 ];
 
 function formatDate(value, locale) {
-  if (!value) return '—';
+  if (!value) return 'â€”';
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return String(value);
   return date.toLocaleString(locale);
@@ -36,6 +41,22 @@ function formatCount(value) {
   const count = Number(value);
   if (!Number.isFinite(count) || count < 0) return '0';
   return String(Math.floor(count));
+}
+
+function readFacebookDbSaveResult(status) {
+  return status?.resultJson?.facebook_db_save
+    || status?.result_json?.facebook_db_save
+    || status?.result?.facebook_db_save
+    || null;
+}
+
+function formatFacebookDbSaveError(dbSave, t) {
+  const errors = Array.isArray(dbSave?.errors) ? dbSave.errors.map((item) => String(item || '')) : [];
+  const firstError = errors.find(Boolean);
+  if (firstError) return firstError;
+
+  const failed = Number(dbSave?.failed || 0);
+  return t('facebookData.toast.crawlDbSaveFailed', { failed: Number.isFinite(failed) ? failed : 0 });
 }
 
 function MediaThumbPlaceholder({ className = THUMB_CLASS }) {
@@ -211,18 +232,38 @@ function ImagePreviewModal({ image, onClose, onOpenExternal, t }) {
 }
 
 function MediaThumbnails({ localPath, mediaValue, alt = '', max = MAX_VISIBLE_THUMBS, onPreview }) {
-  const hasLocal = Boolean(String(localPath || '').trim());
-  if (hasLocal) {
+  const localPaths = [
+    ...parseFacebookMediaUrls(localPath),
+    ...parseFacebookMediaUrls(mediaValue).filter((item) => !/^https?:\/\//i.test(item)),
+  ];
+  const remoteUrls = parseFacebookMediaUrls(mediaValue).filter((item) => /^https?:\/\//i.test(item));
+
+  if (localPaths.length) {
+    const visibleLocal = localPaths.slice(0, max);
+    const hiddenCount = Math.max(0, localPaths.length - visibleLocal.length);
     return (
-      <LocalMediaThumb relativePath={localPath} alt={alt} onPreview={onPreview} />
+      <div className="flex flex-wrap items-center gap-1">
+        {visibleLocal.map((relativePath, index) => (
+          <LocalMediaThumb
+            key={`${relativePath}-${index}`}
+            relativePath={relativePath}
+            alt={alt ? `${alt} ${index + 1}` : ''}
+            onPreview={onPreview}
+          />
+        ))}
+        {hiddenCount > 0 ? (
+          <span className="rounded border border-[#2e3b4e] bg-[#151f2d] px-1.5 py-0.5 text-[10px] text-[#9aa7b7]">
+            +{hiddenCount}
+          </span>
+        ) : null}
+      </div>
     );
   }
 
-  const remoteUrls = parseFacebookMediaUrls(mediaValue);
   const visibleRemote = remoteUrls.slice(0, max);
   const hiddenCount = Math.max(0, remoteUrls.length - visibleRemote.length);
 
-  if (!remoteUrls.length) return '—';
+  if (!remoteUrls.length) return 'â€”';
 
   return (
     <div className="flex flex-wrap items-center gap-1">
@@ -245,9 +286,9 @@ function MediaThumbnails({ localPath, mediaValue, alt = '', max = MAX_VISIBLE_TH
 
 function truncateText(value, max = 180) {
   const text = String(value || '').trim();
-  if (!text) return '—';
+  if (!text) return 'â€”';
   if (text.length <= max) return text;
-  return `${text.slice(0, max)}…`;
+  return `${text.slice(0, max)}â€¦`;
 }
 
 function StudioTable({
@@ -308,8 +349,293 @@ function iconActionButtonClassName() {
   return 'inline-flex h-7 w-7 shrink-0 items-center justify-center rounded border border-[#2f3a4d] text-[#9eb4d6] hover:border-[#3f6fd6] hover:text-[#c7ddff]';
 }
 
+function CrawlGroupModal({
+  open,
+  groupLink,
+  dateLock,
+  crawling,
+  onGroupLinkChange,
+  onDateLockChange,
+  onClose,
+  onSubmit,
+  t,
+}) {
+  useEffect(() => {
+    if (!open) return undefined;
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape' && !crawling) onClose();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [crawling, onClose, open]);
+
+  if (!open) return null;
+
+  const parsedGroupId = parseFacebookGroupLink(groupLink).group_id || 'â€”';
+  const canSubmit = Boolean(String(groupLink || '').trim()) && !crawling;
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
+      onClick={() => {
+        if (!crawling) onClose();
+      }}
+    >
+      <div
+        className="w-full max-w-lg rounded-xl border border-[#2e3b4e] bg-[#182230] p-5 shadow-2xl"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="mb-4 flex items-center justify-between gap-3">
+          <h2 className="text-base font-semibold text-white">{t('facebookData.studio.crawlGroupModalTitle')}</h2>
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={crawling}
+            className="inline-flex h-8 w-8 items-center justify-center rounded border border-[#3a4a61] text-[#c7d2e0] hover:border-[#5b7ec7] hover:text-white disabled:opacity-50"
+            aria-label={t('common.close')}
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="space-y-4">
+          <label className="block">
+            <span className="mb-1 block text-sm text-[#c7d2e0]">{t('facebookData.studio.crawlGroupLink')}</span>
+            <input
+              type="url"
+              value={groupLink}
+              onChange={(event) => onGroupLinkChange(event.target.value)}
+              placeholder={t('facebookData.studio.crawlGroupLinkPlaceholder')}
+              className="input-field h-10"
+              autoFocus
+            />
+            {String(groupLink || '').trim() ? (
+              <p className="mt-1 text-xs text-[#9aa7b7]">
+                {t('facebookData.studio.crawlGroupLinkHint', { groupId: parsedGroupId })}
+              </p>
+            ) : null}
+          </label>
+
+          <label className="block">
+            <span className="mb-1 block text-sm text-[#c7d2e0]">{t('facebookData.studio.crawlDateLock')}</span>
+            <FacebookDatePicker
+              value={dateLock}
+              onChange={onDateLockChange}
+              disabled={crawling}
+              placeholder={t('facebookData.studio.crawlDateLockPlaceholder')}
+            />
+            <p className="mt-1 text-xs text-[#9aa7b7]">{t('facebookData.studio.crawlDateLockHint')}</p>
+          </label>
+        </div>
+
+        <div className="mt-5 flex justify-end gap-2">
+          <button type="button" onClick={onClose} disabled={crawling} className="btn-secondary">
+            {t('common.cancel')}
+          </button>
+          <button
+            type="button"
+            onClick={onSubmit}
+            disabled={!canSubmit}
+            className="btn-primary"
+          >
+            {crawling ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+            {t('facebookData.studio.crawlGroupStart')}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CrawlSinglePostModal({
+  open,
+  postLink,
+  crawling,
+  onPostLinkChange,
+  onClose,
+  onSubmit,
+  t,
+}) {
+  useEffect(() => {
+    if (!open) return undefined;
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape' && !crawling) onClose();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [crawling, onClose, open]);
+
+  if (!open) return null;
+
+  const parsed = parseFacebookPostLink(postLink);
+  const canSubmit = Boolean(String(postLink || '').trim()) && !crawling;
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
+      onClick={() => {
+        if (!crawling) onClose();
+      }}
+    >
+      <div
+        className="w-full max-w-lg rounded-xl border border-[#2e3b4e] bg-[#182230] p-5 shadow-2xl"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="mb-4 flex items-center justify-between gap-3">
+          <h2 className="text-base font-semibold text-white">
+            {t('facebookData.studio.crawlSinglePostModalTitle')}
+          </h2>
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={crawling}
+            className="inline-flex h-8 w-8 items-center justify-center rounded border border-[#3a4a61] text-[#c7d2e0] hover:border-[#5b7ec7] hover:text-white disabled:opacity-50"
+            aria-label={t('common.close')}
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <label className="block">
+          <span className="mb-1 block text-sm text-[#c7d2e0]">
+            {t('facebookData.studio.crawlSinglePostLink')}
+          </span>
+          <input
+            type="url"
+            value={postLink}
+            onChange={(event) => onPostLinkChange(event.target.value)}
+            placeholder={t('facebookData.studio.crawlSinglePostLinkPlaceholder')}
+            className="input-field h-10"
+            autoFocus
+          />
+          {String(postLink || '').trim() ? (
+            <p className="mt-1 text-xs text-[#9aa7b7]">
+              {t('facebookData.studio.crawlSinglePostLinkHint', {
+                groupId: parsed.group_id || '-',
+                postId: parsed.post_id || '-',
+              })}
+            </p>
+          ) : null}
+        </label>
+
+        <div className="mt-5 flex justify-end gap-2">
+          <button type="button" onClick={onClose} disabled={crawling} className="btn-secondary">
+            {t('common.cancel')}
+          </button>
+          <button
+            type="button"
+            onClick={onSubmit}
+            disabled={!canSubmit}
+            className="btn-primary"
+          >
+            {crawling ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+            {t('facebookData.studio.crawlSinglePostStart')}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DeletePostConfirmModal({
+  post,
+  deleting,
+  onClose,
+  onConfirm,
+  t,
+}) {
+  if (!post) return null;
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
+      onClick={() => {
+        if (!deleting) onClose();
+      }}
+    >
+      <div
+        className="w-full max-w-md rounded-xl border border-[#2e3b4e] bg-[#182230] p-5 shadow-2xl"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <h2 className="text-base font-semibold text-white">{t('facebookData.studio.deletePostConfirmTitle')}</h2>
+        <p className="mt-2 text-sm text-[#c7d2e0]">{t('facebookData.studio.deletePostConfirmMessage')}</p>
+        <p className="mt-3 rounded-lg border border-[#2e3b4e] bg-[#151f2d] px-3 py-2 text-sm text-[#e8eef7]">
+          {truncateText(post.post_content || post.post_author || post.post_id, 160)}
+        </p>
+        <div className="mt-5 flex justify-end gap-2">
+          <button type="button" onClick={onClose} disabled={deleting} className="btn-secondary">
+            {t('common.cancel')}
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            disabled={deleting}
+            className="inline-flex items-center gap-2 rounded-lg border border-red-700/60 bg-red-900/40 px-4 py-2 text-sm text-red-100 hover:bg-red-900/60 disabled:opacity-60"
+          >
+            {deleting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+            {t('facebookData.studio.deletePost')}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SelectedPostPreview({ post, onOpenLink, onPreview, onDelete, deleting, t }) {
+  if (!post) return null;
+
+  const authorName = post.post_author || post.author_name || t('common.unknown');
+  const content = String(post.post_content || '').trim();
+  const hasImages = Boolean(String(post.local_image_path || '').trim())
+    || parseFacebookMediaUrls(post.post_images).length > 0;
+
+  return (
+    <div className="mb-3 rounded-lg border border-[#2e3b4e] bg-[#182230] px-4 py-3">
+      <div className="mb-2 flex items-start justify-between gap-3">
+        <AuthorCell
+          name={authorName}
+          authorLink={post.author_link}
+          onOpenLink={onOpenLink}
+          t={t}
+        />
+        {onDelete ? (
+          <button
+            type="button"
+            title={t('facebookData.studio.deletePost')}
+            aria-label={t('facebookData.studio.deletePost')}
+            disabled={deleting}
+            onClick={onDelete}
+            className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded border border-red-800/50 text-red-300 hover:bg-red-900/30 disabled:opacity-60"
+          >
+            {deleting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+          </button>
+        ) : null}
+      </div>
+      {content ? (
+        <p className="whitespace-pre-wrap text-sm leading-relaxed text-[#e8eef7]">{content}</p>
+      ) : (
+        <p className="text-sm text-[#9aa7b7]">â€”</p>
+      )}
+      {hasImages ? (
+        <div className="mt-3">
+          <MediaThumbnails
+            localPath={post.local_image_path}
+            mediaValue={post.post_images}
+            alt={authorName}
+            max={8}
+            onPreview={onPreview}
+          />
+        </div>
+      ) : null}
+      {post.post_date ? (
+        <p className="mt-2 text-xs text-[#9aa7b7]">{post.post_date}</p>
+      ) : null}
+    </div>
+  );
+}
+
 function AuthorCell({ name, authorLink, onOpenLink, t }) {
-  const displayName = name || '—';
+  const displayName = name || 'â€”';
   if (!authorLink) return displayName;
 
   return (
@@ -340,7 +666,6 @@ export default function FacebookDataPage() {
 
   const pendingCrawlRef = useRef(null);
   const lastHandledExecutionRef = useRef('');
-  const selectedPostIdRef = useRef('');
 
   const [platform, setPlatform] = useState('facebook');
   const [selectedGroupId, setSelectedGroupId] = useState('');
@@ -354,8 +679,16 @@ export default function FacebookDataPage() {
   const [loadingComments, setLoadingComments] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [crawlingGroup, setCrawlingGroup] = useState(false);
+  const [crawlingSinglePost, setCrawlingSinglePost] = useState(false);
+  const [showCrawlGroupModal, setShowCrawlGroupModal] = useState(false);
+  const [showCrawlSinglePostModal, setShowCrawlSinglePostModal] = useState(false);
   const [crawlGroupLink, setCrawlGroupLink] = useState('');
-  const [crawlingPostId, setCrawlingPostId] = useState('');
+  const [crawlSinglePostLink, setCrawlSinglePostLink] = useState('');
+  const [postSearch, setPostSearch] = useState('');
+  const [commentSearch, setCommentSearch] = useState('');
+  const [crawlDateLock, setCrawlDateLock] = useState('');
+  const [postPendingDelete, setPostPendingDelete] = useState(null);
+  const [deletingPostId, setDeletingPostId] = useState('');
   const [previewImage, setPreviewImage] = useState(null);
   const [error, setError] = useState('');
 
@@ -378,7 +711,7 @@ export default function FacebookDataPage() {
     }
   }, [t]);
 
-  const loadPosts = useCallback(async () => {
+  const loadPosts = useCallback(async (searchTerm = postSearch) => {
     if (!window.electronAPI?.listFacebookPosts) return;
 
     setLoadingPosts(true);
@@ -387,6 +720,7 @@ export default function FacebookDataPage() {
     try {
       const items = await window.electronAPI.listFacebookPosts({
         groupId: selectedGroupId,
+        search: searchTerm,
         limit: 500,
         offset: 0,
       });
@@ -406,7 +740,7 @@ export default function FacebookDataPage() {
     } finally {
       setLoadingPosts(false);
     }
-  }, [selectedGroupId, t]);
+  }, [postSearch, selectedGroupId, t]);
 
   useEffect(() => {
     if (!selectedPost?.post_id) return;
@@ -416,7 +750,7 @@ export default function FacebookDataPage() {
     }
   }, [posts, selectedPost]);
 
-  const loadComments = useCallback(async (postId) => {
+  const loadComments = useCallback(async (postId, searchTerm = commentSearch) => {
     if (!postId || !window.electronAPI?.listFacebookComments) {
       setComments([]);
       return;
@@ -428,6 +762,7 @@ export default function FacebookDataPage() {
     try {
       const items = await window.electronAPI.listFacebookComments({
         postId,
+        search: searchTerm,
         limit: 1000,
         offset: 0,
       });
@@ -441,14 +776,9 @@ export default function FacebookDataPage() {
     } finally {
       setLoadingComments(false);
     }
-  }, [t]);
-
-  useEffect(() => {
-    selectedPostIdRef.current = selectedPost?.post_id || '';
-  }, [selectedPost?.post_id]);
+  }, [commentSearch, t]);
 
   const groupCrawlScenarioId = String(settings[FACEBOOK_CRAWL_SETTINGS.groupScenarioId] || '').trim();
-  const commentCrawlScenarioId = String(settings[FACEBOOK_CRAWL_SETTINGS.commentScenarioId] || '').trim();
 
   useEffect(() => {
     if (!liveStatus?.executionId) return;
@@ -458,23 +788,38 @@ export default function FacebookDataPage() {
 
     const scenarioId = String(liveStatus.scenarioId || '').trim();
     const isGroupCrawl = groupCrawlScenarioId && scenarioId === groupCrawlScenarioId;
-    const isCommentCrawl = commentCrawlScenarioId && scenarioId === commentCrawlScenarioId;
-    if (!isGroupCrawl && !isCommentCrawl) return;
+    if (!isGroupCrawl) return;
 
     const handledKey = `${liveStatus.executionId}:${liveStatus.type}`;
     if (lastHandledExecutionRef.current === handledKey) return;
     lastHandledExecutionRef.current = handledKey;
 
+    const facebookDbSave = readFacebookDbSaveResult(liveStatus);
+    const dbSaveFailed = liveStatus.type === 'execution:completed'
+      && facebookDbSave
+      && facebookDbSave.success === false;
+
     const refreshCrawledData = async () => {
       await loadGroups();
       await loadPosts();
 
-      const targetPostId = pendingCrawlRef.current?.postId || selectedPostIdRef.current;
-      if (targetPostId && (isCommentCrawl || selectedPostIdRef.current === targetPostId)) {
-        await loadComments(targetPostId);
+      pendingCrawlRef.current = null;
+
+      if (dbSaveFailed) {
+        dispatch(showToast({
+          type: 'error',
+          message: formatFacebookDbSaveError(facebookDbSave, t),
+        }));
+        return;
       }
 
-      pendingCrawlRef.current = null;
+      if (liveStatus.type === 'execution:failed') {
+        dispatch(showToast({
+          type: 'error',
+          message: liveStatus.error || t('executions.toast.failed'),
+        }));
+        return;
+      }
 
       if (liveStatus.type === 'execution:completed') {
         dispatch(showToast({
@@ -486,11 +831,9 @@ export default function FacebookDataPage() {
 
     refreshCrawledData();
   }, [
-    commentCrawlScenarioId,
     dispatch,
     groupCrawlScenarioId,
     liveStatus,
-    loadComments,
     loadGroups,
     loadPosts,
     t,
@@ -501,14 +844,22 @@ export default function FacebookDataPage() {
   }, [loadGroups]);
 
   useEffect(() => {
-    loadPosts();
-  }, [loadPosts]);
+    const timer = window.setTimeout(() => {
+      loadPosts(postSearch);
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [loadPosts, postSearch, selectedGroupId]);
 
   useEffect(() => {
-    if (selectedPost?.post_id) {
-      loadComments(selectedPost.post_id);
+    if (!selectedPost?.post_id) {
+      setComments([]);
+      return;
     }
-  }, [loadComments, selectedPost?.post_id]);
+    const timer = window.setTimeout(() => {
+      loadComments(selectedPost.post_id, commentSearch);
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [commentSearch, loadComments, selectedPost?.post_id]);
 
   const handleSelectPost = (row) => {
     setSelectedPost(row);
@@ -574,6 +925,35 @@ export default function FacebookDataPage() {
     }
   }, [dispatch, t]);
 
+  const handleOpenCrawlGroupModal = useCallback(async () => {
+    setShowCrawlGroupModal(true);
+
+    let lastDate = crawlDateLock;
+    if (!lastDate && window.electronAPI?.getVariableProfileSamples) {
+      try {
+        const samples = await window.electronAPI.getVariableProfileSamples(FACEBOOK_CRAWL_GROUP_PROFILE_ID);
+        lastDate = toFacebookCrawlDateDisplay(readVariableSampleValue(samples, 'last_date'));
+      } catch {
+        lastDate = '';
+      }
+    }
+    if (lastDate) setCrawlDateLock(lastDate);
+  }, [crawlDateLock]);
+
+  const handleCloseCrawlGroupModal = useCallback(() => {
+    if (crawlingGroup) return;
+    setShowCrawlGroupModal(false);
+  }, [crawlingGroup]);
+
+  const handleOpenCrawlSinglePostModal = useCallback(() => {
+    setShowCrawlSinglePostModal(true);
+  }, []);
+
+  const handleCloseCrawlSinglePostModal = useCallback(() => {
+    if (crawlingSinglePost) return;
+    setShowCrawlSinglePostModal(false);
+  }, [crawlingSinglePost]);
+
   const handleCrawlGroup = useCallback(async () => {
     const scenarioId = String(settings[FACEBOOK_CRAWL_SETTINGS.groupScenarioId] || '').trim();
     if (!scenarioId) {
@@ -595,15 +975,9 @@ export default function FacebookDataPage() {
 
     setCrawlingGroup(true);
     try {
-      let lastDate = '';
-      if (window.electronAPI?.getVariableProfileSamples) {
-        const samples = await window.electronAPI.getVariableProfileSamples(FACEBOOK_CRAWL_GROUP_PROFILE_ID);
-        lastDate = readVariableSampleValue(samples, 'last_date');
-      }
-
       const runtimeVariables = buildFacebookGroupCrawlVariables({
         groupId: parsed.group_id,
-        lastDate,
+        lastDate: normalizeFacebookCrawlDateInput(crawlDateLock),
       });
       const launchOptions = readFacebookCrawlLaunchOptions(settings);
       pendingCrawlRef.current = { kind: 'group', scenarioId, postId: null, groupId: parsed.group_id };
@@ -615,6 +989,7 @@ export default function FacebookDataPage() {
       }));
       if (result.meta.requestStatus === 'fulfilled') {
         setSelectedGroupId(parsed.group_id);
+        setShowCrawlGroupModal(false);
         dispatch(showToast({ type: 'info', message: t('facebookData.toast.crawlGroupStarted') }));
       } else {
         dispatch(showToast({
@@ -625,39 +1000,37 @@ export default function FacebookDataPage() {
     } finally {
       setCrawlingGroup(false);
     }
-  }, [crawlGroupLink, dispatch, settings, t]);
+  }, [crawlDateLock, crawlGroupLink, dispatch, settings, t]);
 
-  const handleCrawlComments = useCallback(async (row) => {
-    const scenarioId = String(settings[FACEBOOK_CRAWL_SETTINGS.commentScenarioId] || '').trim();
+  const handleCrawlSinglePost = useCallback(async () => {
+    const scenarioId = String(settings[FACEBOOK_CRAWL_SETTINGS.groupScenarioId] || '').trim();
     if (!scenarioId) {
-      dispatch(showToast({ type: 'error', message: t('facebookData.toast.crawlCommentsNoScenario') }));
+      dispatch(showToast({ type: 'error', message: t('facebookData.toast.crawlGroupNoScenario') }));
       return;
     }
 
-    const postLink = String(row?.post_link || '').trim()
-      || (row?.group_id && row?.post_id
-        ? `https://www.facebook.com/groups/${row.group_id}/posts/${row.post_id}/`
-        : '');
+    const postLink = String(crawlSinglePostLink || '').trim();
     if (!postLink) {
-      dispatch(showToast({ type: 'error', message: t('facebookData.toast.crawlCommentsNoLink') }));
+      dispatch(showToast({ type: 'error', message: t('facebookData.toast.crawlSinglePostNoLink') }));
       return;
     }
 
     const parsed = parseFacebookPostLink(postLink);
     if (!parsed.group_id || !parsed.post_id) {
-      dispatch(showToast({ type: 'error', message: t('facebookData.toast.crawlCommentsInvalidLink') }));
+      dispatch(showToast({ type: 'error', message: t('facebookData.toast.crawlSinglePostInvalidLink') }));
       return;
     }
 
-    setCrawlingPostId(row.post_id);
+    setCrawlingSinglePost(true);
     try {
-      const runtimeVariables = buildFacebookCommentCrawlVariables({
-        postLink,
-        groupId: parsed.group_id,
-        postId: parsed.post_id,
-      });
+      const runtimeVariables = buildFacebookSinglePostCrawlVariables({ postLink });
       const launchOptions = readFacebookCrawlLaunchOptions(settings);
-      pendingCrawlRef.current = { kind: 'comments', scenarioId, postId: row.post_id };
+      pendingCrawlRef.current = {
+        kind: 'single-post',
+        scenarioId,
+        postId: parsed.post_id,
+        groupId: parsed.group_id,
+      };
 
       const result = await dispatch(startLocalCampaign({
         scenarioId,
@@ -665,7 +1038,9 @@ export default function FacebookDataPage() {
         ...launchOptions,
       }));
       if (result.meta.requestStatus === 'fulfilled') {
-        dispatch(showToast({ type: 'info', message: t('facebookData.toast.crawlCommentsStarted') }));
+        setSelectedGroupId(parsed.group_id);
+        setShowCrawlSinglePostModal(false);
+        dispatch(showToast({ type: 'info', message: t('facebookData.toast.crawlSinglePostStarted') }));
       } else {
         dispatch(showToast({
           type: 'error',
@@ -673,9 +1048,43 @@ export default function FacebookDataPage() {
         }));
       }
     } finally {
-      setCrawlingPostId('');
+      setCrawlingSinglePost(false);
     }
-  }, [dispatch, settings, t]);
+  }, [crawlSinglePostLink, dispatch, settings, t]);
+
+  const handleDeletePost = useCallback(async () => {
+    const post = postPendingDelete;
+    if (!post?.post_id || !window.electronAPI?.deleteFacebookPost) return;
+
+    setDeletingPostId(post.post_id);
+    try {
+      const result = await window.electronAPI.deleteFacebookPost({ postId: post.post_id });
+      if (!result?.success) {
+        const message = result?.error === 'post_not_found'
+          ? t('facebookData.toast.deletePostNotFound')
+          : (result?.error || t('facebookData.toast.deletePostFailed'));
+        dispatch(showToast({ type: 'error', message }));
+        return;
+      }
+
+      if (selectedPost?.post_id === post.post_id) {
+        setSelectedPost(null);
+        setComments([]);
+        setActiveTab('posts');
+      }
+
+      setPostPendingDelete(null);
+      await loadPosts();
+      dispatch(showToast({ type: 'success', message: t('facebookData.toast.deletePostSuccess') }));
+    } catch (deleteError) {
+      dispatch(showToast({
+        type: 'error',
+        message: deleteError.message || t('facebookData.toast.deletePostFailed'),
+      }));
+    } finally {
+      setDeletingPostId('');
+    }
+  }, [dispatch, loadPosts, postPendingDelete, selectedPost?.post_id, t]);
 
   const postColumns = useMemo(() => ([
     {
@@ -760,28 +1169,28 @@ export default function FacebookDataPage() {
             </button>
             <button
               type="button"
-              title={t('facebookData.studio.crawlComments')}
-              aria-label={t('facebookData.studio.crawlComments')}
-              disabled={crawlingPostId === row.post_id}
+              title={t('facebookData.studio.deletePost')}
+              aria-label={t('facebookData.studio.deletePost')}
+              disabled={deletingPostId === row.post_id}
               onClick={(event) => {
                 event.stopPropagation();
-                handleCrawlComments(row);
+                setPostPendingDelete(row);
               }}
-              className={iconActionButtonClassName()}
+              className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded border border-[#2f3a4d] text-[#d18a8a] hover:border-red-700/70 hover:text-red-200"
             >
-              {crawlingPostId === row.post_id
+              {deletingPostId === row.post_id
                 ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                : <MessagesSquare className="h-3.5 w-3.5" />}
+                : <Trash2 className="h-3.5 w-3.5" />}
             </button>
           </div>
-        ) : '—'
+        ) : 'â€”'
       ),
       accessor: (row) => row.post_link || '',
     },
     {
       key: 'post_date',
       label: t('facebookData.studio.columns.postDate'),
-      render: (row) => row.post_date || '—',
+      render: (row) => row.post_date || 'â€”',
       accessor: (row) => row.post_date || '',
     },
     {
@@ -790,7 +1199,7 @@ export default function FacebookDataPage() {
       render: (row) => formatDate(row.crawled_at, dateLocale),
       accessor: (row) => formatDate(row.crawled_at, dateLocale),
     },
-  ]), [copyPostLink, crawlingPostId, dateLocale, handleCrawlComments, handlePreviewImage, openExternalLink, t]);
+  ]), [copyPostLink, dateLocale, deletingPostId, handlePreviewImage, openExternalLink, t]);
 
   const commentColumns = useMemo(() => ([
     {
@@ -890,20 +1299,19 @@ export default function FacebookDataPage() {
           <p className="page-subtitle">{t('facebookData.studio.subtitle')}</p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <label className="flex min-w-[220px] flex-1 items-center gap-2">
-            <span className="sr-only">{t('facebookData.studio.crawlGroupLink')}</span>
-            <input
-              type="url"
-              value={crawlGroupLink}
-              onChange={(event) => setCrawlGroupLink(event.target.value)}
-              placeholder={t('facebookData.studio.crawlGroupLinkPlaceholder')}
-              className="input-field h-10 min-w-0 flex-1"
-            />
-          </label>
           <button
             type="button"
-            onClick={handleCrawlGroup}
-            disabled={crawlingGroup || !String(crawlGroupLink || '').trim()}
+            onClick={handleOpenCrawlSinglePostModal}
+            disabled={crawlingSinglePost}
+            className="btn-secondary"
+          >
+            {crawlingSinglePost ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+            {t('facebookData.studio.crawlSinglePost')}
+          </button>
+          <button
+            type="button"
+            onClick={handleOpenCrawlGroupModal}
+            disabled={crawlingGroup}
             className="btn-secondary"
           >
             {crawlingGroup ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
@@ -933,14 +1341,6 @@ export default function FacebookDataPage() {
           </button>
         </div>
       </div>
-
-      {String(crawlGroupLink || '').trim() ? (
-        <p className="mb-3 text-xs text-[#9aa7b7]">
-          {t('facebookData.studio.crawlGroupLinkHint', {
-            groupId: parseFacebookGroupLink(crawlGroupLink).group_id || '—',
-          })}
-        </p>
-      ) : null}
 
       <div className="mb-4 grid gap-3 md:grid-cols-2">
         <label className="block">
@@ -978,7 +1378,7 @@ export default function FacebookDataPage() {
             <option value="">{t('facebookData.studio.allGroups')}</option>
             {groups.map((group) => (
               <option key={group.group_id} value={group.group_id}>
-                {group.group_name || group.group_id}
+                {group.display_name || group.group_name || group.group_id}
               </option>
             ))}
           </select>
@@ -988,7 +1388,7 @@ export default function FacebookDataPage() {
       {selectedGroup && (
         <p className="mb-3 text-xs text-[#9aa7b7]">
           {t('facebookData.studio.filteredByGroup', {
-            name: selectedGroup.group_name || selectedGroup.group_id,
+            name: selectedGroup.display_name || selectedGroup.group_name || selectedGroup.group_id,
           })}
         </p>
       )}
@@ -1020,12 +1420,38 @@ export default function FacebookDataPage() {
         </button>
       </div>
 
+      <div className="mb-4">
+        <label className="relative block">
+          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#9aa7b7]" />
+          <input
+            type="search"
+            value={activeTab === 'posts' ? postSearch : commentSearch}
+            onChange={(event) => {
+              if (activeTab === 'posts') {
+                setPostSearch(event.target.value);
+              } else {
+                setCommentSearch(event.target.value);
+              }
+            }}
+            placeholder={
+              activeTab === 'posts'
+                ? t('facebookData.studio.searchPosts')
+                : t('facebookData.studio.searchComments')
+            }
+            className="input-field h-10 w-full pl-10"
+          />
+        </label>
+      </div>
+
       {activeTab === 'comments' && selectedPost && (
-        <div className="mb-3 rounded-lg border border-[#2e3b4e] bg-[#182230] px-4 py-3 text-sm text-[#c7d2e0]">
-          {t('facebookData.studio.selectedPostHint', {
-            author: selectedPost.post_author || selectedPost.author_name || t('common.unknown'),
-          })}
-        </div>
+        <SelectedPostPreview
+          post={selectedPost}
+          onOpenLink={openExternalLink}
+          onPreview={handlePreviewImage}
+          onDelete={() => setPostPendingDelete(selectedPost)}
+          deleting={deletingPostId === selectedPost.post_id}
+          t={t}
+        />
       )}
 
       {error && (
@@ -1075,6 +1501,36 @@ export default function FacebookDataPage() {
           t={t}
         />
       ) : null}
+      <CrawlGroupModal
+        open={showCrawlGroupModal}
+        groupLink={crawlGroupLink}
+        dateLock={crawlDateLock}
+        crawling={crawlingGroup}
+        onGroupLinkChange={setCrawlGroupLink}
+        onDateLockChange={setCrawlDateLock}
+        onClose={handleCloseCrawlGroupModal}
+        onSubmit={handleCrawlGroup}
+        t={t}
+      />
+      <CrawlSinglePostModal
+        open={showCrawlSinglePostModal}
+        postLink={crawlSinglePostLink}
+        crawling={crawlingSinglePost}
+        onPostLinkChange={setCrawlSinglePostLink}
+        onClose={handleCloseCrawlSinglePostModal}
+        onSubmit={handleCrawlSinglePost}
+        t={t}
+      />
+      <DeletePostConfirmModal
+        post={postPendingDelete}
+        deleting={Boolean(deletingPostId)}
+        onClose={() => {
+          if (!deletingPostId) setPostPendingDelete(null);
+        }}
+        onConfirm={handleDeletePost}
+        t={t}
+      />
     </div>
   );
 }
+

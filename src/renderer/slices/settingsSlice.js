@@ -12,7 +12,6 @@ export const defaultSettings = {
   'automation.screenshotOnError': true,
   'execution.browserCloseDelayMs': 5000,
   'facebook.crawlGroupScenarioId': '',
-  'facebook.crawlCommentScenarioId': '',
   'facebook.crawlScrollSettleSeconds': 4,
   'facebook.crawlBrowserProfileId': '',
   'facebook.crawlProxyId': '',

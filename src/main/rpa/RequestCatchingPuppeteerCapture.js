@@ -56,10 +56,13 @@ export class RequestCatchingPuppeteerCapture {
 
       const parsed = parseNdjsonResponseText(text);
       if (parsed.length && this._onCapture) {
+        const requestHeaders = pending.requestHeaders || meta.requestHeaders || {};
         this._onCapture(parsed, {
           url: pending.url,
           itemCount: parsed.length,
           postData,
+          requestHeaders,
+          referer: requestHeaders.Referer || requestHeaders.referer || '',
         });
       }
     } catch (error) {

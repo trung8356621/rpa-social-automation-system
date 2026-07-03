@@ -3,7 +3,6 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import fs from 'node:fs';
 import {
-  FACEBOOK_CRAWL_COMMENT_PROFILE_ID,
   FACEBOOK_CRAWL_GROUP_PROFILE_ID,
   FACEBOOK_CRAWL_SETTINGS,
   isSystemVariableProfile,
@@ -401,13 +400,9 @@ class DatabaseService {
 
   syncFacebookCrawlScenarioBindings(settings = {}) {
     const groupScenarioId = String(settings[FACEBOOK_CRAWL_SETTINGS.groupScenarioId] || '').trim();
-    const commentScenarioId = String(settings[FACEBOOK_CRAWL_SETTINGS.commentScenarioId] || '').trim();
 
     if (groupScenarioId) {
       this.setScenarioVariableProfileId(groupScenarioId, FACEBOOK_CRAWL_GROUP_PROFILE_ID);
-    }
-    if (commentScenarioId) {
-      this.setScenarioVariableProfileId(commentScenarioId, FACEBOOK_CRAWL_COMMENT_PROFILE_ID);
     }
   }
 

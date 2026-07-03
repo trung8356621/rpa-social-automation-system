@@ -2,6 +2,7 @@ import { enrichFacebookCrawlPosts } from './facebookCrawlConfig.js';
 import {
   extractFacebookMediaUrls,
   mergeFacebookMediaUrls,
+  parseFacebookMediaUrls,
 } from './facebookMediaExtract.js';
 import {
   mergeInteractionStats,
@@ -18,6 +19,67 @@ const ANONYMOUS_AUTHOR_PATTERNS = [
   /anonymous/i,
   /anonymous participant/i,
 ];
+
+const FACEBOOK_UI_NOISE_PATTERNS = [
+  /bình luận đã bị tắt/i,
+  /comments have been turned off/i,
+  /commenting has been turned off/i,
+  /comments are turned off/i,
+  /xem thêm bình luận/i,
+  /view more comments/i,
+  /see more comments/i,
+  /be the first to comment/i,
+  /hãy là người đầu tiên bình luận/i,
+];
+
+const COMMENT_ONLY_QUERY_PATTERNS = [
+  /CometUFICommentsProvider/i,
+  /CometUFICommentsProviderQuery/i,
+  /CometUFICommentsProviderPaginationQuery/i,
+  /CommentsProvider/i,
+  /CommentList/i,
+];
+
+function getFacebookGraphQLQueryName(payload = {}) {
+  const request = payload?.__request || {};
+  return String(
+    request.friendlyName
+      || request.queryName
+      || request.operationName
+      || payload?.operationName
+      || payload?.queryName
+      || payload?.extensions?.operationName
+      || '',
+  ).trim();
+}
+
+function isCommentOnlyGraphQLPayload(payload = {}) {
+  const queryName = getFacebookGraphQLQueryName(payload);
+  if (
+    payload?.__request?.source === 'force_graphql_fetch'
+    && /CometModernPost|CometSinglePost|CometPermalink/i.test(queryName)
+  ) {
+    return false;
+  }
+  return Boolean(queryName) && COMMENT_ONLY_QUERY_PATTERNS.some((pattern) => pattern.test(queryName));
+}
+
+export function isFacebookUiNoiseText(text = '') {
+  const value = String(text || '').trim();
+  if (!value) return false;
+  return FACEBOOK_UI_NOISE_PATTERNS.some((pattern) => pattern.test(value));
+}
+
+export function sanitizeFacebookPostContent(text = '') {
+  const value = String(text || '').trim();
+  if (!value || isFacebookUiNoiseText(value)) return '';
+  return value;
+}
+
+export function isKnownFacebookPostAuthor(name = '') {
+  const value = String(name || '').trim();
+  return Boolean(value) && value !== DEFAULT_POST_AUTHOR && !isAnonymousAuthorName(value);
+}
 
 export function extractFacebookGroupSlug(urlOrSlug = '') {
   const text = String(urlOrSlug || '').trim();
@@ -57,11 +119,23 @@ function pickStoryActorNode(story) {
   if (!story || typeof story !== 'object') return null;
 
   try {
-    const fromActors = story?.actors?.[0];
-    if (fromActors && typeof fromActors === 'object') return fromActors;
+    const paths = [
+      story?.actors?.[0],
+      story?.actor,
+      story?.comet_sections?.actor_photo?.story?.actors?.[0],
+      story?.comet_sections?.title?.story?.actors?.[0],
+      story?.comet_sections?.context_layout?.story?.comet_sections?.actor_photo?.story?.actors?.[0],
+      story?.comet_sections?.context_layout?.story?.actors?.[0],
+      story?.comet_sections?.metadata?.story?.actors?.[0],
+      story?.comet_sections?.content?.story?.actors?.[0],
+      story?.comet_sections?.message?.story?.actors?.[0],
+      story?.comet_sections?.introduction?.story?.actors?.[0],
+      story?.attached_story?.actors?.[0],
+    ];
 
-    const fromActor = story?.actor;
-    if (fromActor && typeof fromActor === 'object') return fromActor;
+    for (const candidate of paths) {
+      if (candidate && typeof candidate === 'object') return candidate;
+    }
   } catch {
     // Fall through.
   }
@@ -155,18 +229,40 @@ function pickStoryAuthorLink(story) {
   }
 }
 
-function pickStoryAuthor(story) {
+function pickStoryActor(story) {
   const actor = pickStoryActorNode(story);
   if (!actor) return DEFAULT_POST_AUTHOR;
 
   try {
-    const name = actor?.name;
+    const name = actor?.name || actor?.short_name;
     if (typeof name === 'string' && name.trim()) return name.trim();
   } catch {
     // Fall through to default.
   }
 
   return DEFAULT_POST_AUTHOR;
+}
+
+function pickStoryAuthor(story) {
+  return pickStoryActor(story);
+}
+
+function pickActorNameFromNode(node, depth = 0) {
+  if (!node || depth > 12 || typeof node !== 'object') return '';
+  if (node.__typename === 'Comment') return '';
+
+  const typename = String(node.__typename || '');
+  if (['User', 'Page', 'Group'].includes(typename) && typeof node.name === 'string' && node.name.trim()) {
+    return node.name.trim();
+  }
+
+  for (const value of Object.values(node)) {
+    if (!value || typeof value !== 'object') continue;
+    const found = pickActorNameFromNode(value, depth + 1);
+    if (found) return found;
+  }
+
+  return '';
 }
 
 function pickCommentAuthor(comment) {
@@ -187,7 +283,28 @@ function pickCommentAuthor(comment) {
 
 function pickPostId(node) {
   if (!node || typeof node !== 'object') return null;
-  return node?.post_id || node?.fbid || node?.legacy_fbid || node?.id || null;
+
+  const directCandidates = [
+    node?.post_id,
+    node?.fbid,
+    node?.legacy_fbid,
+    node?.feedback?.legacy_fbid,
+    node?.feedback?.id,
+  ];
+
+  for (const candidate of directCandidates) {
+    if (!candidate) continue;
+    const text = String(candidate);
+    const numeric = text.match(/(\d{10,})/);
+    if (numeric?.[1]) return numeric[1];
+  }
+
+  const rawId = node?.id;
+  if (!rawId) return null;
+
+  const decoded = looksLikeBase64GraphQlId(rawId) ? decodeBase64Ascii(rawId) : String(rawId);
+  const match = String(decoded || '').match(/(\d{10,})/);
+  return match?.[1] || null;
 }
 
 function pickStoryCreationTime(story) {
@@ -230,34 +347,144 @@ export function formatFacebookPostDate(unixValue) {
   return `${year}-${month}-${day}`;
 }
 
-function pickStoryMessageText(story) {
-  if (!story || typeof story !== 'object') return '';
+function pickTrimmedText(value) {
+  if (typeof value !== 'string') return '';
+  const text = value.trim();
+  return text || '';
+}
 
+function pickStoryMessageTextNormal(story) {
   const paths = [
+    story?.comet_sections?.content?.story?.message?.text,
+    story?.message?.text,
     story?.comet_sections?.content?.story?.comet_sections?.message_container?.story?.message?.text,
     story?.comet_sections?.message_container?.story?.message?.text,
     story?.comet_sections?.message?.story?.message?.text,
-    story?.message?.text,
+    story?.comet_sections?.message?.text,
     story?.attached_story?.message?.text,
+    story?.comet_sections?.context_layout?.story?.comet_sections?.message_container?.story?.message?.text,
+    story?.comet_sections?.metadata?.story?.message?.text,
+    story?.comet_sections?.title?.story?.message?.text,
+    story?.comet_sections?.content?.story?.comet_sections?.message?.story?.message?.text,
+    story?.comet_sections?.introduction?.story?.message?.text,
   ];
 
   for (const candidate of paths) {
-    if (typeof candidate === 'string' && candidate.trim()) {
-      return candidate.trim();
-    }
+    const text = pickTrimmedText(candidate);
+    if (text) return text;
   }
 
   return '';
 }
 
+function pickStoryMessageTextSpecialFallback(story) {
+  try {
+    const paths = [
+      story?.styled_message?.text,
+      story?.comet_sections?.content?.story?.styled_message?.text,
+      story?.comet_sections?.content?.story?.message?.delight_ranges?.[0]?.text,
+      story?.message?.delight_ranges?.[0]?.text,
+      story?.comet_sections?.content?.story?.comet_sections?.message_container?.story?.styled_message?.text,
+    ];
+
+    for (const candidate of paths) {
+      const text = pickTrimmedText(candidate);
+      if (!text) continue;
+
+      console.log(
+        '-> Đã kích hoạt hàm vét và bóc được nội dung bài viết đặc biệt (Background Text):',
+        `${text.substring(0, 30)}...`,
+      );
+      return text;
+    }
+  } catch {
+    // Bỏ qua nhánh GraphQL lỗi/thiếu field — không làm crash parser.
+  }
+
+  return '';
+}
+
+function pickStoryMessageText(story) {
+  if (!story || typeof story !== 'object') return '';
+
+  let content = pickStoryMessageTextNormal(story);
+  if (!content) {
+    content = pickStoryMessageTextSpecialFallback(story);
+  }
+  if (!content) {
+    content = collectStoryTextDeep(story);
+  }
+
+  return content;
+}
+
+function pickRenderableText(node) {
+  if (!node || typeof node !== 'object') return '';
+  if (typeof node.text === 'string' && node.text.trim()) return node.text.trim();
+  if (typeof node.message?.text === 'string' && node.message.text.trim()) return node.message.text.trim();
+  if (typeof node.body?.text === 'string' && node.body.text.trim()) return node.body.text.trim();
+  if (typeof node.preferred_body?.text === 'string' && node.preferred_body.text.trim()) {
+    return node.preferred_body.text.trim();
+  }
+  return '';
+}
+
+function collectStoryTextDeep(story, depth = 0, maxDepth = 16) {
+  if (!story || depth > maxDepth) return '';
+
+  const candidates = [];
+  const seen = new Set();
+
+  const visit = (node, currentDepth) => {
+    if (!node || currentDepth > maxDepth) return;
+
+    const direct = pickRenderableText(node);
+    if (direct && direct.length >= 3 && !seen.has(direct)) {
+      seen.add(direct);
+      candidates.push(direct);
+    }
+
+    if (Array.isArray(node)) {
+      node.forEach((item) => visit(item, currentDepth + 1));
+      return;
+    }
+
+    if (typeof node !== 'object') return;
+
+    if (node.__typename === 'Comment') return;
+
+    Object.values(node).forEach((value) => {
+      if (value && typeof value === 'object') visit(value, currentDepth + 1);
+    });
+  };
+
+  visit(story, 0);
+
+  return candidates
+    .filter((text) => text.length >= 8 && !isFacebookUiNoiseText(text))
+    .sort((left, right) => right.length - left.length)[0] || '';
+}
+
 function collectPostImagesFromStory(story) {
   const images = mergeFacebookMediaUrls([], extractFacebookMediaUrls(story));
+  const addMedia = (value) => {
+    mergeFacebookMediaUrls(images, value).forEach((url) => {
+      if (!images.includes(url)) images.push(url);
+    });
+  };
 
   const visit = (node, depth = 0) => {
     if (!node || typeof node !== 'object' || depth > 10) return;
-    if (node.__typename === 'StoryAttachment' || node.__typename === 'Photo') {
-      mergeFacebookMediaUrls(images, extractFacebookMediaUrls(node));
-      return;
+    if (
+      node.__typename === 'StoryAttachment'
+      || node.__typename === 'Photo'
+      || node.__typename === 'Video'
+      || node.media
+      || node.attachments
+      || node.all_subattachments
+      || node.subattachments
+    ) {
+      addMedia(extractFacebookMediaUrls(node));
     }
     if (Array.isArray(node)) {
       node.forEach((item) => visit(item, depth + 1));
@@ -272,14 +499,23 @@ function collectPostImagesFromStory(story) {
   return images;
 }
 
+function isStoryTypename(value = '') {
+  const name = String(value || '').trim();
+  return name === 'Story' || name === 'GroupPostStory' || /Story$/i.test(name);
+}
+
 function extractPostFromStory(story, groupSlug = DEFAULT_GROUP_SLUG) {
-  if (!story || story.__typename !== 'Story') return null;
+  if (!story || !isStoryTypename(story.__typename)) return null;
 
   try {
     const post_id = pickPostId(story);
-    const post_author = pickStoryAuthor(story);
+    let post_author = pickStoryAuthor(story);
+    if (post_author === DEFAULT_POST_AUTHOR) {
+      const fallbackAuthor = pickActorNameFromNode(story);
+      if (fallbackAuthor) post_author = fallbackAuthor;
+    }
     const author_link = pickStoryAuthorLink(story);
-    const post_content = pickStoryMessageText(story);
+    const post_content = sanitizeFacebookPostContent(pickStoryMessageText(story));
     const post_link = post_id ? buildFacebookPostLink(post_id, groupSlug) : '';
     const creationTime = pickStoryCreationTime(story);
     const post_date = formatFacebookPostDate(creationTime);
@@ -306,15 +542,116 @@ function extractPostFromStory(story, groupSlug = DEFAULT_GROUP_SLUG) {
   }
 }
 
+function looksLikeTruncatedText(text = '') {
+  const value = String(text || '').trim();
+  if (!value) return false;
+  return /(?:…|\.\.\.)$/.test(value);
+}
+
+function assembleTextFromBodyRanges(bodyNode) {
+  if (!bodyNode || typeof bodyNode !== 'object') return '';
+
+  const rangeLists = [
+    bodyNode.ranges,
+    bodyNode.delight_ranges,
+    bodyNode.text_entity_ranges,
+    bodyNode.entities,
+  ].filter(Array.isArray);
+
+  const parts = [];
+  rangeLists.forEach((ranges) => {
+    ranges.forEach((range) => {
+      const text = pickTrimmedText(range?.text)
+        || pickTrimmedText(range?.entity?.text)
+        || pickTrimmedText(range?.entity?.name);
+      if (text) parts.push(text);
+    });
+  });
+
+  return parts.join('').trim();
+}
+
+function collectCommentTextDeep(comment, depth = 0, maxDepth = 14) {
+  if (!comment || depth > maxDepth) return '';
+
+  const candidates = [];
+  const seen = new Set();
+
+  const visit = (node, currentDepth) => {
+    if (!node || currentDepth > maxDepth) return;
+
+    if (typeof node === 'string') {
+      const text = node.trim();
+      if (text.length >= 4 && !seen.has(text) && !isFacebookUiNoiseText(text)) {
+        seen.add(text);
+        candidates.push(text);
+      }
+      return;
+    }
+
+    if (Array.isArray(node)) {
+      node.forEach((item) => visit(item, currentDepth + 1));
+      return;
+    }
+
+    if (typeof node !== 'object') return;
+
+    const typename = String(node.__typename || '');
+    if (['User', 'Page', 'Group', 'Story'].includes(typename)) return;
+
+    const direct = pickRenderableText(node);
+    if (direct.length >= 4 && !seen.has(direct) && !isFacebookUiNoiseText(direct)) {
+      seen.add(direct);
+      candidates.push(direct);
+    }
+
+    Object.values(node).forEach((value) => {
+      if (value && typeof value === 'object') visit(value, currentDepth + 1);
+    });
+  };
+
+  visit(comment, 0);
+  return candidates.sort((left, right) => right.length - left.length)[0] || '';
+}
+
+function pickCommentBodyText(comment) {
+  if (!comment || typeof comment !== 'object') return '';
+
+  try {
+    const candidates = [];
+    const push = (text) => {
+      const value = pickTrimmedText(text);
+      if (value && !isFacebookUiNoiseText(value)) candidates.push(value);
+    };
+
+    push(comment?.preferred_body?.text);
+    push(comment?.body?.text);
+    push(comment?.body_renderer?.text);
+    push(assembleTextFromBodyRanges(comment?.preferred_body));
+    push(assembleTextFromBodyRanges(comment?.body));
+    push(comment?.translation?.text);
+    push(typeof comment?.message === 'string' ? comment.message : comment?.message?.text);
+    push(comment?.untruncated_body?.text);
+    push(comment?.expanded_body?.text);
+
+    const primary = pickTrimmedText(comment?.body?.text)
+      || pickTrimmedText(comment?.preferred_body?.text);
+    if (!primary || looksLikeTruncatedText(primary)) {
+      push(collectCommentTextDeep(comment));
+    }
+
+    const unique = [...new Set(candidates)];
+    return unique.sort((left, right) => right.length - left.length)[0] || '';
+  } catch {
+    return '';
+  }
+}
+
 function looksLikeCommentNode(comment) {
   if (!comment || typeof comment !== 'object') return false;
   if (comment.__typename === 'Comment') return true;
 
-  const text = (
-    comment?.body?.text
-    || comment?.preferred_body?.text
-    || ''
-  ).trim();
+  const text = pickCommentBodyText(comment);
   const hasAuthor = Boolean(
     comment?.author?.name
     || comment?.actor?.name,
@@ -335,11 +672,7 @@ function extractCommentFromNode(comment) {
   if (!looksLikeCommentNode(comment)) return null;
 
   try {
-    const comment_content = (
-      comment?.body?.text
-      || comment?.preferred_body?.text
-      || ''
-    ).trim();
+    const comment_content = pickCommentBodyText(comment);
     const comment_images = extractFacebookMediaUrls(comment);
 
     if (!comment_content && !comment_images.length) return null;
@@ -360,6 +693,18 @@ function extractCommentFromNode(comment) {
 function mergeCommentFields(existing, incoming) {
   if (!existing || !incoming) return;
   if (!existing.comment_id && incoming.comment_id) existing.comment_id = incoming.comment_id;
+  const incomingText = String(incoming.comment_content || '').trim();
+  const existingText = String(existing.comment_content || '').trim();
+  if (incomingText.length > existingText.length) {
+    existing.comment_content = incoming.comment_content;
+  }
+  if (
+    (!existing.comment_author || existing.comment_author === 'Không rõ nguồn')
+    && incoming.comment_author
+    && incoming.comment_author !== 'Không rõ nguồn'
+  ) {
+    existing.comment_author = incoming.comment_author;
+  }
   if (!existing.created_time && incoming.created_time != null) {
     existing.created_time = incoming.created_time;
   }
@@ -426,6 +771,7 @@ function applyFeedbackToContext(feedback, ctx) {
         post_link: buildFacebookPostLink(postId, ctx.groupSlug),
         ...stats,
         comments: [],
+        _feedback_only: true,
       });
     } else {
       Object.assign(
@@ -460,12 +806,35 @@ function extractCommentsFromEdges(node, ctx) {
 const COMMENT_CONTEXT_KEYS = new Set([
   'comments',
   'comment_renderer',
-  'feedback',
   'display_comments',
   'comment_list_renderer',
   'replies_connection',
   'if_viewer_can_comment',
 ]);
+
+const POST_STORY_NODE_KEYS = new Set([
+  'story',
+  'permalink_story',
+  'attached_story',
+  'parent_story',
+  'target_story',
+]);
+
+function tryExtractPostFromStoryNode(storyNode, ctx) {
+  if (!storyNode || typeof storyNode !== 'object') return;
+  if (!isStoryTypename(storyNode.__typename)) return;
+
+  const post = extractPostFromStory(storyNode, ctx.groupSlug);
+  if (!post) return;
+
+  const key = post.post_id || `story:${post.post_content.slice(0, 120)}`;
+  if (!ctx.postsByKey.has(key)) {
+    ctx.postsByKey.set(key, { ...post, comments: [] });
+  } else {
+    mergePostFields(ctx.postsByKey.get(key), post);
+  }
+  ctx.activePostKey = key;
+}
 
 function walkGraph(node, ctx, depth = 0, inCommentContext = false) {
   if (!node || typeof node !== 'object' || depth > 36) return;
@@ -475,26 +844,46 @@ function walkGraph(node, ctx, depth = 0, inCommentContext = false) {
     return;
   }
 
-  if (node.__typename === 'Story') {
-    const post = extractPostFromStory(node, ctx.groupSlug);
-    if (post) {
-      const key = post.post_id || `story:${post.post_content.slice(0, 120)}`;
-      if (!ctx.postsByKey.has(key)) {
-        ctx.postsByKey.set(key, { ...post, comments: [] });
-      } else {
-        mergePostFields(ctx.postsByKey.get(key), post);
-      }
-      ctx.activePostKey = key;
+  const isCommentNode = node.__typename === 'Comment' || looksLikeCommentNode(node);
+  if (inCommentContext || isCommentNode) {
+    if (isCommentNode) {
+      const parsed = extractCommentFromNode(node);
+      if (parsed) registerComment(parsed, ctx);
     }
+
+    if (Array.isArray(node.edges)) {
+      extractCommentsFromEdges(node, ctx);
+      node.edges.forEach((edge) => {
+        if (edge?.node) walkGraph(edge.node, ctx, depth + 1, true);
+      });
+    }
+
+    for (const [key, value] of Object.entries(node)) {
+      if (!value || typeof value !== 'object') continue;
+      if (key === 'edges') continue;
+      walkGraph(value, ctx, depth + 1, true);
+    }
+    return;
+  }
+
+  if (node.__typename === 'Story' || isStoryTypename(node.__typename)) {
+    tryExtractPostFromStoryNode(node, ctx);
   }
 
   if (node.__typename === 'Feedback') {
     applyFeedbackToContext(node, ctx);
   }
 
-  if (node.__typename === 'Comment' || looksLikeCommentNode(node)) {
-    const parsed = extractCommentFromNode(node);
-    if (parsed) registerComment(parsed, ctx);
+  for (const [key, value] of Object.entries(node)) {
+    if (!value || typeof value !== 'object') continue;
+    if (key === 'edges') continue;
+    if (POST_STORY_NODE_KEYS.has(key)) {
+      tryExtractPostFromStoryNode(value, ctx);
+    }
+  }
+
+  if (node.story && typeof node.story === 'object') {
+    tryExtractPostFromStoryNode(node.story, ctx);
   }
 
   if (Array.isArray(node.edges)) {
@@ -558,7 +947,7 @@ export function parseFacebookGraphQL(apiJsonData, options = {}) {
       activePostKey: null,
     };
 
-    walkGraph(root, ctx);
+    walkGraph(root, ctx, 0, isCommentOnlyGraphQLPayload(apiJsonData));
 
     const posts = Array.from(ctx.postsByKey.values());
 
@@ -574,10 +963,10 @@ export function parseFacebookGraphQL(apiJsonData, options = {}) {
     }
 
     if (ctx.orphanComments.length) {
-      return {
+      return markCommentOnlyFacebookPost({
         ...createEmptyPost(groupSlug),
         comments: ctx.orphanComments,
-      };
+      });
     }
 
     return null;
@@ -586,8 +975,15 @@ export function parseFacebookGraphQL(apiJsonData, options = {}) {
   }
 }
 
-function mergePostFields(existing, incoming) {
-  if (!existing.post_content && incoming.post_content) existing.post_content = incoming.post_content;
+export function mergeFacebookPostFields(existing, incoming) {
+  if (!existing || !incoming) return;
+  const incomingContent = sanitizeFacebookPostContent(incoming.post_content);
+  const existingContent = sanitizeFacebookPostContent(existing.post_content);
+  if (!existingContent && incomingContent) {
+    existing.post_content = incomingContent;
+  } else if (existingContent !== sanitizeFacebookPostContent(existing.post_content)) {
+    existing.post_content = existingContent;
+  }
   if ((!existing.post_author || existing.post_author === DEFAULT_POST_AUTHOR) && incoming.post_author) {
     existing.post_author = incoming.post_author;
   }
@@ -600,6 +996,31 @@ function mergePostFields(existing, incoming) {
     incoming.post_images || [],
   );
   Object.assign(existing, mergeInteractionStats(existing, incoming));
+}
+
+function isCommentOnlyFacebookPost(post = {}) {
+  const content = sanitizeFacebookPostContent(post?.post_content);
+  const hasImages = parseFacebookMediaUrls(post?.post_images).length > 0
+    || String(post?.local_image_path || '').trim();
+  const hasAuthor = isKnownFacebookPostAuthor(post?.post_author);
+  return Boolean((post?.comments || []).length) && !content && !hasImages && !hasAuthor;
+}
+
+function markCommentOnlyFacebookPost(post = {}) {
+  return {
+    ...post,
+    _comments_only: true,
+  };
+}
+
+function mergePostFields(existing, incoming) {
+  mergeFacebookPostFields(existing, incoming);
+  if (existing._comments_only && !isCommentOnlyFacebookPost(incoming)) {
+    delete existing._comments_only;
+  }
+  if (existing._feedback_only && !incoming?._feedback_only) {
+    delete existing._feedback_only;
+  }
 }
 
 /**
@@ -643,7 +1064,10 @@ export function parseFacebookGraphQLBatch(rawObjects, options = {}) {
         parsed.posts.forEach((post) => {
           const key = post.post_id || `story:${post.post_content?.slice(0, 120)}`;
           if (!mergedByPostId.has(key)) {
-            mergedByPostId.set(key, { ...post, comments: [...(post.comments || [])] });
+            mergedByPostId.set(key, {
+              ...(isCommentOnlyFacebookPost(post) ? markCommentOnlyFacebookPost(post) : post),
+              comments: [...(post.comments || [])],
+            });
             return;
           }
           const existing = mergedByPostId.get(key);
@@ -656,7 +1080,10 @@ export function parseFacebookGraphQLBatch(rawObjects, options = {}) {
       if (parsed.post_id || parsed.post_content) {
         const key = parsed.post_id || `story:${parsed.post_content?.slice(0, 120)}`;
         if (!mergedByPostId.has(key)) {
-          mergedByPostId.set(key, { ...parsed, comments: [...(parsed.comments || [])] });
+          mergedByPostId.set(key, {
+            ...(isCommentOnlyFacebookPost(parsed) ? markCommentOnlyFacebookPost(parsed) : parsed),
+            comments: [...(parsed.comments || [])],
+          });
         } else {
           const existing = mergedByPostId.get(key);
           mergePostFields(existing, parsed);
@@ -673,10 +1100,10 @@ export function parseFacebookGraphQLBatch(rawObjects, options = {}) {
   const results = Array.from(mergedByPostId.values());
 
   if (orphanComments.length) {
-    results.push({
+    results.push(markCommentOnlyFacebookPost({
       ...createEmptyPost(groupSlug),
       comments: orphanComments,
-    });
+    }));
   }
 
   return enrichFacebookCrawlPosts(results, options);

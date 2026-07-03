@@ -83,9 +83,12 @@ export function runCrawlScrollStep(distance = 600, mode = 'scroll', scrollContex
   function findFacebookCommentScrollContainer() {
     const selectors = [
       '[data-pagelet*="Comments"]',
+      '[data-pagelet*="Comment"]',
       '[aria-label*="Comment" i]',
       '[aria-label*="Bình luận"]',
       '[aria-label*="binh luan" i]',
+      '[role="dialog"] [role="article"]',
+      '[role="main"] [role="article"]',
     ];
 
     for (const selector of selectors) {
@@ -184,10 +187,13 @@ export function runCrawlScrollStep(distance = 600, mode = 'scroll', scrollContex
   if (context === 'comments') {
     const loadMorePatterns = [
       'xem thêm bình luận',
+      'xem thêm',
       'view more comments',
       'see more comments',
       'view previous comments',
       'xem các bình luận trước',
+      'view more replies',
+      'xem thêm phản hồi',
     ];
     const clicked = new Set();
     Array.from(document.querySelectorAll('span, div, a, button, [role="button"]'))
@@ -245,19 +251,23 @@ export function resolveCrawlScrollLoopConfig(crawlMeta = {}, scrollContext = 'fe
   const configuredDelay = Math.max(100, Number(autoscroll.delay_ms) || 500);
   const context = scrollContext === 'auto' ? 'feed' : scrollContext;
 
-  const scrollsPerBatch = context === 'comments' ? 4 : 3;
+  const scrollsPerBatch = context === 'comments' ? 8 : 3;
   const betweenScrollMs = Math.min(configuredDelay, 350);
   const settleMs = infiniteEnabled
     ? Math.max(3000, Number(infinite.settle_ms) || 4000)
     : Math.max(configuredDelay * 2, 1500);
 
-  const defaultMaxScrolls = context === 'comments' ? 200 : 30;
+  const defaultMaxScrolls = context === 'comments' ? 120 : 200;
+  const minMaxScrolls = context === 'feed' ? 200 : 1;
+  const maxScrollCap = context === 'feed' ? 600 : 300;
+  const configuredMaxScrolls = Number(infinite.max_scrolls) || defaultMaxScrolls;
   const maxScrolls = infiniteEnabled
-    ? Math.max(1, Math.min(300, Number(infinite.max_scrolls) || defaultMaxScrolls))
+    ? Math.max(minMaxScrolls, Math.min(maxScrollCap, configuredMaxScrolls))
     : (context === 'comments' ? 50 : 5);
   const maxBatches = Math.ceil(maxScrolls / scrollsPerBatch);
-  const defaultTimeoutMs = context === 'comments' ? 180000 : 30000;
-  const timeoutMs = Math.max(1000, Number(infinite.timeout_ms) || defaultTimeoutMs);
+  const defaultTimeoutMs = context === 'comments' ? 180000 : 600000;
+  const minTimeoutMs = context === 'feed' ? 600000 : 1000;
+  const timeoutMs = Math.max(minTimeoutMs, Number(infinite.timeout_ms) || defaultTimeoutMs);
   const minBatchesBeforeConditionStop = context === 'feed' ? 3 : 1;
 
   return {

@@ -6,13 +6,18 @@ import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer';
 import { getCrawlExtractionScript } from './CardExtractorScript.js';
 import {
-  applyFacebookCommentCrawlMetaOverrides,
+  buildFacebookPostLink,
   applyFacebookCrawlSettingsToMeta,
-  isFacebookCommentCrawlUrl,
+  buildFacebookGroupUrl,
+  buildFacebookCrawlNavigationError,
+  FACEBOOK_CRAWL_URL_GUARD_SKIP_MESSAGE,
+  isFacebookCrawlUrlGuardMatch,
+  parseFacebookGroupLink,
+  parseFacebookPostLink,
+  shouldSkipFacebookCrawlRequest,
+  validateFacebookCrawlNavigation,
 } from '../../shared/facebookCrawlConfig.js';
 import {
-  countParsedFacebookComments,
-  getExpectedFacebookCommentCount,
   parseFacebookGraphQLBatch,
 } from '../../shared/parseFacebookGraphQL.js';
 import { crawlConditionShouldStopScroll } from '../../shared/crawlStopCondition.js';
@@ -28,6 +33,7 @@ import {
   mergeRequestCatchingRawObjects,
   RequestCatchingPuppeteerCapture,
 } from './RequestCatchingPuppeteerCapture.js';
+import { CrawlRequestDumpService } from './CrawlRequestDumpService.js';
 import { resolveScenarioTargetUrl, resolveVariableTemplate } from './VariableResolver.js';
 import { ensureRememberMeChecked, isCheckboxAlreadyChecked, resolveGuestSessionDir, resolveSessionStartUrl } from '../browser/BrowserSessionPaths.js';
 
@@ -76,6 +82,8 @@ class ExecutorService {
     this._activeUserDataDir = null;
     this._currentSampleId = null;
     this._variableMap = null;
+    this._currentExecutionId = null;
+    this._crawlDumpFolderId = null;
     this._executionViewport = null;
     this._releaseDirLock = null;
     this._crawlResults = [];
@@ -89,6 +97,8 @@ class ExecutorService {
 
     this.isRunning = true;
     const executionId = options.executionId || crypto.randomUUID();
+    this._currentExecutionId = executionId;
+    this._crawlDumpFolderId = null;
     const startTime = Date.now();
     this._currentBrowserProfileId = options.browserProfileId ?? null;
     this._currentSampleId = options.sampleId
@@ -547,8 +557,30 @@ class ExecutorService {
     return resolveScenarioTargetUrl(url, map);
   }
 
-  async _navigateToScenarioStart(scenario) {
-    const startUrl = this._resolveStartUrl(scenario);
+  _resolveRequestCatchingTargetUrl(scenario, map) {
+    const scenarioUrl = String(scenario?.target_url || '').trim();
+    const resolvedScenarioUrl = scenarioUrl
+      ? resolveScenarioTargetUrl(scenarioUrl, map)
+      : '';
+    const platform = String(scenario?.platform || 'facebook').trim().toLowerCase();
+    if (platform !== 'facebook') {
+      return resolvedScenarioUrl || this.page?.url?.() || '';
+    }
+
+    const groupId = String(map?.get?.('group_id') || '').trim();
+    const postId = String(map?.get?.('post_id') || '').trim();
+    if (groupId && postId) {
+      return buildFacebookPostLink(postId, groupId);
+    }
+    if (groupId) {
+      return buildFacebookGroupUrl(groupId);
+    }
+
+    return resolvedScenarioUrl || this.page?.url?.() || '';
+  }
+
+  async _navigateToScenarioStart(scenario, targetUrlOverride = '') {
+    const startUrl = String(targetUrlOverride || '').trim() || this._resolveStartUrl(scenario);
     if (!startUrl || !this.page || this.page.isClosed()) return;
 
     await this.page.goto(startUrl, {
@@ -557,10 +589,10 @@ class ExecutorService {
     });
     await ensureRememberMeChecked(this.page);
     await this._sleep(400);
-    await this._verifyFacebookPostNavigation(scenario, startUrl);
+    await this._verifyFacebookGroupNavigation(scenario, startUrl);
   }
 
-  async _verifyFacebookPostNavigation(scenario, expectedUrl) {
+  async _verifyFacebookGroupNavigation(scenario, expectedUrl) {
     const platform = String(scenario?.platform || '').trim().toLowerCase();
     if (platform !== 'facebook' || !this.page || this.page.isClosed()) return;
 
@@ -568,30 +600,78 @@ class ExecutorService {
       scenario?.id,
       this._currentSampleId,
     );
-    const postId = String(map.get('post_id') || '').trim();
-    if (!postId) return;
+    const expectedGroupId = String(
+      map.get('group_id')
+      || parseFacebookGroupLink(expectedUrl).group_id
+      || '',
+    ).trim();
 
-    const hasPostInUrl = () => String(this.page.url() || '').includes(postId);
-    if (hasPostInUrl()) return;
-
-    const deadline = Date.now() + 12000;
-    while (Date.now() < deadline) {
-      await this._sleep(600);
-      if (hasPostInUrl()) return;
+    const actualUrl = this.page.url() || '';
+    const validation = validateFacebookCrawlNavigation(expectedUrl, actualUrl);
+    if (!validation.ok) {
+      throw new Error(buildFacebookCrawlNavigationError(validation, expectedUrl, actualUrl));
     }
 
-    console.warn(`[Executor] Retrying navigation to post_id ${postId}`);
-    await this.page.goto(expectedUrl, {
-      waitUntil: 'domcontentloaded',
-      timeout: 60000,
-    });
-    await ensureRememberMeChecked(this.page);
-    await this._sleep(1200);
+    if (expectedGroupId) {
+      const actualGroupId = parseFacebookGroupLink(actualUrl).group_id;
+      if (actualGroupId && actualGroupId.toLowerCase() !== expectedGroupId.toLowerCase()) {
+        throw new Error(buildFacebookCrawlNavigationError({
+          ok: false,
+          reason: 'group_mismatch',
+          expected: { group_id: expectedGroupId },
+          actual: { group_id: actualGroupId },
+        }, expectedUrl, actualUrl));
+      }
+    }
+  }
 
-    if (!hasPostInUrl()) {
-      throw new Error(
-        `Khong dieu huong duoc toi post_id ${postId}. URL hien tai: ${this.page.url()}`,
+  async _guardFacebookCrawlPageUrl(targetUrl = '', options = {}) {
+    if (!targetUrl || !this.page || this.page.isClosed()) {
+      return { ok: true, currentUrl: '' };
+    }
+
+    try {
+      const recover = options.recover !== false;
+      let currentUrl = this.page.url() || '';
+      if (isFacebookCrawlUrlGuardMatch(targetUrl, { pageUrl: currentUrl })) {
+        return { ok: true, currentUrl };
+      }
+
+      if (!recover) {
+        console.warn(`[Executor] URL Guard: trinh duyet da di lac (${currentUrl}). Dung scroll hien tai.`);
+        return {
+          ok: false,
+          currentUrl,
+          reason: 'url_mismatch',
+        };
+      }
+
+      console.warn(
+        `[Executor] URL Guard: trinh duyet da di lac (${currentUrl}). Thu goBack...`,
       );
+
+      try {
+        await this.page.goBack({ waitUntil: 'domcontentloaded', timeout: 15000 });
+        await this._sleep(800);
+        currentUrl = this.page.url() || '';
+        if (isFacebookCrawlUrlGuardMatch(targetUrl, { pageUrl: currentUrl })) {
+          console.log(`[Executor] URL Guard: da quay lai trang crawl (${currentUrl})`);
+          return { ok: true, currentUrl, recovered: true };
+        }
+      } catch (error) {
+        console.warn('[Executor] URL Guard goBack failed:', error?.message || error);
+      }
+
+      throw new Error(
+        `URL Guard: trinh duyet da roi khoi trang crawl va khong the quay lai. `
+        + `Mong muon: ${targetUrl}. Hien tai: ${currentUrl}`,
+      );
+    } catch (error) {
+      if (String(error?.message || '').startsWith('URL Guard:')) {
+        throw error;
+      }
+      console.warn('[Executor] URL Guard check failed:', error?.message || error);
+      return { ok: true, currentUrl: this.page?.url?.() || '' };
     }
   }
 
@@ -606,7 +686,14 @@ class ExecutorService {
 
     console.log(`[Executor] DOM chua san sang — chay kich ban parent: ${parentId}`);
     await this._runParentScenario(parentId, executionId);
-    await this._navigateToScenarioStart(scenario);
+    const map = this._variableMap || this.dbService.buildVariableMap(
+      scenario?.id,
+      this._currentSampleId,
+    );
+    const requestCatchingTargetUrl = isRequestCatchingScenario(scenario)
+      ? this._resolveRequestCatchingTargetUrl(scenario, map)
+      : '';
+    await this._navigateToScenarioStart(scenario, requestCatchingTargetUrl);
 
     const readyAfterParent = await this._isDomReady(scenario);
     if (!readyAfterParent) {
@@ -814,18 +901,15 @@ class ExecutorService {
       scenario?.id,
       this._currentSampleId,
     );
-    const targetUrl = resolveScenarioTargetUrl(String(scenario?.target_url || '').trim(), map)
-      || this.page.url()
-      || '';
-    const crawlMeta = (() => {
-      const base = applyFacebookCrawlSettingsToMeta(
-        getCrawlMeta(scenario?.scenario_meta),
-        this.dbService.getSettings(),
-      );
-      return isFacebookCommentCrawlUrl(targetUrl)
-        ? applyFacebookCommentCrawlMetaOverrides(base)
-        : base;
-    })();
+    const targetUrl = this._resolveRequestCatchingTargetUrl(scenario, map);
+    const isSinglePostCrawl = Boolean(
+      String(map?.get?.('post_id') || '').trim()
+      || parseFacebookPostLink(targetUrl).post_id,
+    );
+    const crawlMeta = applyFacebookCrawlSettingsToMeta(
+      getCrawlMeta(scenario?.scenario_meta),
+      this.dbService.getSettings(),
+    );
     const infinite = crawlMeta.infinity_scroll || {};
     const resolvedCondition = {
       ...infinite.condition,
@@ -835,39 +919,33 @@ class ExecutorService {
     const rawCaptured = [];
     let conditionStopPending = false;
     const scrollProgress = { completedBatches: 0 };
-    const commentCrawlProgress = { lastCount: 0, stagnantBatches: 0 };
-
-    const isSinglePostCrawl = isFacebookCommentCrawlUrl(targetUrl);
+    const emptyBatchProgress = {
+      lastRawCount: 0,
+      consecutive: 0,
+    };
+    const MAX_EMPTY_SCROLL_BATCHES = 5;
     const shouldCheckStopCondition = infinite.enabled
       && infinite.stop_mode === 'condition'
       && !isSinglePostCrawl;
 
-    const shouldStopCommentCrawl = () => {
-      if (!isSinglePostCrawl) return false;
+    this._crawlDumpFolderId = CrawlRequestDumpService.resolveFolderId({
+      targetUrl,
+      variables: map,
+      scenarioId: scenario?.id,
+      executionId: this._currentExecutionId,
+    });
 
-      const parsed = parseFacebookGraphQLBatch(rawCaptured, { targetUrl, variables: map });
-      const count = countParsedFacebookComments(parsed);
-      const expected = getExpectedFacebookCommentCount(parsed);
-
-      if (count > commentCrawlProgress.lastCount) {
-        commentCrawlProgress.lastCount = count;
-        commentCrawlProgress.stagnantBatches = 0;
-      } else {
-        commentCrawlProgress.stagnantBatches += 1;
-      }
-
-      if (expected > 0 && count >= expected) {
-        console.log(`[Executor] Comment crawl complete: ${count}/${expected}`);
-        return true;
-      }
-
-      if (commentCrawlProgress.stagnantBatches >= 4) {
-        console.log(`[Executor] Comment crawl stalled at ${count} comments (expected ${expected || '?'})`);
-        return true;
-      }
-
-      return false;
-    };
+    if (CrawlRequestDumpService.isEnabled()) {
+      await CrawlRequestDumpService.writeMeta(this._crawlDumpFolderId, {
+        targetUrl,
+        scenarioId: scenario?.id || '',
+        executionId: this._currentExecutionId || '',
+        scenarioName: scenario?.name || '',
+      });
+      console.log(
+        `[Executor] Crawl request dump enabled: ${CrawlRequestDumpService.resolveDumpDir(this._crawlDumpFolderId)}`,
+      );
+    }
 
     const capture = new RequestCatchingPuppeteerCapture();
     this._requestCatchingCapture = capture;
@@ -875,14 +953,34 @@ class ExecutorService {
     try {
       await capture.start(this.page, platform, {
         customFilters,
-        onCapture: (items) => {
-          const merged = mergeRequestCatchingRawObjects(rawCaptured, items);
+        onCapture: (items, meta = {}) => {
+          try {
+            const pageUrl = this.page && !this.page.isClosed() ? this.page.url() : '';
+            if (shouldSkipFacebookCrawlRequest({
+              targetUrl,
+              pageUrl,
+              referer: meta?.referer,
+              requestHeaders: meta?.requestHeaders,
+            })) {
+              console.warn(`[Executor] ${FACEBOOK_CRAWL_URL_GUARD_SKIP_MESSAGE}`);
+              return;
+            }
+          } catch (error) {
+            console.warn('[Executor] URL Guard request filter failed:', error?.message || error);
+          }
+
+          const annotatedItems = annotateFacebookGraphQLRawObjects(items, meta);
+          const merged = mergeRequestCatchingRawObjects(rawCaptured, annotatedItems);
           rawCaptured.length = 0;
           rawCaptured.push(...merged);
 
+          if (CrawlRequestDumpService.isEnabled() && this._crawlDumpFolderId) {
+            void CrawlRequestDumpService.appendCapture(this._crawlDumpFolderId, annotatedItems, meta);
+          }
+
           if (!shouldCheckStopCondition || conditionStopPending) return;
 
-          const parsedBatch = parseFacebookGraphQLBatch(items, { targetUrl, variables: map });
+          const parsedBatch = parseFacebookGraphQLBatch(annotatedItems, { targetUrl, variables: map });
           if (crawlConditionShouldStopScroll(parsedBatch, resolvedCondition)) {
             conditionStopPending = true;
             console.log('[Executor] Stop condition matched — finishing current scroll batch before stopping');
@@ -890,18 +988,61 @@ class ExecutorService {
         },
       });
 
-      await this._navigateToScenarioStart(scenario);
+      await this._navigateToScenarioStart(scenario, targetUrl);
       await this._sleep(1500);
+      if (isSinglePostCrawl) {
+        const forcedItems = await forceFetchFacebookSinglePostGraphQL(this.page, {
+          targetUrl,
+          variables: map,
+        });
+        if (forcedItems.length) {
+          const annotatedItems = annotateFacebookGraphQLRawObjects(forcedItems, {
+            url: 'https://www.facebook.com/api/graphql/',
+            friendlyName: 'CometModernPostForceFetch',
+            source: 'force_graphql_fetch',
+          });
+          const merged = mergeRequestCatchingRawObjects(rawCaptured, annotatedItems);
+          rawCaptured.length = 0;
+          rawCaptured.push(...merged);
+          emptyBatchProgress.lastRawCount = rawCaptured.length;
+
+          if (CrawlRequestDumpService.isEnabled() && this._crawlDumpFolderId) {
+            void CrawlRequestDumpService.appendCapture(this._crawlDumpFolderId, annotatedItems, {
+              url: 'https://www.facebook.com/api/graphql/',
+              friendlyName: 'CometModernPostForceFetch',
+              source: 'force_graphql_fetch',
+            });
+          }
+          console.log(`[Executor] Force GraphQL single post fetch captured ${forcedItems.length} object(s)`);
+        } else {
+          console.warn('[Executor] Force GraphQL single post fetch did not return usable JSON');
+        }
+      }
       await this._runRequestCatchingScroll(
         crawlMeta,
         () => false,
         targetUrl,
-        (loopConfig) => {
-          if (shouldStopCommentCrawl()) return true;
-          return conditionStopPending
-            && scrollProgress.completedBatches >= (loopConfig?.minBatchesBeforeConditionStop || 1);
-        },
+        (loopConfig) => (
+          conditionStopPending
+            && scrollProgress.completedBatches >= (loopConfig?.minBatchesBeforeConditionStop || 1)
+        ),
         scrollProgress,
+        null,
+        false,
+        () => {
+          const rawCount = rawCaptured.length;
+          if (rawCount > emptyBatchProgress.lastRawCount) {
+            emptyBatchProgress.lastRawCount = rawCount;
+            emptyBatchProgress.consecutive = 0;
+            return false;
+          }
+
+          emptyBatchProgress.consecutive += 1;
+          console.log(
+            `[Executor] Empty GraphQL scroll batch ${emptyBatchProgress.consecutive}/${MAX_EMPTY_SCROLL_BATCHES}`,
+          );
+          return emptyBatchProgress.consecutive >= MAX_EMPTY_SCROLL_BATCHES;
+        },
       );
       await this._waitForRequestCatchingSettle();
     } finally {
@@ -915,20 +1056,56 @@ class ExecutorService {
       );
     }
 
-    const cleaned = parseFacebookGraphQLBatch(rawCaptured, { targetUrl, variables: map });
+    if (CrawlRequestDumpService.isEnabled() && this._crawlDumpFolderId) {
+      const savedDump = await CrawlRequestDumpService.saveSession(this._crawlDumpFolderId, {
+        targetUrl,
+        actualUrl: this.page && !this.page.isClosed() ? this.page.url() : '',
+        executionId: this._currentExecutionId || '',
+        scenarioId: scenario?.id || '',
+        rawCaptured,
+      });
+      console.log(
+        `[Executor] Crawl request dump saved: ${savedDump?.raw_object_count || 0} objects -> ${savedDump?.dumpPath || ''}`,
+      );
+    }
+
+    let cleaned = parseFacebookGraphQLBatch(rawCaptured, { targetUrl, variables: map });
+    if (isSinglePostCrawl) {
+      const targetPostId = String(map?.get?.('post_id') || parseFacebookPostLink(targetUrl).post_id || '').trim();
+      cleaned = mergeSinglePostParsedResults(cleaned, {
+        postId: targetPostId,
+        groupId: String(map?.get?.('group_id') || parseFacebookPostLink(targetUrl).group_id || '').trim(),
+        targetUrl,
+      });
+      const hasTargetPost = cleaned.some((post) => (
+        String(post?.post_id || '') === targetPostId
+        && post._comments_only !== true
+        && post._feedback_only !== true
+      ));
+      if (!hasTargetPost) {
+        throw new Error('Force GraphQL single post fetch did not capture the target post JSON.');
+      }
+    }
 
     let facebookDbSave = null;
     if (platform === 'facebook' && this.platformCrawledDataService) {
+      const saveCandidates = cleaned.filter((post) => (
+        post?.post_id
+        && post._comments_only !== true
+        && post._feedback_only !== true
+      ));
       facebookDbSave = await this.platformCrawledDataService.saveFacebookPostsBatch(
-        cleaned.filter((post) => post?.post_id),
+        saveCandidates,
         { group_link: targetUrl },
         {
           platform: 'facebook',
-          supplement: isSinglePostCrawl,
+          supplement: false,
+          requireExistingPostForCommentOnly: true,
         },
       );
       console.log(
-        `[Executor] Facebook DB save: ${facebookDbSave.saved} saved, ${facebookDbSave.failed} failed`,
+        `[Executor] Facebook DB save: ${facebookDbSave.saved} saved, ${facebookDbSave.failed} failed`
+        + (facebookDbSave.errors?.length ? `, errors: ${JSON.stringify(facebookDbSave.errors)}` : ''),
       );
     }
 
@@ -994,13 +1171,16 @@ class ExecutorService {
     targetUrl = '',
     shouldStopAfterSettle = () => false,
     scrollProgress = null,
+    forcedScrollContext = null,
+    disableEarlyScrollStop = false,
+    onBatchSettled = null,
   ) {
     if (!this.page || this.page.isClosed()) return;
 
     const autoscroll = crawlMeta.autoscroll || {};
     const infinite = crawlMeta.infinity_scroll || {};
     const shouldScroll = autoscroll.enabled || infinite.enabled;
-    const scrollContext = resolveCrawlScrollContext(targetUrl || this.page.url());
+    const scrollContext = forcedScrollContext || resolveCrawlScrollContext(targetUrl || this.page.url());
 
     if (!shouldScroll) {
       await this._sleep(Math.max(2000, Number(autoscroll.delay_ms) || 500) * 2);
@@ -1016,10 +1196,21 @@ class ExecutorService {
 
     const startedAt = Date.now();
     let totalScrolls = 0;
+    let urlGuardStopped = false;
 
     for (let batchIndex = 0; batchIndex < loop.maxBatches; batchIndex += 1) {
       if (shouldStop()) break;
       if (loop.infiniteEnabled && Date.now() - startedAt >= loop.timeoutMs) break;
+
+      if (targetUrl) {
+        const guard = await this._guardFacebookCrawlPageUrl(targetUrl, {
+          recover: batchIndex === 0 && scrollContext !== 'comments',
+        });
+        if (guard?.ok === false) {
+          urlGuardStopped = true;
+          break;
+        }
+      }
 
       const remainingScrolls = loop.maxScrolls - totalScrolls;
       const batchSize = Math.min(loop.scrollsPerBatch, remainingScrolls);
@@ -1030,6 +1221,19 @@ class ExecutorService {
       let nextState = previousState;
       for (let scrollIndex = 0; scrollIndex < batchSize; scrollIndex += 1) {
         if (shouldStop()) break;
+
+        if (targetUrl) {
+          const currentUrl = this.page.url() || '';
+          if (!isFacebookCrawlUrlGuardMatch(targetUrl, { pageUrl: currentUrl })) {
+            const guard = await this._guardFacebookCrawlPageUrl(targetUrl, { recover: false });
+            if (guard?.ok === false) {
+              urlGuardStopped = true;
+              break;
+            }
+          }
+        }
+
+        if (urlGuardStopped) break;
 
         nextState = await this.page.evaluate(
           runCrawlScrollStep,
@@ -1044,6 +1248,7 @@ class ExecutorService {
         }
       }
 
+      if (urlGuardStopped) break;
       if (shouldStop()) break;
 
       await this._waitForScrollBatchSettle(loop.settleMs);
@@ -1052,11 +1257,16 @@ class ExecutorService {
         scrollProgress.completedBatches += 1;
       }
 
-      if (shouldStop() || shouldStopAfterSettle(loop)) break;
+      const stopAfterSettle = shouldStopAfterSettle(loop);
+      const stopFromBatchHook = onBatchSettled
+        ? await Promise.resolve(onBatchSettled(loop, { nextState, previousState }))
+        : false;
+
+      if (shouldStop() || stopAfterSettle || stopFromBatchHook) break;
 
       const atBottom = await this.page.evaluate(isCrawlScrollAtBottom, nextState);
       const didNotMove = await this.page.evaluate(isCrawlScrollStuck, previousState, nextState);
-      if (shouldStopCrawlScrollEarly({
+      if (!disableEarlyScrollStop && shouldStopCrawlScrollEarly({
         infiniteEnabled: loop.infiniteEnabled,
         atBottom,
         didNotMove,
@@ -1709,6 +1919,41 @@ function mergeParsedFacebookPosts(primary = [], secondary = []) {
   return Array.from(merged.values());
 }
 
+function readFacebookGraphQLFriendlyName(postData = '') {
+  const body = String(postData || '');
+  if (!body) return '';
+
+  try {
+    const params = new URLSearchParams(body);
+    return String(
+      params.get('fb_api_req_friendly_name')
+        || params.get('friendly_name')
+        || params.get('operationName')
+        || '',
+    ).trim();
+  } catch {
+    const match = body.match(/(?:fb_api_req_friendly_name|friendly_name|operationName)=([^&]+)/i);
+    return match?.[1] ? decodeURIComponent(match[1]).trim() : '';
+  }
+}
+
+function annotateFacebookGraphQLRawObjects(items = [], meta = {}) {
+  const friendlyName = readFacebookGraphQLFriendlyName(meta?.postData);
+  if (!friendlyName) return Array.isArray(items) ? items : [];
+
+  return (Array.isArray(items) ? items : []).map((item) => {
+    if (!item || typeof item !== 'object') return item;
+    return {
+      ...item,
+      __request: {
+        ...(item.__request || {}),
+        friendlyName,
+        url: meta?.url || '',
+      },
+    };
+  });
+}
+
 function buildCrawlExecutionResult(crawlResults = [], resultType = 'simple') {
   return resultType === 'list'
     ? buildMergedCrawlListResult(crawlResults)
@@ -1845,6 +2090,213 @@ const SCENARIO_RESULT_TYPES = new Set(['simple', 'list']);
 function normalizeScenarioResultType(value) {
   const normalized = String(value || 'simple').trim().toLowerCase();
   return SCENARIO_RESULT_TYPES.has(normalized) ? normalized : 'simple';
+}
+
+async function forceFetchFacebookSinglePostGraphQL(page, options = {}) {
+  if (!page || page.isClosed()) return [];
+
+  const parsedUrl = parseFacebookPostLink(options.targetUrl || '');
+  const postId = String(options.variables?.get?.('post_id') || parsedUrl.post_id || '').trim();
+  const groupId = String(options.variables?.get?.('group_id') || parsedUrl.group_id || '').trim();
+  if (!postId) return [];
+
+  try {
+    const result = await page.evaluate(async ({ targetPostId, targetGroupId, targetUrl }) => {
+      const pickToken = (...values) => values
+        .map((value) => (typeof value === 'string' ? value.trim() : ''))
+        .find(Boolean) || '';
+      const readRequireModule = (name) => {
+        try {
+          if (typeof require !== 'function') return null;
+          return require(name);
+        } catch {
+          return null;
+        }
+      };
+      const readCookie = (name) => {
+        const match = document.cookie.match(new RegExp(`(?:^|; )${name}=([^;]*)`));
+        return match ? decodeURIComponent(match[1]) : '';
+      };
+      const readDocIdCandidates = () => {
+        const names = [
+          'CometModernPostFeedQuery.graphql',
+          'CometModernPostQuery.graphql',
+          'CometSinglePostContentQuery.graphql',
+          'CometPermalinkRootQuery.graphql',
+          'CometUFICommentsProviderQuery.graphql',
+        ];
+        const ids = [];
+        names.forEach((name) => {
+          const mod = readRequireModule(name);
+          const id = mod?.params?.id || mod?.params?.metadata?.relayPreloadable?.concreteRequestID || mod?.id;
+          if (id && !ids.includes(String(id))) ids.push(String(id));
+        });
+        return ids;
+      };
+      const dtsgModule = readRequireModule('DTSGInitialData');
+      const lsdModule = readRequireModule('LSD');
+      const currentUserModule = readRequireModule('CurrentUserInitialData');
+      const siteDataModule = readRequireModule('SiteData');
+      const spin = window.__spin_r || siteDataModule?.__spin_r || '';
+      const userId = pickToken(
+        window.__user,
+        currentUserModule?.USER_ID,
+        readCookie('c_user'),
+      );
+      const fbDtsg = pickToken(
+        window.fb_dtsg,
+        dtsgModule?.token,
+      );
+      const lsd = pickToken(
+        lsdModule?.token,
+      );
+      const variablesList = [
+        {
+          feedbackSource: 2,
+          feedLocation: 'PERMALINK',
+          focusCommentID: null,
+          privacySelectorRenderLocation: 'COMET_STREAM',
+          renderLocation: 'permalink',
+          scale: window.devicePixelRatio || 1,
+          storyID: targetPostId,
+          useDefaultActor: false,
+          id: targetPostId,
+        },
+        {
+          UFI2CommentsProvider_commentsKey: 'CometModernPostFeedQuery',
+          displayCommentsContextEnableComment: null,
+          displayCommentsContextIsAdPreview: null,
+          displayCommentsContextIsAggregatedShare: null,
+          displayCommentsContextIsStorySet: null,
+          displayCommentsFeedbackContext: null,
+          feedLocation: 'PERMALINK',
+          feedbackSource: 2,
+          focusCommentID: null,
+          scale: window.devicePixelRatio || 1,
+          storyID: targetPostId,
+          id: targetPostId,
+        },
+      ];
+      const docIds = readDocIdCandidates();
+      const friendlyNames = [
+        'CometModernPostFeedQuery',
+        'CometModernPostQuery',
+        'CometSinglePostContentQuery',
+        'CometPermalinkRootQuery',
+      ];
+      const responses = [];
+
+      for (const variables of variablesList) {
+        for (const friendlyName of friendlyNames) {
+          const docIdCandidates = docIds.length ? docIds : [''];
+          for (const docId of docIdCandidates) {
+            const body = new URLSearchParams();
+            if (userId) {
+              body.set('__user', userId);
+              body.set('av', userId);
+            }
+            body.set('__a', '1');
+            body.set('__req', 'forcepost');
+            if (spin) body.set('__rev', String(spin));
+            if (fbDtsg) body.set('fb_dtsg', fbDtsg);
+            if (lsd) body.set('lsd', lsd);
+            body.set('fb_api_caller_class', 'RelayModern');
+            body.set('fb_api_req_friendly_name', friendlyName);
+            body.set('variables', JSON.stringify(variables));
+            if (docId) body.set('doc_id', docId);
+
+            try {
+              const response = await fetch('/api/graphql/', {
+                method: 'POST',
+                credentials: 'include',
+                headers: {
+                  'content-type': 'application/x-www-form-urlencoded',
+                  ...(lsd ? { 'x-fb-lsd': lsd } : {}),
+                },
+                body,
+              });
+              const text = await response.text();
+              const chunks = text
+                .split(/\n+/)
+                .map((line) => line.trim())
+                .filter(Boolean)
+                .map((line) => {
+                  try { return JSON.parse(line); } catch { return null; }
+                })
+                .filter(Boolean);
+              chunks.forEach((chunk) => {
+                responses.push({
+                  ...chunk,
+                  __request: {
+                    friendlyName,
+                    docId,
+                    source: 'force_graphql_fetch',
+                    targetPostId,
+                    targetGroupId,
+                    targetUrl,
+                  },
+                });
+              });
+            } catch {
+              // Try next query shape.
+            }
+          }
+        }
+      }
+
+      return responses;
+    }, {
+      targetPostId: postId,
+      targetGroupId: groupId,
+      targetUrl: options.targetUrl || '',
+    });
+
+    return Array.isArray(result) ? result : [];
+  } catch (error) {
+    console.warn('[Executor] Force GraphQL single post fetch failed:', error?.message || error);
+    return [];
+  }
+}
+
+function mergeSinglePostParsedResults(parsedPosts = [], options = {}) {
+  const posts = Array.isArray(parsedPosts) ? parsedPosts : [];
+  const targetPostId = String(options.postId || '').trim();
+  if (!targetPostId) return posts;
+
+  const base = posts.find((post) => (
+    String(post?.post_id || '') === targetPostId
+    && post._comments_only !== true
+    && post._feedback_only !== true
+  ));
+  if (!base) return posts;
+
+  const seen = new Set((base.comments || []).map((comment) => (
+    comment.comment_id || `${comment.comment_author || ''}::${comment.comment_content || ''}`
+  )));
+  posts.forEach((post) => {
+    if (post === base || !Array.isArray(post?.comments)) return;
+    post.comments.forEach((comment) => {
+      const key = comment.comment_id || `${comment.comment_author || ''}::${comment.comment_content || ''}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      base.comments.push(comment);
+    });
+  });
+  base.comment_count = Math.max(Number(base.comment_count) || 0, base.comments.length);
+  if (!base.group_id && options.groupId) base.group_id = options.groupId;
+  if (!base.post_link && options.targetUrl) base.post_link = options.targetUrl;
+  delete base._comments_only;
+  delete base._feedback_only;
+
+  return [
+    base,
+    ...posts.filter((post) => (
+      post !== base
+      && post._comments_only !== true
+      && post._feedback_only !== true
+      && String(post?.post_id || '') !== targetPostId
+    )),
+  ];
 }
 
 export { ExecutorService };

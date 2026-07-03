@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import { app, BrowserWindow, dialog, ipcMain, Menu, net, protocol, shell } from 'electron';
+import { loadProjectEnv } from './config/loadEnv.js';
 import { ScenarioEmbeddedBrowserService } from './browser/ScenarioEmbeddedBrowserService.js';
 import { RequestCatchingDumpService } from './rpa/RequestCatchingDumpService.js';
 import path from 'node:path';
@@ -24,6 +25,7 @@ import { isMasterBuild } from './appRoleConfig.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PROJECT_ROOT = path.join(__dirname, '..', '..');
+loadProjectEnv(PROJECT_ROOT);
 
 /** @type {BrowserWindow|null} */
 let mainWindow = null;
@@ -248,6 +250,13 @@ function registerDatabaseHandlers() {
   ipcMain.handle('facebook-data:list-comments', (_event, options = {}) => {
     assertMasterFacebookDataAccess();
     return platformCrawledDataService.listFacebookComments(options);
+  });
+
+  ipcMain.handle('facebook-data:delete-post', (_event, payload = {}) => {
+    assertMasterFacebookDataAccess();
+    return platformCrawledDataService.deleteFacebookPost(payload?.postId, {
+      platform: payload?.platform || 'facebook',
+    });
   });
 
   ipcMain.handle('facebook-data:export-csv', async (_event, payload = {}) => {
@@ -851,7 +860,6 @@ function withDefaultSettings(settings) {
       settings['browser.userDataDir'] || path.join(app.getPath('userData'), 'browser-data'),
     'execution.browserCloseDelayMs': Number(settings['execution.browserCloseDelayMs']) || 5000,
     'facebook.crawlGroupScenarioId': settings['facebook.crawlGroupScenarioId'] || '',
-    'facebook.crawlCommentScenarioId': settings['facebook.crawlCommentScenarioId'] || '',
     'facebook.crawlScrollSettleSeconds': Number(settings['facebook.crawlScrollSettleSeconds']) || 4,
     'facebook.crawlBrowserProfileId': settings['facebook.crawlBrowserProfileId'] || '',
     'facebook.crawlProxyId': settings['facebook.crawlProxyId'] || '',

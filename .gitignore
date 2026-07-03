@@ -1,5 +1,5 @@
 node_modules/
-.npm-cache/_cacache
+.npm-cache/
 cache/
 dist/
 .env
@@ -7,3 +7,5 @@ dist/
 .DS_Store
 Thumbs.db
 debug_dumps/
+.tmp-meta-test/
+facebook_media/

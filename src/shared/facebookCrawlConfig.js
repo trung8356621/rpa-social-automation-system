@@ -3,17 +3,13 @@
  */
 
 export const FACEBOOK_CRAWL_GROUP_PROFILE_ID = 'c7f8a901-2b3c-4d5e-8f67-000000000001';
-export const FACEBOOK_CRAWL_COMMENT_PROFILE_ID = 'c7f8a901-2b3c-4d5e-8f67-000000000002';
 
 export const FACEBOOK_CRAWL_GROUP_PROFILE_NAME = '__system:facebook-crawl-group';
-export const FACEBOOK_CRAWL_COMMENT_PROFILE_NAME = '__system:facebook-crawl-comment';
 
 export const FACEBOOK_CRAWL_GROUP_VARIABLES = ['group_id', 'last_date'];
-export const FACEBOOK_CRAWL_COMMENT_VARIABLES = ['group_id', 'post_id'];
 
 export const FACEBOOK_CRAWL_SETTINGS = {
   groupScenarioId: 'facebook.crawlGroupScenarioId',
-  commentScenarioId: 'facebook.crawlCommentScenarioId',
   scrollSettleSeconds: 'facebook.crawlScrollSettleSeconds',
   crawlBrowserProfileId: 'facebook.crawlBrowserProfileId',
   crawlProxyId: 'facebook.crawlProxyId',
@@ -49,41 +45,6 @@ export function applyFacebookCrawlSettingsToMeta(crawlMeta = {}, settings = {}) 
   };
 }
 
-/** True when target URL is a single group post (comment crawl). */
-export function isFacebookCommentCrawlUrl(url = '') {
-  return /\/posts\/\d+/i.test(String(url || '').trim());
-}
-
-/**
- * Comment crawls must load every comment — no date stop condition, longer scroll budget.
- */
-export function applyFacebookCommentCrawlMetaOverrides(crawlMeta = {}) {
-  const autoscroll = crawlMeta.autoscroll || {};
-  const infinite = crawlMeta.infinity_scroll || {};
-
-  return {
-    ...crawlMeta,
-    autoscroll: {
-      ...autoscroll,
-      enabled: true,
-      distance_px: Math.max(400, Number(autoscroll.distance_px) || 600),
-      delay_ms: Math.max(300, Number(autoscroll.delay_ms) || 500),
-    },
-    infinity_scroll: {
-      ...infinite,
-      enabled: true,
-      stop_mode: 'timeout',
-      max_scrolls: Math.max(200, Number(infinite.max_scrolls) || 0),
-      timeout_ms: Math.max(180000, Number(infinite.timeout_ms) || 0),
-      settle_ms: Math.max(4000, Number(infinite.settle_ms) || 0),
-      condition: {
-        field: '',
-        operator: '<',
-        value: '',
-      },
-    },
-  };
-}
 
 export function readVariableSampleValue(samples = [], key = '', preferredName = 'Default') {
   if (!Array.isArray(samples) || !key) return '';
@@ -98,11 +59,6 @@ export const SYSTEM_FACEBOOK_VARIABLE_PROFILES = [
     name: FACEBOOK_CRAWL_GROUP_PROFILE_NAME,
     keys: FACEBOOK_CRAWL_GROUP_VARIABLES,
   },
-  {
-    id: FACEBOOK_CRAWL_COMMENT_PROFILE_ID,
-    name: FACEBOOK_CRAWL_COMMENT_PROFILE_NAME,
-    keys: FACEBOOK_CRAWL_COMMENT_VARIABLES,
-  },
 ];
 
 export const SYSTEM_VARIABLE_PROFILE_IDS = new Set(
@@ -116,7 +72,7 @@ export function isSystemVariableProfile(profileId) {
 export function buildFacebookGroupUrl(groupId = '') {
   const slug = String(groupId || '').trim();
   if (!slug) return '';
-  return `https://www.facebook.com/groups/${slug}/`;
+  return `https://www.facebook.com/groups/${slug}/?sorting_setting=CHRONOLOGICAL`;
 }
 
 export function buildFacebookPostLink(postId, groupId = '') {
@@ -146,42 +102,36 @@ function readVariableValue(variables, key) {
 }
 
 /**
- * Resolve group_id / post_id from scenario variables and/or target URL.
+ * Resolve group_id from scenario variables and/or target URL.
  */
 export function resolveFacebookCrawlContext(options = {}) {
-  const fromUrl = parseFacebookPostLink(options.targetUrl || '');
   const groupId = readVariableValue(options.variables, 'group_id')
     || String(options.groupId || options.groupSlug || '').trim()
-    || fromUrl.group_id;
-  const postId = readVariableValue(options.variables, 'post_id')
-    || String(options.postId || '').trim()
-    || fromUrl.post_id;
+    || parseFacebookGroupLink(options.targetUrl || '').group_id;
 
   return {
     group_id: groupId,
-    post_id: postId,
+    post_id: readVariableValue(options.variables, 'post_id') || String(options.postId || '').trim(),
   };
 }
 
 /**
- * Fill missing post_id / group_id / post_link on parsed crawl results
- * using scenario variables or the resolved target URL.
+ * Fill missing group_id / post_link on parsed crawl results using scenario variables.
  */
 export function enrichFacebookCrawlPosts(posts, options = {}) {
   const context = resolveFacebookCrawlContext(options);
-  if (!context.group_id && !context.post_id) {
+  if (!context.group_id) {
     return Array.isArray(posts) ? posts : [];
   }
 
   return (Array.isArray(posts) ? posts : []).map((post) => {
-    const postId = post?.post_id || context.post_id || null;
+    const postId = post?.post_id || null;
     const groupId = post?.group_id || post?._group_slug || context.group_id || null;
     const postLink = post?.post_link
       || (postId && groupId ? buildFacebookPostLink(postId, groupId) : '');
 
     return {
       ...post,
-      post_id: postId,
       group_id: groupId,
       post_link: postLink,
       ...(groupId ? { _group_slug: groupId } : {}),
@@ -204,15 +154,18 @@ export function parseFacebookGroupLink(url = '') {
 
 /**
  * Parse group_id and post_id from a Facebook group post URL.
+ * Used for saved post links and isolated JSON-only Single Post crawl.
  * @param {string} url
  * @returns {{ group_id: string, post_id: string }}
  */
 export function parseFacebookPostLink(url = '') {
   const text = String(url || '').trim();
   const match = text.match(/facebook\.com\/groups\/([^/?#]+)\/posts\/(\d+)/i);
+  const multiPermalinkMatch = text.match(/facebook\.com\/groups\/([^/?#]+)\/?\?(?:[^#]*&)?multi_permalinks=(\d+)/i);
+  const resolved = match || multiPermalinkMatch;
   return {
-    group_id: match?.[1] ? String(match[1]).trim() : '',
-    post_id: match?.[2] ? String(match[2]).trim() : '',
+    group_id: resolved?.[1] ? String(resolved[1]).trim() : '',
+    post_id: resolved?.[2] ? String(resolved[2]).trim() : '',
   };
 }
 
@@ -227,18 +180,85 @@ export function buildFacebookGroupCrawlVariables({ groupId = '', lastDate = '' }
   ];
 }
 
-/**
- * Build variable entries for a Facebook comment crawl run.
- * @param {{ postLink?: string, groupId?: string, postId?: string }} params
- */
-export function buildFacebookCommentCrawlVariables({
-  postLink = '',
-  groupId = '',
-  postId = '',
-} = {}) {
+export function buildFacebookSinglePostCrawlVariables({ postLink = '', groupId = '', postId = '' } = {}) {
   const parsed = parseFacebookPostLink(postLink);
   return [
     { key: 'group_id', value: String(groupId || parsed.group_id || '').trim() },
     { key: 'post_id', value: String(postId || parsed.post_id || '').trim() },
   ];
+}
+
+export const FACEBOOK_CRAWL_URL_GUARD_SKIP_MESSAGE = 'URL Guard: skipped request outside expected Facebook group';
+
+function normalizeFacebookGroupId(value = '') {
+  return String(value || '').trim().replace(/\/+$/, '').toLowerCase();
+}
+
+function readHeaderValue(headers = {}, key = '') {
+  const expected = String(key || '').toLowerCase();
+  if (!headers || typeof headers !== 'object' || !expected) return '';
+
+  const foundKey = Object.keys(headers).find((item) => String(item).toLowerCase() === expected);
+  return foundKey ? String(headers[foundKey] || '') : '';
+}
+
+export function isFacebookCrawlUrlGuardMatch(targetUrl = '', options = {}) {
+  const expectedGroupId = normalizeFacebookGroupId(parseFacebookGroupLink(targetUrl).group_id);
+  if (!expectedGroupId) return true;
+
+  const candidates = [
+    options.pageUrl,
+    options.referer,
+    options.url,
+  ].map((value) => normalizeFacebookGroupId(parseFacebookGroupLink(value || '').group_id))
+    .filter(Boolean);
+
+  if (!candidates.length) return true;
+  return candidates.some((groupId) => groupId === expectedGroupId);
+}
+
+export function shouldSkipFacebookCrawlRequest({
+  targetUrl = '',
+  pageUrl = '',
+  referer = '',
+  requestHeaders = {},
+} = {}) {
+  const resolvedReferer = referer || readHeaderValue(requestHeaders, 'referer');
+  return !isFacebookCrawlUrlGuardMatch(targetUrl, {
+    pageUrl,
+    referer: resolvedReferer,
+  });
+}
+
+export function validateFacebookCrawlNavigation(expectedUrl = '', actualUrl = '') {
+  const expectedGroupId = normalizeFacebookGroupId(parseFacebookGroupLink(expectedUrl).group_id);
+  const actualGroupId = normalizeFacebookGroupId(parseFacebookGroupLink(actualUrl).group_id);
+
+  if (!expectedGroupId || !actualGroupId) {
+    return { ok: true, expected: { group_id: expectedGroupId }, actual: { group_id: actualGroupId } };
+  }
+
+  if (expectedGroupId !== actualGroupId) {
+    return {
+      ok: false,
+      reason: 'group_mismatch',
+      expected: { group_id: expectedGroupId },
+      actual: { group_id: actualGroupId },
+    };
+  }
+
+  return { ok: true, expected: { group_id: expectedGroupId }, actual: { group_id: actualGroupId } };
+}
+
+export function buildFacebookCrawlNavigationError(validation = {}, expectedUrl = '', actualUrl = '') {
+  const reason = validation.reason || 'url_mismatch';
+  const expectedGroupId = validation.expected?.group_id || parseFacebookGroupLink(expectedUrl).group_id || '';
+  const actualGroupId = validation.actual?.group_id || parseFacebookGroupLink(actualUrl).group_id || '';
+  return [
+    `Facebook crawl navigation guard failed: ${reason}.`,
+    expectedGroupId ? `Expected group: ${expectedGroupId}.` : '',
+    actualGroupId ? `Actual group: ${actualGroupId}.` : '',
+    `Expected URL: ${expectedUrl || '(empty)'}.`,
+    `Actual URL: ${actualUrl || '(empty)'}.`,
+  ].filter(Boolean).join(' ');
 }

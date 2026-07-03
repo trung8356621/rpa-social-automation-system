@@ -12,6 +12,21 @@ function normalizeUrl(value) {
   return text;
 }
 
+function normalizeMediaValue(value) {
+  const text = String(value || '').trim().replace(/\\/g, '/');
+  if (!text) return '';
+  if (/^https?:\/\//i.test(text)) return text;
+  if (/^facebook_media\//i.test(text)) return text;
+  return '';
+}
+
+export function isLikelyFacebookVideoUrl(url) {
+  const normalized = normalizeUrl(url);
+  if (!normalized) return false;
+  return /\.mp4(?:[?#]|$)/i.test(normalized)
+    || /video.*fbcdn\.net|fbcdn\.net\/.*\/v\/|facebook\.com\/.*video/i.test(normalized);
+}
+
 export function isLikelyContentImageUrl(url) {
   const normalized = normalizeUrl(url);
   if (!normalized) return false;
@@ -21,8 +36,23 @@ export function isLikelyContentImageUrl(url) {
   return true;
 }
 
+export function isLikelyFacebookMediaUrl(value) {
+  const normalized = normalizeMediaValue(value);
+  if (!normalized) return false;
+  if (/^facebook_media\//i.test(normalized)) return true;
+  return isLikelyContentImageUrl(normalized) || isLikelyFacebookVideoUrl(normalized);
+}
+
 function readMediaUri(media = {}) {
   const candidates = [
+    media?.playable_url,
+    media?.playable_url_quality_hd,
+    media?.browser_native_sd_url,
+    media?.browser_native_hd_url,
+    media?.dash_manifest_url,
+    media?.animated_image?.uri,
+    media?.preferred_thumbnail?.image?.uri,
+    media?.thumbnail_image?.uri,
     media?.photo_image?.uri,
     media?.viewer_image?.uri,
     media?.image?.uri,
@@ -32,7 +62,7 @@ function readMediaUri(media = {}) {
 
   for (const candidate of candidates) {
     const url = normalizeUrl(candidate);
-    if (isLikelyContentImageUrl(url)) return url;
+    if (isLikelyFacebookMediaUrl(url)) return url;
   }
 
   return '';
@@ -40,18 +70,32 @@ function readMediaUri(media = {}) {
 
 function readAttachmentUri(attachment = {}) {
   const direct = [
+    attachment?.media?.playable_url,
+    attachment?.media?.playable_url_quality_hd,
+    attachment?.media?.browser_native_sd_url,
+    attachment?.media?.browser_native_hd_url,
+    attachment?.media?.preferred_thumbnail?.image?.uri,
+    attachment?.media?.thumbnail_image?.uri,
     attachment?.media?.photo_image?.uri,
     attachment?.media?.viewer_image?.uri,
     attachment?.media?.image?.uri,
+    attachment?.style_type_renderer?.attachment?.media?.playable_url,
+    attachment?.style_type_renderer?.attachment?.media?.playable_url_quality_hd,
+    attachment?.style_type_renderer?.attachment?.media?.preferred_thumbnail?.image?.uri,
+    attachment?.style_type_renderer?.attachment?.media?.thumbnail_image?.uri,
     attachment?.style_type_renderer?.attachment?.media?.image?.uri,
     attachment?.style_type_renderer?.attachment?.media?.photo_image?.uri,
+    attachment?.styles?.attachment?.media?.playable_url,
+    attachment?.styles?.attachment?.media?.playable_url_quality_hd,
+    attachment?.styles?.attachment?.media?.preferred_thumbnail?.image?.uri,
+    attachment?.styles?.attachment?.media?.thumbnail_image?.uri,
     attachment?.styles?.attachment?.media?.photo_image?.uri,
     attachment?.styles?.attachment?.media?.image?.uri,
   ];
 
   for (const candidate of direct) {
     const url = normalizeUrl(candidate);
-    if (isLikelyContentImageUrl(url)) return url;
+    if (isLikelyFacebookMediaUrl(url)) return url;
   }
 
   const mediaUrl = readMediaUri(attachment?.media || {});
@@ -68,7 +112,7 @@ export function extractFacebookMediaUrls(node = {}) {
   const urls = [];
   const pushUrl = (value) => {
     const url = normalizeUrl(value);
-    if (!isLikelyContentImageUrl(url)) return;
+    if (!isLikelyFacebookMediaUrl(url)) return;
     if (!urls.includes(url)) urls.push(url);
   };
 
@@ -98,8 +142,8 @@ export function extractFacebookMediaUrls(node = {}) {
 
 export function serializeFacebookMediaUrls(urls = []) {
   const normalized = (Array.isArray(urls) ? urls : [])
-    .map((item) => normalizeUrl(item))
-    .filter((item) => isLikelyContentImageUrl(item));
+    .map((item) => normalizeMediaValue(item))
+    .filter((item) => isLikelyFacebookMediaUrl(item));
 
   return normalized.length ? JSON.stringify(normalized) : '';
 }
@@ -107,7 +151,7 @@ export function serializeFacebookMediaUrls(urls = []) {
 export function parseFacebookMediaUrls(value) {
   if (!value) return [];
   if (Array.isArray(value)) {
-    return value.map((item) => normalizeUrl(item)).filter(Boolean);
+    return value.map((item) => normalizeMediaValue(item)).filter(Boolean);
   }
 
   const text = String(value).trim();
@@ -116,13 +160,14 @@ export function parseFacebookMediaUrls(value) {
   try {
     const parsed = JSON.parse(text);
     if (Array.isArray(parsed)) {
-      return parsed.map((item) => normalizeUrl(item)).filter(Boolean);
+      return parsed.map((item) => normalizeMediaValue(item)).filter(Boolean);
     }
   } catch {
     // Fall through to single URL.
   }
 
-  return isLikelyContentImageUrl(text) ? [text] : [];
+  const normalized = normalizeMediaValue(text);
+  return isLikelyFacebookMediaUrl(normalized) ? [normalized] : [];
 }
 
 export function mergeFacebookMediaUrls(existing = [], incoming = []) {

@@ -1,0 +1,131 @@
+.facebook-date-picker .rdp {
+  --rdp-cell-size: 36px;
+  --rdp-accent-color: #2f80ed;
+  --rdp-background-color: #243041;
+  margin: 0;
+}
+
+.facebook-date-picker .rdp-months {
+  justify-content: center;
+}
+
+.facebook-date-picker .rdp-month {
+  width: 100%;
+}
+
+.facebook-date-picker .rdp-caption {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 4px 12px;
+}
+
+.facebook-date-picker .rdp-caption_label {
+  flex: 1;
+  text-align: center;
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: #e8eef7;
+}
+
+.facebook-date-picker .rdp-nav {
+  display: flex;
+  gap: 4px;
+}
+
+.facebook-date-picker .rdp-nav_button {
+  display: inline-flex;
+  height: 32px;
+  width: 32px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  border: 1px solid #3a4a61;
+  background: #1d2736;
+  color: #c7d2e0;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background-color 0.15s ease, color 0.15s ease;
+}
+
+.facebook-date-picker .rdp-nav_button:hover:not(:disabled) {
+  border-color: #5b7ec7;
+  background: #243041;
+  color: #ffffff;
+}
+
+.facebook-date-picker .rdp-nav_button:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.facebook-date-picker .rdp-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.facebook-date-picker .rdp-head_cell {
+  width: var(--rdp-cell-size);
+  padding-bottom: 6px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #9aa7b7;
+}
+
+.facebook-date-picker .rdp-cell {
+  padding: 2px;
+  text-align: center;
+}
+
+.facebook-date-picker .rdp-day {
+  height: var(--rdp-cell-size);
+  width: var(--rdp-cell-size);
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: #e8eef7;
+  font-size: 0.8125rem;
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+.facebook-date-picker .rdp-day:hover:not([disabled]):not(.rdp-day_selected) {
+  background: #243041;
+}
+
+.facebook-date-picker .rdp-day_selected,
+.facebook-date-picker .rdp-day_selected:hover {
+  background: #2f80ed;
+  color: #ffffff;
+}
+
+.facebook-date-picker .rdp-day_today:not(.rdp-day_selected) {
+  box-shadow: inset 0 0 0 1px rgba(47, 128, 237, 0.55);
+}
+
+.facebook-date-picker .rdp-day_outside {
+  color: #6f7d90;
+  opacity: 0.65;
+}
+
+.facebook-date-picker .rdp-day_disabled {
+  color: #4b5563;
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.facebook-date-picker-popover {
+  animation: facebook-date-picker-in 0.14s ease-out;
+}
+
+@keyframes facebook-date-picker-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}

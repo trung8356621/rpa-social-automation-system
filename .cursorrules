@@ -38,6 +38,9 @@ Follow these rules when editing or generating code in this repository.
 ## RPA / Automation Rules
 
 - Keep Puppeteer automation in `src/main/rpa/**`.
+- For Facebook Data Studio crawl, request-catching, GraphQL parser, media
+  download, or crawled Facebook DB persistence work, read and follow
+  `.cursor/skills/facebook-crawl-data/SKILL.md`.
 - Design recorded steps to be resilient across viewport changes:
   - Prefer semantic anchors such as `aria-label`, placeholder, role, text, stable attributes.
   - Keep recorded viewport width, height, and device pixel ratio with scenarios.

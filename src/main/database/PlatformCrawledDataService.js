@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { extractFacebookGroupSlug } from '../../shared/parseFacebookGraphQL.js';
+import { extractFacebookGroupSlug, sanitizeFacebookPostContent } from '../../shared/parseFacebookGraphQL.js';
 import { parseInteractionCount } from '../../shared/facebookInteractionCounts.js';
 import {
   parseFacebookMediaUrls,
@@ -111,6 +111,7 @@ export class PlatformCrawledDataService {
   async saveFacebookPostWithComments(postData, groupInfo = {}, options = {}) {
     const platform = options.platform || 'facebook';
     const supplement = options.supplement === true;
+    const requireExistingPost = options.requireExistingPost === true;
 
     try {
       const db = this.connectPlatformDatabase(platform);
@@ -146,6 +147,13 @@ export class PlatformCrawledDataService {
           .get(existingPost.author_id)
         : null;
 
+      if (requireExistingPost && !existingPost) {
+        return {
+          success: false,
+          error: `post_not_found_for_comment_update:${normalizedPost.post_id}`,
+        };
+      }
+
       if (supplement && existingPost) {
         normalizedPost = mergeSupplementFacebookPostFields(
           existingPost,
@@ -156,7 +164,15 @@ export class PlatformCrawledDataService {
 
       let localImagePath = String(existingPost?.local_image_path || normalizedPost.local_image_path || '').trim();
       const imageUrls = parseFacebookMediaUrls(normalizedPost.post_images);
-      if (!localImagePath && imageUrls.length) {
+      const downloadedPostPaths = await this.postImageDownloader.downloadAllImages(
+        normalizedPost.post_id,
+        imageUrls,
+        { prefix: 'post' },
+      );
+      if (downloadedPostPaths.length) {
+        normalizedPost.post_images = serializeFacebookMediaUrls(downloadedPostPaths);
+        localImagePath = downloadedPostPaths[0];
+      } else if (!localImagePath && imageUrls.length) {
         const downloadedPath = await this.postImageDownloader.downloadPostImage(
           normalizedPost.post_id,
           imageUrls,
@@ -166,7 +182,7 @@ export class PlatformCrawledDataService {
         }
       }
       normalizedPost.local_image_path = localImagePath;
-      if (localImagePath) {
+      if (localImagePath && !downloadedPostPaths.length) {
         normalizedPost.post_images = '';
       }
 
@@ -174,18 +190,37 @@ export class PlatformCrawledDataService {
         normalizedPost.author_link,
         normalizedPost.post_author,
       );
+      let postAuthorName = normalizedPost.post_author || '';
+      let postAuthorLink = normalizedPost.author_link || null;
       if (
         supplement
         && existingPost?.author_id
         && isUnknownFacebookAuthorName(normalizedPost.post_author)
       ) {
         postAuthorId = existingPost.author_id;
+        postAuthorName = existingAuthor?.author_name || postAuthorName;
+        postAuthorLink = existingAuthor?.author_link || postAuthorLink;
+      } else if (!postAuthorLink && existingAuthor?.author_link) {
+        postAuthorLink = existingAuthor.author_link;
       }
 
       const upsertGroup = db.prepare(`
         INSERT OR REPLACE INTO groups (group_id, group_name, group_link)
         VALUES (?, ?, ?)
       `);
+      const existingGroup = db.prepare(`
+        SELECT group_id, group_name, group_link
+        FROM groups
+        WHERE group_id = ?
+      `).get(normalizedGroup.group_id);
+      const resolvedGroupName = resolveFacebookGroupNameForSave(
+        normalizedGroup,
+        normalizedPost,
+        existingGroup,
+      );
+      const resolvedGroupLink = normalizedGroup.group_link
+        || existingGroup?.group_link
+        || '';
       const upsertAuthor = db.prepare(`
         INSERT OR REPLACE INTO authors (author_id, author_name, author_link)
         VALUES (?, ?, ?)
@@ -204,17 +239,44 @@ export class PlatformCrawledDataService {
         VALUES (?, ?, ?, ?, ?, ?)
       `);
 
+      const preparedComments = [];
+      for (const [commentIndex, comment] of (normalizedPost.comments || []).entries()) {
+        const commentId = resolveFacebookCommentId(
+          normalizedPost.post_id,
+          comment,
+          commentIndex,
+        );
+        let commentImages = serializeFacebookMediaUrls(comment?.comment_images);
+        const commentImageUrls = parseFacebookMediaUrls(comment?.comment_images);
+        if (commentImageUrls.length) {
+          const downloadedCommentPaths = await this.postImageDownloader.downloadAllImages(
+            `${normalizedPost.post_id}_${commentId}`,
+            commentImageUrls,
+            { prefix: 'comment' },
+          );
+          if (downloadedCommentPaths.length) {
+            commentImages = serializeFacebookMediaUrls(downloadedCommentPaths);
+          }
+        }
+
+        preparedComments.push({
+          comment,
+          commentId,
+          commentImages,
+        });
+      }
+
       const saveTx = db.transaction(() => {
         upsertGroup.run(
           normalizedGroup.group_id,
-          normalizedGroup.group_name || normalizedGroup.group_id,
-          normalizedGroup.group_link || '',
+          resolvedGroupName,
+          resolvedGroupLink,
         );
 
         upsertAuthor.run(
           postAuthorId,
-          normalizedPost.post_author || '',
-          normalizedPost.author_link || null,
+          postAuthorName,
+          postAuthorLink,
         );
 
         upsertPost.run(
@@ -231,7 +293,7 @@ export class PlatformCrawledDataService {
           normalizedPost.local_image_path || '',
         );
 
-        (normalizedPost.comments || []).forEach((comment, index) => {
+        preparedComments.forEach(({ comment, commentId, commentImages }) => {
           const commentAuthorId = resolveFacebookAuthorId(
             comment?.author_link,
             comment?.comment_author,
@@ -243,19 +305,13 @@ export class PlatformCrawledDataService {
             comment?.author_link || null,
           );
 
-          const commentId = resolveFacebookCommentId(
-            normalizedPost.post_id,
-            comment,
-            index,
-          );
-
           upsertComment.run(
             commentId,
             normalizedPost.post_id,
             commentAuthorId,
             comment?.comment_content || '',
             parseInteractionCount(comment?.like_count),
-            serializeFacebookMediaUrls(comment?.comment_images),
+            commentImages,
           );
         });
       });
@@ -301,6 +357,8 @@ export class PlatformCrawledDataService {
       const result = await this.saveFacebookPostWithComments(post, groupInfo, {
         platform,
         supplement,
+        requireExistingPost: options.requireExistingPost === true
+          || (options.requireExistingPostForCommentOnly === true && post?._comments_only === true),
       });
       if (result.success) {
         saved += 1;
@@ -316,6 +374,78 @@ export class PlatformCrawledDataService {
       failed,
       errors,
     };
+  }
+
+  /**
+   * Xóa bài viết Facebook và toàn bộ comment liên quan.
+   *
+   * @param {string} postId
+   * @param {{ platform?: string }} [options]
+   * @returns {{ success: boolean, post_id?: string, deleted_comments?: number, error?: string }}
+   */
+  deleteFacebookPost(postId, options = {}) {
+    const platform = options.platform || 'facebook';
+    const normalizedPostId = String(postId || '').trim();
+    if (!normalizedPostId) {
+      return { success: false, error: 'post_id is required' };
+    }
+
+    try {
+      const db = this.connectPlatformDatabase(platform);
+      const post = db.prepare(`
+        SELECT post_id, local_image_path, post_images
+        FROM posts
+        WHERE post_id = ?
+      `).get(normalizedPostId);
+
+      if (!post) {
+        return { success: false, error: 'post_not_found' };
+      }
+
+      const comments = db.prepare(`
+        SELECT comment_id, comment_images
+        FROM comments
+        WHERE post_id = ?
+      `).all(normalizedPostId);
+
+      const mediaPaths = new Set();
+      const addMediaPaths = (value) => {
+        parseFacebookMediaUrls(value).forEach((item) => {
+          if (item && !/^https?:\/\//i.test(item)) mediaPaths.add(item);
+        });
+      };
+
+      addMediaPaths(post.local_image_path);
+      addMediaPaths(post.post_images);
+      comments.forEach((comment) => addMediaPaths(comment.comment_images));
+
+      const deleteTx = db.transaction(() => {
+        db.prepare('DELETE FROM comments WHERE post_id = ?').run(normalizedPostId);
+        db.prepare('DELETE FROM posts WHERE post_id = ?').run(normalizedPostId);
+      });
+      deleteTx();
+
+      mediaPaths.forEach((relativePath) => {
+        const absolutePath = this.postImageDownloader.resolveAbsolutePath(relativePath);
+        if (!absolutePath) return;
+        try {
+          if (fs.existsSync(absolutePath)) fs.unlinkSync(absolutePath);
+        } catch {
+          // Best-effort media cleanup.
+        }
+      });
+
+      return {
+        success: true,
+        post_id: normalizedPostId,
+        deleted_comments: comments.length,
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: error?.message || String(error),
+      };
+    }
   }
 
   /**
@@ -339,30 +469,44 @@ export class PlatformCrawledDataService {
     const { limit = 200, offset = 0, search = '' } = options;
     const db = this.connectPlatformDatabase('facebook');
     const term = String(search || '').trim();
+    const selectGroupColumns = `
+          g.group_id,
+          g.group_name AS raw_group_name,
+          CASE
+            WHEN TRIM(COALESCE(g.group_name, '')) != ''
+              AND TRIM(g.group_name) != TRIM(g.group_id)
+              AND NOT (TRIM(g.group_name) GLOB '[0-9]*' AND TRIM(g.group_name) NOT GLOB '*[^0-9]*')
+            THEN TRIM(g.group_name) || ' (' || g.group_id || ')'
+            ELSE 'Group: ' || g.group_id
+          END AS group_name,
+          CASE
+            WHEN TRIM(COALESCE(g.group_name, '')) != ''
+              AND TRIM(g.group_name) != TRIM(g.group_id)
+              AND NOT (TRIM(g.group_name) GLOB '[0-9]*' AND TRIM(g.group_name) NOT GLOB '*[^0-9]*')
+            THEN TRIM(g.group_name) || ' (' || g.group_id || ')'
+            ELSE 'Group: ' || g.group_id
+          END AS display_name,
+          g.group_link,
+          (SELECT COUNT(*) FROM posts p WHERE p.group_id = g.group_id) AS post_count
+    `;
 
     if (term) {
       const like = `%${term}%`;
       return db.prepare(`
         SELECT
-          g.group_id,
-          g.group_name,
-          g.group_link,
-          (SELECT COUNT(*) FROM posts p WHERE p.group_id = g.group_id) AS post_count
+${selectGroupColumns}
         FROM groups g
         WHERE g.group_name LIKE ? OR g.group_id LIKE ? OR g.group_link LIKE ?
-        ORDER BY g.group_name COLLATE NOCASE ASC
+        ORDER BY display_name COLLATE NOCASE ASC
         LIMIT ? OFFSET ?
       `).all(like, like, like, limit, offset);
     }
 
     return db.prepare(`
       SELECT
-        g.group_id,
-        g.group_name,
-        g.group_link,
-        (SELECT COUNT(*) FROM posts p WHERE p.group_id = g.group_id) AS post_count
+${selectGroupColumns}
       FROM groups g
-      ORDER BY g.group_name COLLATE NOCASE ASC
+      ORDER BY display_name COLLATE NOCASE ASC
       LIMIT ? OFFSET ?
     `).all(limit, offset);
   }
@@ -455,10 +599,7 @@ export class PlatformCrawledDataService {
     sql += ' ORDER BY COALESCE(p.post_date, p.crawled_at) DESC LIMIT ? OFFSET ?';
     params.push(limit, offset);
 
-    return db.prepare(sql).all(...params).map((row) => ({
-      ...row,
-      post_images: row.local_image_path ? '' : row.post_images,
-    }));
+    return db.prepare(sql).all(...params);
   }
 
   /**
@@ -466,10 +607,11 @@ export class PlatformCrawledDataService {
    * @param {{ postId?: string, groupId?: string, limit?: number, offset?: number }} [options]
    */
   listFacebookComments(options = {}) {
-    const { postId = '', groupId = '', limit = 500, offset = 0 } = options;
+    const { postId = '', groupId = '', limit = 500, offset = 0, search = '' } = options;
     const db = this.connectPlatformDatabase('facebook');
     const normalizedPostId = String(postId || '').trim();
     const normalizedGroupId = String(groupId || '').trim();
+    const term = String(search || '').trim();
 
     let sql = `
       SELECT
@@ -500,6 +642,12 @@ export class PlatformCrawledDataService {
     if (normalizedGroupId) {
       sql += ' AND p.group_id = ?';
       params.push(normalizedGroupId);
+    }
+
+    if (term) {
+      sql += ' AND (c.comment_content LIKE ? OR c.comment_id LIKE ? OR a.author_name LIKE ? OR p.post_content LIKE ?)';
+      const like = `%${term}%`;
+      params.push(like, like, like, like);
     }
 
     sql += ' ORDER BY c.crawled_at DESC LIMIT ? OFFSET ?';
@@ -657,7 +805,7 @@ function normalizeFacebookPostInput(postData = {}) {
     post_author: postData.post_author ? String(postData.post_author) : '',
     author_link: postData.author_link ? String(postData.author_link) : null,
     post_link: postData.post_link ? String(postData.post_link) : '',
-    post_content: postData.post_content ? String(postData.post_content) : '',
+    post_content: sanitizeFacebookPostContent(postData.post_content),
     post_date: postDate || null,
     like_count: parseInteractionCount(postData.like_count),
     share_count: parseInteractionCount(postData.share_count),
@@ -665,6 +813,9 @@ function normalizeFacebookPostInput(postData = {}) {
     post_images: serializeFacebookMediaUrls(postData.post_images),
     local_image_path: postData.local_image_path ? String(postData.local_image_path).trim() : '',
     comments: Array.isArray(postData.comments) ? postData.comments : [],
+    group_name: postData.group_name ? String(postData.group_name).trim() : '',
+    group: postData.group && typeof postData.group === 'object' ? postData.group : null,
+    story: postData.story && typeof postData.story === 'object' ? postData.story : null,
   };
 }
 
@@ -682,10 +833,12 @@ function isUnknownFacebookAuthorName(name = '') {
 
 function mergeSupplementFacebookPostFields(existingPost = {}, existingAuthor = null, incoming = {}) {
   const merged = { ...incoming };
+  const existingContent = sanitizeFacebookPostContent(existingPost.post_content);
+  const incomingContent = incoming?._comments_only === true
+    ? ''
+    : sanitizeFacebookPostContent(merged.post_content);
 
-  if (!String(merged.post_content || '').trim()) {
-    merged.post_content = existingPost.post_content || '';
-  }
+  merged.post_content = incomingContent || existingContent;
   if (!merged.post_date) {
     merged.post_date = existingPost.post_date || null;
   }
@@ -730,7 +883,7 @@ function normalizeFacebookGroupInfo(groupInfo = {}, postData = {}) {
 
   const groupName = groupInfo.group_name
     ? String(groupInfo.group_name)
-    : groupId;
+    : '';
 
   const resolvedLink = groupLink
     || (groupId ? `https://www.facebook.com/groups/${groupId}/` : '');
@@ -740,6 +893,31 @@ function normalizeFacebookGroupInfo(groupInfo = {}, postData = {}) {
     group_name: groupName,
     group_link: resolvedLink,
   };
+}
+
+function resolveFacebookGroupNameForSave(groupInfo = {}, postData = {}, existingGroup = null) {
+  const candidates = [
+    groupInfo.group_name,
+    postData.group_name,
+    postData.group?.name,
+    postData.group?.group_name,
+    postData.story?.group?.name,
+    existingGroup?.group_name,
+  ];
+
+  const meaningful = candidates
+    .map((value) => String(value || '').trim())
+    .find((name) => isMeaningfulFacebookGroupName(name, groupInfo.group_id));
+
+  return meaningful || '';
+}
+
+function isMeaningfulFacebookGroupName(name = '', groupId = '') {
+  const value = String(name || '').trim();
+  const id = String(groupId || '').trim();
+  if (!value) return false;
+  if (id && value === id) return false;
+  return !/^\d+$/.test(value);
 }
 
 /**

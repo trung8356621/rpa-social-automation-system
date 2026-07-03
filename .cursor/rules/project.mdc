@@ -43,6 +43,9 @@ This repository is a local-first Electron + React + SQLite RPA application for s
 ## RPA / Scenario Logic
 
 - Keep Puppeteer code in main-process RPA services.
+- When editing Facebook Data Studio crawl, request-catching, GraphQL parsing,
+  media download, or crawled Facebook DB persistence, use the Cursor skill at
+  `.cursor/skills/facebook-crawl-data/SKILL.md`.
 - Prefer semantic anchors (`aria-label`, placeholder, role, stable text/attributes) over brittle selectors.
 - Preserve recorded viewport width, height, and device pixel ratio.
 - Convert recorded physical coordinates into viewport-relative execution intent where possible.

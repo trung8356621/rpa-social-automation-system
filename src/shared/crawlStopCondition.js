@@ -2,6 +2,10 @@
  * Shared stop-condition helpers for crawl / request-catching infinity scroll.
  */
 
+import { normalizeFacebookCrawlDateInput } from './facebookDateFormat.js';
+
+const DEFAULT_CONSECUTIVE_STOP_MATCHES = 7;
+
 export function normalizeConditionItem(item = {}) {
   if (item?.data !== undefined) return item.data;
   if (item?.html !== undefined) return item.html;
@@ -23,8 +27,9 @@ export function crawlConditionMatched(items = [], condition = {}) {
 }
 
 /**
- * Stop infinity scroll only when every parsed post in the batch matches the condition.
- * Avoids stopping after the first batch when the feed mixes new and old posts.
+ * Stop infinity scroll only after enough consecutive parsed posts match the
+ * condition. Facebook group feeds can mix pinned/recently-active old posts with
+ * newer posts, so a single old post must not stop the crawl.
  */
 export function crawlConditionShouldStopScroll(parsedItems = [], condition = {}) {
   const field = String(condition?.field || '').trim();
@@ -37,9 +42,26 @@ export function crawlConditionShouldStopScroll(parsedItems = [], condition = {})
 
   if (!candidates.length) return false;
 
-  return candidates.every((data) => (
-    compareCrawlValues(data[field], condition.operator, condition.value)
-  ));
+  const tolerance = resolveConsecutiveStopTolerance(condition);
+  condition.__consecutiveStopMatches = Number(condition.__consecutiveStopMatches) || 0;
+
+  for (const data of candidates) {
+    const matched = compareCrawlValues(data[field], condition.operator, condition.value);
+    if (matched) {
+      condition.__consecutiveStopMatches += 1;
+      if (condition.__consecutiveStopMatches >= tolerance) return true;
+    } else {
+      condition.__consecutiveStopMatches = 0;
+    }
+  }
+
+  return false;
+}
+
+function resolveConsecutiveStopTolerance(condition = {}) {
+  const explicit = Number(condition.consecutive_matches || condition.consecutiveMatches);
+  if (Number.isFinite(explicit) && explicit > 0) return Math.max(1, Math.floor(explicit));
+  return DEFAULT_CONSECUTIVE_STOP_MATCHES;
 }
 
 export function compareCrawlValues(left, operator = '<', right) {
@@ -64,9 +86,11 @@ export function compareCrawlValues(left, operator = '<', right) {
 
 export function toComparableValue(value) {
   const text = String(value).trim();
-  const dateText = text.includes('/') && !text.includes('-')
-    ? text.split('/').reverse().join('-')
-    : text;
+  const normalizedDate = normalizeFacebookCrawlDateInput(text);
+  const dateText = normalizedDate
+    || (text.includes('/') && !text.includes('-')
+      ? text.split('/').reverse().join('-')
+      : text);
   const timestamp = Date.parse(dateText);
   if (!Number.isNaN(timestamp) && /^\d{4}-\d{2}-\d{2}/.test(dateText)) {
     return timestamp;

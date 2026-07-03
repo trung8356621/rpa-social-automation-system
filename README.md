@@ -6,18 +6,50 @@ The app ships in two **build roles**: **master** (full studio + data management)
 
 ---
 
+## Architecture Rules
+
+These invariants are global. Do not violate them when changing Facebook or adding
+new social platforms.
+
+- **Single Post is isolated JSON-only:** Crawl Single Post is allowed only as a
+  separate Force GraphQL Fetch flow for one direct post URL. It must not reuse
+  Group feed scrolling to find old posts.
+- **No DOM data scraping:** Social data must not be extracted from HTML UI
+  elements. Do not use `querySelector`, accessibility trees, visible text, or
+  platform UI classes to scrape post content, authors, dates, stats, comments,
+  or media. `page.evaluate` is allowed only for reading runtime tokens and
+  calling JSON endpoints such as `/api/graphql/`.
+- **Facebook Crawl Group stays separate:** Facebook Data Studio keeps Crawl
+  Group optimized for public and private groups, and Crawl Single Post must not
+  change Group feed behavior.
+- **Network-only extraction:** Facebook posts, comments, media, and interaction
+  stats must come from GraphQL network interception or Single Post Force
+  GraphQL Fetch JSON, then `parseFacebookGraphQLBatch`.
+- **Centralized random delay:** Browser-like actions must not use fixed
+  hardcoded delays. Click, type, scroll, and settle waits must go through
+  `randomDelay(baseMs, minMs, maxMs)`.
+- **Delay formula:** `randomDelay` must multiply `baseMs` by a random floating
+  factor in `[0.75, 1.4]`, then clamp to `[minMs, maxMs]`.
+- **Typing delay:** `page.keyboard.type` per-character delay must use
+  `randomDelay` with a base between `50ms` and `100ms`.
+- **Scroll delay:** `betweenScrollMs` and `settleMs` in `infinity_scroll` loops
+  must call `randomDelay` on every loop to create non-linear timing.
+- **LinkedIn extension rule:** LinkedIn modules must use network interception
+  against `/voyager/api/...` REST endpoints with URN mapping. Do not build
+  LinkedIn DOM scrapers; reuse centralized random delay.
+
 ## Current Status
 
 - **Master / Slave builds** via `VITE_APP_ROLE` (`master` | `slave`). Slave hides Global Header and Facebook Data; master has full studio.
 - **Global Header** (master only): view switcher (Scenarios / Facebook Data) + quick language toggle synced with Settings (`app.language`).
 - **Facebook Data Studio** (master only): full-width UI to browse `facebook_crawled_data.db` — filter by group, posts/comments tabs, CSV export.
-- **Facebook Data settings** (master only): bind crawl scenarios for group posts and comments; system variable profiles auto-seeded.
+- **Facebook Data settings** (master only): bind the group crawl scenario; system variable profile auto-seeded.
 - **Request catching scenarios** (`scenario_type = request_catching`): intercept Facebook GraphQL API responses while browsing; offline dump analysis; final JSON result preview.
-- **Facebook GraphQL parser** (`src/shared/parseFacebookGraphQL.js`): normalizes posts/comments from raw GraphQL payloads; enriches missing `post_id` / `group_id` / `post_link` from scenario variables or target URL before DB save.
+- **Facebook GraphQL parser** (`src/shared/parseFacebookGraphQL.js`): normalizes posts/comments from raw GraphQL payloads; enriches group metadata from scenario variables before DB save.
 - Scenario list supports grouped display by the first name token (`WP login` → `WP`, `omi_channel` → `omi`).
 - Scenarios can be pinned; pin state persists in SQLite (`scenarios.is_pinned`).
 - **Crawl scenarios** (`scenario_type = crawl`): embedded browser, Design mode, crawl widgets, live sample preview.
-- **Crawl execution** via `ExecutorService` with autoscroll / infinite scroll (modal-aware scroll for Facebook post dialogs).
+- **Crawl execution** via `ExecutorService` with autoscroll / infinite scroll for group feeds.
 - **Scenario variables** (`local_variables`) and data profiles with `{{variable}}` template resolution in target URLs and scroll stop conditions.
 - **Tasks** page: visual flow builder (prepare / crawl / action nodes).
 - Renderer builds verified: `npm run build:renderer`, `npm run build:renderer:slave`.
@@ -113,36 +145,48 @@ Master-only, full-width page (no embedded browser).
 
 **Service:** `src/main/database/PlatformCrawledDataService.js` (master only).
 
-Posts without `post_id` are skipped on save. Request-catching runs enrich parsed results from scenario variables so comment-only GraphQL payloads still persist correctly.
+Posts without `post_id` are skipped on save. Request-catching runs enrich parsed
+results with group metadata from scenario variables.
+
+**Facebook crawl invariants:**
+
+- Crawl Single Post is supported only as an isolated JSON-only Force GraphQL
+  Fetch flow. It must have its own post-link modal and must not scroll a group
+  feed to locate the target post.
+- Facebook Crawl Group remains group-only: navigate by runtime `group_id` to
+  `https://www.facebook.com/groups/{group_id}/`.
+- Post content, author, date, interaction stats, comments, and media must come
+  from intercepted GraphQL network payloads or Single Post Force GraphQL Fetch
+  JSON parsed by `parseFacebookGraphQLBatch`.
+- DOM element scraping is forbidden for Facebook data extraction. Do not use
+  `querySelector`, accessibility trees, or visible UI text to create or patch
+  post/comment data. `page.evaluate` may read runtime tokens and call GraphQL
+  JSON endpoints, but must not read post/comment text from HTML.
+- Comment-only payloads such as `display_comments` must not create new `posts`
+  rows.
+- Post/comment media must be downloaded into `facebook_media/` whenever Facebook
+  returns a downloadable image or video URL. Preserve local paths in
+  `post_images` / `comment_images`.
 
 ## Facebook Crawl Settings
 
-Accessible from **Facebook Data → Settings** (master only, via `FacebookSidebar`).
+Accessible from **Facebook Data -> Settings** (master only, via `FacebookSidebar`).
 
 | Setting | Purpose |
 |---------|---------|
 | Group crawl scenario | `crawl` or `request_catching` scenario for scanning group feed posts |
-| Comment crawl scenario | `crawl` or `request_catching` scenario for scanning comments on a single post |
 
 Settings keys (in main app `settings` table):
 
 - `facebook.crawlGroupScenarioId`
-- `facebook.crawlCommentScenarioId`
 
-On save, the app binds each scenario to a **system variable profile** (cannot be deleted):
+On save, the app binds the scenario to a **system variable profile** (cannot be deleted):
 
 | Profile | Variables | Use |
 |---------|-----------|-----|
 | `__system:facebook-crawl-group` | `group_id`, `last_date` | Group feed crawl; `last_date` for infinite-scroll stop |
-| `__system:facebook-crawl-comment` | `group_id`, `post_id` | Comment crawl; `post_id` from post link or variable |
 
-Helpers: `src/shared/facebookCrawlConfig.js` (`parseFacebookPostLink`, `buildFacebookPostLink`, `enrichFacebookCrawlPosts`, …).
-
-**Typical comment crawl target URL:**
-
-```text
-https://www.facebook.com/groups/{{group_id}}/posts/{{post_id}}/
-```
+Helpers: `src/shared/facebookCrawlConfig.js` (`parseFacebookGroupLink`, `buildFacebookGroupUrl`, `enrichFacebookCrawlPosts`, ...).
 
 Variables are resolved in preview, execution, and final result enrichment.
 
@@ -152,11 +196,11 @@ Fourth scenario type: `request_catching` (alongside `prepare`, `crawl`, `action`
 
 **Workflow:**
 
-1. Set platform (Facebook) and target URL with `{{variables}}`.
-2. Define **Scenario variables** (`local_variables`) — e.g. `group_id`, `post_id`.
-3. Browse in embedded browser; the app intercepts matching GraphQL network responses.
+1. Set platform (Facebook) and a group target URL with `{{variables}}`.
+2. Define **Scenario variables** (`local_variables`) such as `group_id` and `last_date`.
+3. Browse the group feed; the app intercepts matching GraphQL network responses.
 4. Configure request filters in scenario meta (`scenario_meta.request_catching.filters`).
-5. Preview **Final result** — parsed posts/comments JSON.
+5. Preview **Final result** as parsed posts/comments JSON.
 6. Optional: save session dump for offline analysis (`debug_dumps/`).
 7. On execution, `ExecutorService` captures live via Puppeteer CDP and saves to platform DB (master).
 
@@ -168,16 +212,18 @@ Fourth scenario type: `request_catching` (alongside `prepare`, `crawl`, `action`
 | `src/main/rpa/RequestCatchingPuppeteerCapture.js` | CDP capture during execution |
 | `src/main/browser/ScenarioEmbeddedBrowserService.js` | Embedded preview + listen-only capture |
 | `src/shared/parseFacebookGraphQL.js` | Parse + enrich GraphQL batches |
-| `src/shared/crawlScroll.js` | Modal-aware autoscroll (Facebook post dialogs) |
+| `src/shared/crawlScroll.js` | Autoscroll / infinite-scroll helpers |
 
-**Result enrichment:** when GraphQL returns orphan comments without a post node, `enrichFacebookCrawlPosts()` fills `post_id`, `group_id`, and `post_link` from scenario variables or the resolved target URL so database writes stay consistent.
+**Result enrichment:** `enrichFacebookCrawlPosts()` may fill missing `group_id`
+and `post_link` from scenario variables. It must not invent a post from
+comment-only GraphQL.
 
 ## Features
 
 - **Dual build:** master studio vs slave execution agent.
 - **Global Header:** bilingual quick switch + Scenarios / Facebook Data views (master).
 - **Facebook Data Studio:** browse, filter, drill into comments, export CSV.
-- **Facebook crawl settings:** scenario bindings + system variable profiles.
+- **Facebook crawl settings:** group scenario binding + system variable profile.
 - **Request catching:** intercept API responses, parse GraphQL, preview and persist structured data.
 - Browser profiles and session persistence per app profile.
 - Scenario studio: record, edit timeline, preview, replay Puppeteer steps.
@@ -280,7 +326,7 @@ When adding IPC: service → `main.js` handler → preload → renderer. Guard m
 - UUID v4 text IDs, `is_dirty` for future sync.
 - JSON fields stored as strings (`target_anchor`, `flow_data`, `scenario_meta`, …).
 - Tasks in `tasks` table; crawl widgets in `scenario_steps`.
-- System Facebook variable profiles seeded on startup (`is_system = 1`, protected from delete).
+- System Facebook group variable profile seeded on startup (`is_system = 1`, protected from delete).
 
 **Platform crawled DB** (`PlatformCrawledDataService`, master only):
 
@@ -294,71 +340,21 @@ Project skill for AI assistants working on layout and role split:
 
 `.cursor/skills/master-slave-layout/SKILL.md`
 
-Use when changing Global Header, App layout, `VITE_APP_ROLE`, Facebook Data Studio, Facebook crawl settings, or platform crawled-data IPC.
+Use `.cursor/skills/facebook-crawl-data/SKILL.md` when changing Facebook crawl,
+network parsing, media download, or platform crawled-data persistence.
 
 ---
 
-## Tiếng Việt
+## Vietnamese Notes
 
-Ứng dụng RPA local-first (Electron + React + SQLite) hỗ trợ hai bản cài: **máy chính (master)** và **máy phụ (slave)**.
+The Vietnamese UI remains supported. Technical architecture rules are defined in
+English in **Architecture Rules** and are authoritative for future AI-assisted
+changes.
 
-### Vai trò bản cài
-
-| | Máy chính | Máy phụ |
-|---|-----------|---------|
-| Mục đích | Thiết kế kịch bản, xem dữ liệu, báo cáo | Chỉ chạy kịch bản, tiết kiệm RAM |
-| Global Header | Có (đổi view + ngôn ngữ) | Ẩn hoàn toàn |
-| Facebook Data Studio | Có | Khóa |
-| Sidebar | Đầy đủ / Facebook sidebar | Kịch bản, Thực thi, Browser, Cài đặt |
-| SQLite dữ liệu cào | Đọc/ghi | Không khởi tạo service |
-
-Cấu hình: `VITE_APP_ROLE=master` hoặc `slave` trong `.env`.  
-Chạy: `npm run dev` (master) hoặc `npm run dev:slave` (máy phụ).
-
-### Facebook Data Studio (máy chính)
-
-- Full-width, không nhúng browser.
-- Lọc theo nền tảng (Facebook) và nhóm/hội từ bảng `groups`.
-- Tab **Bài viết** và **Bình luận** — click một bài để xem comment tương ứng.
-- Nút **Export Excel / CSV** xuất tab đang hiển thị.
-
-File dữ liệu: `userData/data/facebook_crawled_data.db`.
-
-### Cài đặt crawl Facebook
-
-Trong view **Facebook Data → Cài đặt**:
-
-- Chọn kịch bản **crawl nhóm** (quét bài viết trong nhóm).
-- Chọn kịch bản **crawl comment** (quét bình luận theo bài).
-
-Hai **profile biến hệ thống** được tạo sẵn, không xóa được:
-
-- Nhóm: `group_id`, `last_date`
-- Comment: `group_id`, `post_id`
-
-URL mẫu crawl comment:
-
-```text
-https://www.facebook.com/groups/{{group_id}}/posts/{{post_id}}/
-```
-
-### Kịch bản bắt request API (`request_catching`)
-
-- Duyệt Facebook trong browser nhúng; app chặn response GraphQL phù hợp.
-- Khai báo biến kịch bản (`local_variables`) — ví dụ `group_id`, `post_id`.
-- Xem **Final result** (JSON bài viết + comment đã parse).
-- Khi GraphQL chỉ trả comment mà không có node bài viết, hệ thống **tự gán `post_id` / `group_id` từ biến kịch bản** trước khi lưu DB.
-- Hỗ trợ autoscroll trong modal bài viết Facebook.
-
-### Ghi chú kỹ thuật
-
-- Renderer chỉ gọi `window.electronAPI`.
-- Logic role: `src/shared/appRole.js`.
-- Main import role: `src/main/appRoleConfig.js` → `../shared/appRole.js` (không dùng `../../shared/`).
-- Parse Facebook: `src/shared/parseFacebookGraphQL.js`, `src/shared/facebookCrawlConfig.js`.
-- Thêm IPC: cập nhật `main.js`, `preload.cjs`, và i18n (`vi.js` + `en.js`).
-- Skill cho Cursor: `.cursor/skills/master-slave-layout/SKILL.md`.
+- Facebook Crawl Group and Crawl Single Post are separate flows.
+- Single Post crawl must be JSON-only Force GraphQL Fetch; DOM element scraping
+  remains forbidden.
+- Social crawlers must use network interception plus centralized random delay.
 
 ## License
-
 See repository owner for license terms.
