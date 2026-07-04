@@ -991,15 +991,15 @@ class ExecutorService {
       await this._navigateToScenarioStart(scenario, targetUrl);
       await this._sleep(1500);
       if (isSinglePostCrawl) {
-        const forcedItems = await forceFetchFacebookSinglePostGraphQL(this.page, {
+        const initialStateItems = await extractFacebookInitialStateJson(this.page, {
           targetUrl,
           variables: map,
         });
-        if (forcedItems.length) {
-          const annotatedItems = annotateFacebookGraphQLRawObjects(forcedItems, {
-            url: 'https://www.facebook.com/api/graphql/',
-            friendlyName: 'CometModernPostForceFetch',
-            source: 'force_graphql_fetch',
+        if (initialStateItems.length) {
+          const annotatedItems = annotateFacebookGraphQLRawObjects(initialStateItems, {
+            url: targetUrl,
+            friendlyName: 'FacebookInitialStateJson',
+            source: 'initial_state_json',
           });
           const merged = mergeRequestCatchingRawObjects(rawCaptured, annotatedItems);
           rawCaptured.length = 0;
@@ -1008,14 +1008,14 @@ class ExecutorService {
 
           if (CrawlRequestDumpService.isEnabled() && this._crawlDumpFolderId) {
             void CrawlRequestDumpService.appendCapture(this._crawlDumpFolderId, annotatedItems, {
-              url: 'https://www.facebook.com/api/graphql/',
-              friendlyName: 'CometModernPostForceFetch',
-              source: 'force_graphql_fetch',
+              url: targetUrl,
+              friendlyName: 'FacebookInitialStateJson',
+              source: 'initial_state_json',
             });
           }
-          console.log(`[Executor] Force GraphQL single post fetch captured ${forcedItems.length} object(s)`);
+          console.log(`[Executor] Initial state JSON captured ${initialStateItems.length} object(s)`);
         } else {
-          console.warn('[Executor] Force GraphQL single post fetch did not return usable JSON');
+          console.warn('[Executor] Initial state JSON did not contain usable post JSON');
         }
       }
       await this._runRequestCatchingScroll(
@@ -1083,7 +1083,7 @@ class ExecutorService {
         && post._feedback_only !== true
       ));
       if (!hasTargetPost) {
-        throw new Error('Force GraphQL single post fetch did not capture the target post JSON.');
+        throw new Error('Initial state JSON did not capture the target post JSON.');
       }
     }
 
@@ -1216,9 +1216,8 @@ class ExecutorService {
       const batchSize = Math.min(loop.scrollsPerBatch, remainingScrolls);
       if (batchSize <= 0) break;
 
-      console.log(`[Executor] Scroll batch ${batchIndex + 1}/${loop.maxBatches} (${batchSize} scrolls)`);
-
       let nextState = previousState;
+      let movedInBatch = 0;
       for (let scrollIndex = 0; scrollIndex < batchSize; scrollIndex += 1) {
         if (shouldStop()) break;
 
@@ -1242,6 +1241,9 @@ class ExecutorService {
           scrollContext,
         );
         totalScrolls += 1;
+        const moved = !await this.page.evaluate(isCrawlScrollStuck, previousState, nextState);
+        if (moved) movedInBatch += 1;
+        previousState = nextState;
 
         if (scrollIndex < batchSize - 1) {
           await this._sleep(loop.betweenScrollMs);
@@ -1250,6 +1252,11 @@ class ExecutorService {
 
       if (urlGuardStopped) break;
       if (shouldStop()) break;
+
+      console.log(
+        `[Executor] Scroll batch ${batchIndex + 1}/${loop.maxBatches}: moved ${movedInBatch}/${batchSize}`
+        + ` (${scrollContext}, top ${Math.round(Number(nextState?.scrollTop) || 0)})`,
+      );
 
       await this._waitForScrollBatchSettle(loop.settleMs);
 
@@ -2092,168 +2099,229 @@ function normalizeScenarioResultType(value) {
   return SCENARIO_RESULT_TYPES.has(normalized) ? normalized : 'simple';
 }
 
-async function forceFetchFacebookSinglePostGraphQL(page, options = {}) {
-  if (!page || page.isClosed()) return [];
+function decodeHtmlScriptJson(text = '') {
+  return String(text || '')
+    .replace(/&quot;/g, '"')
+    .replace(/&#34;/g, '"')
+    .replace(/&#x22;/gi, '"')
+    .replace(/&#039;/g, "'")
+    .replace(/&#x27;/gi, "'")
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>');
+}
 
-  const parsedUrl = parseFacebookPostLink(options.targetUrl || '');
-  const postId = String(options.variables?.get?.('post_id') || parsedUrl.post_id || '').trim();
-  const groupId = String(options.variables?.get?.('group_id') || parsedUrl.group_id || '').trim();
-  if (!postId) return [];
+function hasFacebookPostStateNode(value, depth = 0) {
+  if (!value || typeof value !== 'object' || depth > 28) return false;
+
+  if (Array.isArray(value)) {
+    return value.some((item) => hasFacebookPostStateNode(item, depth + 1));
+  }
+
+  const typename = String(value.__typename || value.__isNode || value.__isStory || '');
+  if (/^(Story|GroupPostStory)$|Story$/i.test(typename)) return true;
+  if (/CometModernPost|CometSinglePost|CometPermalink/i.test(typename)) return true;
+  if (value.story && typeof value.story === 'object' && hasFacebookPostStateNode(value.story, depth + 1)) {
+    return true;
+  }
+  if (value.comet_sections && typeof value.comet_sections === 'object' && (
+    Array.isArray(value.actors)
+    || value.feedback
+    || value.creation_time
+    || value.post_id
+    || value.id
+  )) {
+    return true;
+  }
+
+  for (const [key, child] of Object.entries(value)) {
+    if (/CometModernPost|CometSinglePost|CometPermalink/i.test(key)) return true;
+    if (!child || typeof child !== 'object') continue;
+    if (hasFacebookPostStateNode(child, depth + 1)) return true;
+  }
+  return false;
+}
+
+function isFacebookUnavailableContentHtml(html = '') {
+  const text = decodeHtmlScriptJson(html).replace(/\s+/g, ' ');
+  return [
+    /B[aạ]n hi[eệ]n kh[oô]ng xem [đd][uư][oợ]c n[oộ]i dung n[aà]y/i,
+    /This content isn['’]t available right now/i,
+    /L[oỗ]i n[aà]y th[uư][oờ]ng do ch[uủ] s[oở] h[uữ]u/i,
+    /content isn't available/i,
+  ].some((pattern) => pattern.test(text));
+}
+
+function resolveFacebookTargetPostId(options = {}, currentUrl = '') {
+  const fromVariables = String(options.variables?.get?.('post_id') || '').trim();
+  if (fromVariables) return fromVariables;
+
+  const fromTargetUrl = parseFacebookPostLink(options.targetUrl || '').post_id;
+  if (fromTargetUrl) return String(fromTargetUrl).trim();
+
+  return String(parseFacebookPostLink(currentUrl || '').post_id || '').trim();
+}
+
+function candidateContainsTargetPostId(candidate, targetPostId = '', rawText = '') {
+  const id = String(targetPostId || '').trim();
+  if (!id) return false;
+  if (String(rawText || '').includes(id)) return true;
 
   try {
-    const result = await page.evaluate(async ({ targetPostId, targetGroupId, targetUrl }) => {
-      const pickToken = (...values) => values
-        .map((value) => (typeof value === 'string' ? value.trim() : ''))
-        .find(Boolean) || '';
-      const readRequireModule = (name) => {
-        try {
-          if (typeof require !== 'function') return null;
-          return require(name);
-        } catch {
-          return null;
-        }
-      };
-      const readCookie = (name) => {
-        const match = document.cookie.match(new RegExp(`(?:^|; )${name}=([^;]*)`));
-        return match ? decodeURIComponent(match[1]) : '';
-      };
-      const readDocIdCandidates = () => {
-        const names = [
-          'CometModernPostFeedQuery.graphql',
-          'CometModernPostQuery.graphql',
-          'CometSinglePostContentQuery.graphql',
-          'CometPermalinkRootQuery.graphql',
-          'CometUFICommentsProviderQuery.graphql',
-        ];
-        const ids = [];
-        names.forEach((name) => {
-          const mod = readRequireModule(name);
-          const id = mod?.params?.id || mod?.params?.metadata?.relayPreloadable?.concreteRequestID || mod?.id;
-          if (id && !ids.includes(String(id))) ids.push(String(id));
-        });
-        return ids;
-      };
-      const dtsgModule = readRequireModule('DTSGInitialData');
-      const lsdModule = readRequireModule('LSD');
-      const currentUserModule = readRequireModule('CurrentUserInitialData');
-      const siteDataModule = readRequireModule('SiteData');
-      const spin = window.__spin_r || siteDataModule?.__spin_r || '';
-      const userId = pickToken(
-        window.__user,
-        currentUserModule?.USER_ID,
-        readCookie('c_user'),
-      );
-      const fbDtsg = pickToken(
-        window.fb_dtsg,
-        dtsgModule?.token,
-      );
-      const lsd = pickToken(
-        lsdModule?.token,
-      );
-      const variablesList = [
-        {
-          feedbackSource: 2,
-          feedLocation: 'PERMALINK',
-          focusCommentID: null,
-          privacySelectorRenderLocation: 'COMET_STREAM',
-          renderLocation: 'permalink',
-          scale: window.devicePixelRatio || 1,
-          storyID: targetPostId,
-          useDefaultActor: false,
-          id: targetPostId,
-        },
-        {
-          UFI2CommentsProvider_commentsKey: 'CometModernPostFeedQuery',
-          displayCommentsContextEnableComment: null,
-          displayCommentsContextIsAdPreview: null,
-          displayCommentsContextIsAggregatedShare: null,
-          displayCommentsContextIsStorySet: null,
-          displayCommentsFeedbackContext: null,
-          feedLocation: 'PERMALINK',
-          feedbackSource: 2,
-          focusCommentID: null,
-          scale: window.devicePixelRatio || 1,
-          storyID: targetPostId,
-          id: targetPostId,
-        },
-      ];
-      const docIds = readDocIdCandidates();
-      const friendlyNames = [
-        'CometModernPostFeedQuery',
-        'CometModernPostQuery',
-        'CometSinglePostContentQuery',
-        'CometPermalinkRootQuery',
-      ];
-      const responses = [];
+    return JSON.stringify(candidate).includes(id);
+  } catch {
+    return false;
+  }
+}
 
-      for (const variables of variablesList) {
-        for (const friendlyName of friendlyNames) {
-          const docIdCandidates = docIds.length ? docIds : [''];
-          for (const docId of docIdCandidates) {
-            const body = new URLSearchParams();
-            if (userId) {
-              body.set('__user', userId);
-              body.set('av', userId);
-            }
-            body.set('__a', '1');
-            body.set('__req', 'forcepost');
-            if (spin) body.set('__rev', String(spin));
-            if (fbDtsg) body.set('fb_dtsg', fbDtsg);
-            if (lsd) body.set('lsd', lsd);
-            body.set('fb_api_caller_class', 'RelayModern');
-            body.set('fb_api_req_friendly_name', friendlyName);
-            body.set('variables', JSON.stringify(variables));
-            if (docId) body.set('doc_id', docId);
+function pushFacebookInitialStateCandidate(items, seen, candidate, meta = {}) {
+  if (!candidate || typeof candidate !== 'object') return;
+  if (!candidateContainsTargetPostId(candidate, meta.targetPostId, meta.rawText)) return;
+  if (!hasFacebookPostStateNode(candidate)) return;
 
-            try {
-              const response = await fetch('/api/graphql/', {
-                method: 'POST',
-                credentials: 'include',
-                headers: {
-                  'content-type': 'application/x-www-form-urlencoded',
-                  ...(lsd ? { 'x-fb-lsd': lsd } : {}),
-                },
-                body,
-              });
-              const text = await response.text();
-              const chunks = text
-                .split(/\n+/)
-                .map((line) => line.trim())
-                .filter(Boolean)
-                .map((line) => {
-                  try { return JSON.parse(line); } catch { return null; }
-                })
-                .filter(Boolean);
-              chunks.forEach((chunk) => {
-                responses.push({
-                  ...chunk,
-                  __request: {
-                    friendlyName,
-                    docId,
-                    source: 'force_graphql_fetch',
-                    targetPostId,
-                    targetGroupId,
-                    targetUrl,
-                  },
-                });
-              });
-            } catch {
-              // Try next query shape.
-            }
-          }
-        }
+  try {
+    const key = JSON.stringify(candidate);
+    if (seen.has(key)) return;
+    seen.add(key);
+  } catch {
+    // If a large object cannot be stringified, still let the parser try it once.
+  }
+
+  const item = Array.isArray(candidate) ? [...candidate] : { ...candidate };
+  item.__request = {
+    friendlyName: 'FacebookInitialStateJson',
+    source: 'initial_state_json',
+    targetUrl: meta.targetUrl || '',
+    targetPostId: meta.targetPostId || '',
+    targetGroupId: meta.targetGroupId || '',
+  };
+  items.push(item);
+}
+
+function extractBalancedJsonStrings(source = '', maxCandidates = 80) {
+  const text = String(source || '');
+  const candidates = [];
+  const stack = [];
+  let start = -1;
+  let quote = '';
+  let escaped = false;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === quote) {
+        quote = '';
       }
+      continue;
+    }
 
-      return responses;
-    }, {
-      targetPostId: postId,
-      targetGroupId: groupId,
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+
+    if (char === '{' || char === '[') {
+      if (!stack.length) start = index;
+      stack.push(char);
+      continue;
+    }
+
+    if (char !== '}' && char !== ']') continue;
+    if (!stack.length) continue;
+
+    const open = stack[stack.length - 1];
+    if ((open === '{' && char !== '}') || (open === '[' && char !== ']')) {
+      stack.length = 0;
+      start = -1;
+      continue;
+    }
+
+    stack.pop();
+    if (!stack.length && start >= 0) {
+      candidates.push(text.slice(start, index + 1));
+      if (candidates.length >= maxCandidates) break;
+      start = -1;
+    }
+  }
+
+  return candidates;
+}
+
+function tryParseFacebookJsonCandidate(text) {
+  try {
+    return JSON.parse(decodeHtmlScriptJson(text).trim());
+  } catch {
+    return null;
+  }
+}
+
+async function extractFacebookInitialStateJson(page, options = {}) {
+  if (!page || page.isClosed()) {
+    return [];
+  }
+
+  try {
+    const html = await page.content();
+    if (isFacebookUnavailableContentHtml(html)) {
+      console.error('[Executor] Bài viết không tồn tại hoặc bị giới hạn quyền');
+      throw new Error('Bài viết không tồn tại hoặc bị giới hạn quyền');
+    }
+
+    const items = [];
+    const seen = new Set();
+    const currentUrl = page && !page.isClosed() ? page.url() : '';
+    const targetPostId = resolveFacebookTargetPostId(options, currentUrl);
+    const meta = {
       targetUrl: options.targetUrl || '',
-    });
+      targetPostId,
+      targetGroupId: String(options.variables?.get?.('group_id') || parseFacebookPostLink(options.targetUrl || '').group_id || '').trim(),
+    };
 
-    return Array.isArray(result) ? result : [];
+    if (!targetPostId) {
+      console.warn('[Executor] Initial state JSON skipped because target_post_id is missing');
+      return [];
+    }
+
+    const jsonScriptPattern = /<script\b(?=[^>]*\btype=["']application\/json["'])(?=[^>]*\bdata-sjs\b)[^>]*>([\s\S]*?)<\/script>/gi;
+    for (const match of html.matchAll(jsonScriptPattern)) {
+      try {
+        const rawText = match?.[1] || '';
+        if (!candidateContainsTargetPostId(null, targetPostId, rawText)) continue;
+        const parsed = tryParseFacebookJsonCandidate(rawText);
+        pushFacebookInitialStateCandidate(items, seen, parsed, { ...meta, rawText });
+      } catch (error) {
+        console.warn('[Executor] Initial state JSON script parse skipped:', error?.message || error);
+      }
+    }
+
+    const relayScriptPattern = /<script\b[^>]*>([\s\S]*?requireLazy\(\s*\[\s*["']RelayModern["'][\s\S]*?)<\/script>/gi;
+    for (const match of html.matchAll(relayScriptPattern)) {
+      const scriptText = match?.[1] || '';
+      if (!/CometModernPost|CometSinglePost|CometPermalink|__typename["']?\s*:\s*["'](?:\w*Story|Story)["']/i.test(scriptText)) {
+        continue;
+      }
+      try {
+        extractBalancedJsonStrings(scriptText).forEach((candidateText) => {
+          if (!candidateContainsTargetPostId(null, targetPostId, candidateText)) return;
+          const parsed = tryParseFacebookJsonCandidate(candidateText);
+          pushFacebookInitialStateCandidate(items, seen, parsed, { ...meta, rawText: candidateText });
+        });
+      } catch (error) {
+        console.warn('[Executor] RelayModern initial state parse skipped:', error?.message || error);
+      }
+    }
+
+    return items;
   } catch (error) {
-    console.warn('[Executor] Force GraphQL single post fetch failed:', error?.message || error);
+    if (error?.message === 'Bài viết không tồn tại hoặc bị giới hạn quyền') {
+      throw error;
+    }
+    console.warn('[Executor] Initial state JSON extraction failed:', error?.message || error);
     return [];
   }
 }

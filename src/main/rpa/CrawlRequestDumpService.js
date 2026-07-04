@@ -8,6 +8,7 @@ const ROOT_DIR = 'crawl';
 const CAPTURES_DIR = 'captures';
 const SESSION_FILE = 'session.json';
 const META_FILE = 'meta.json';
+const FORCE_GRAPHQL_FILE = 'force_graphql_fetch.json';
 
 export class CrawlRequestDumpService {
   static isEnabled() {
@@ -83,6 +84,19 @@ export class CrawlRequestDumpService {
 
     await fsp.writeFile(path.join(capturesDir, fileName), JSON.stringify(payload, null, 2), 'utf8');
     return path.join(capturesDir, fileName);
+  }
+
+  static async saveForceGraphQLFetch(folderId, debug = {}) {
+    if (!this.isEnabled() || !folderId) return null;
+
+    const dir = await this.ensureDumpDir(folderId);
+    const payload = {
+      capturedAt: new Date().toISOString(),
+      ...debug,
+    };
+    const filePath = path.join(dir, FORCE_GRAPHQL_FILE);
+    await fsp.writeFile(filePath, JSON.stringify(payload, null, 2), 'utf8');
+    return filePath;
   }
 
   static mergeRawObjects(previous = [], incoming = []) {
