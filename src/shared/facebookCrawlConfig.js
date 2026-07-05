@@ -6,7 +6,7 @@ export const FACEBOOK_CRAWL_GROUP_PROFILE_ID = 'c7f8a901-2b3c-4d5e-8f67-00000000
 
 export const FACEBOOK_CRAWL_GROUP_PROFILE_NAME = '__system:facebook-crawl-group';
 
-export const FACEBOOK_CRAWL_GROUP_VARIABLES = ['group_id', 'last_date'];
+export const FACEBOOK_CRAWL_GROUP_VARIABLES = ['group_id', 'post_limit'];
 
 export const FACEBOOK_CRAWL_SETTINGS = {
   groupScenarioId: 'facebook.crawlGroupScenarioId',
@@ -171,13 +171,19 @@ export function parseFacebookPostLink(url = '') {
 
 /**
  * Build variable entries for a Facebook group crawl run.
- * @param {{ groupId?: string, lastDate?: string }} params
+ * @param {{ groupId?: string, postLimit?: string|number }} params
  */
-export function buildFacebookGroupCrawlVariables({ groupId = '', lastDate = '' } = {}) {
+export function buildFacebookGroupCrawlVariables({ groupId = '', postLimit = '' } = {}) {
   return [
     { key: 'group_id', value: String(groupId || '').trim() },
-    { key: 'last_date', value: String(lastDate || '').trim() },
+    { key: 'post_limit', value: normalizeFacebookPostLimit(postLimit) },
   ];
+}
+
+export function normalizeFacebookPostLimit(value = '') {
+  const limit = Number(String(value ?? '').replace(/,/g, '').trim());
+  if (!Number.isFinite(limit) || limit <= 0) return '';
+  return String(Math.floor(limit));
 }
 
 export function buildFacebookSinglePostCrawlVariables({ postLink = '', groupId = '', postId = '' } = {}) {

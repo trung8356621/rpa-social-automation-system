@@ -8,20 +8,17 @@ import { fetchSettings } from '../slices/settingsSlice';
 import { startLocalCampaign } from '../slices/executionSlice';
 import { parseFacebookMediaUrls } from '../../shared/facebookMediaExtract.js';
 import {
+  buildFacebookGroupUrl,
   buildFacebookGroupCrawlVariables,
   buildFacebookSinglePostCrawlVariables,
   FACEBOOK_CRAWL_GROUP_PROFILE_ID,
   FACEBOOK_CRAWL_SETTINGS,
+  normalizeFacebookPostLimit,
   parseFacebookGroupLink,
   parseFacebookPostLink,
   readFacebookCrawlLaunchOptions,
   readVariableSampleValue,
 } from '../../shared/facebookCrawlConfig.js';
-import {
-  normalizeFacebookCrawlDateInput,
-  toFacebookCrawlDateDisplay,
-} from '../../shared/facebookDateFormat.js';
-import FacebookDatePicker from '../components/FacebookDatePicker.jsx';
 
 const THUMB_CLASS = 'h-12 w-12 shrink-0 rounded border border-[#2e3b4e] object-cover bg-[#151f2d]';
 const MAX_VISIBLE_THUMBS = 4;
@@ -352,10 +349,10 @@ function iconActionButtonClassName() {
 function CrawlGroupModal({
   open,
   groupLink,
-  dateLock,
+  postLimit,
   crawling,
   onGroupLinkChange,
-  onDateLockChange,
+  onPostLimitChange,
   onClose,
   onSubmit,
   t,
@@ -417,14 +414,19 @@ function CrawlGroupModal({
           </label>
 
           <label className="block">
-            <span className="mb-1 block text-sm text-[#c7d2e0]">{t('facebookData.studio.crawlDateLock')}</span>
-            <FacebookDatePicker
-              value={dateLock}
-              onChange={onDateLockChange}
+            <span className="mb-1 block text-sm text-[#c7d2e0]">{t('facebookData.studio.crawlPostLimit')}</span>
+            <input
+              type="number"
+              min="1"
+              step="1"
+              inputMode="numeric"
+              value={postLimit}
+              onChange={(event) => onPostLimitChange(event.target.value)}
               disabled={crawling}
-              placeholder={t('facebookData.studio.crawlDateLockPlaceholder')}
+              placeholder={t('facebookData.studio.crawlPostLimitPlaceholder')}
+              className="input-field h-10"
             />
-            <p className="mt-1 text-xs text-[#9aa7b7]">{t('facebookData.studio.crawlDateLockHint')}</p>
+            <p className="mt-1 text-xs text-[#9aa7b7]">{t('facebookData.studio.crawlPostLimitHint')}</p>
           </label>
         </div>
 
@@ -686,7 +688,7 @@ export default function FacebookDataPage() {
   const [crawlSinglePostLink, setCrawlSinglePostLink] = useState('');
   const [postSearch, setPostSearch] = useState('');
   const [commentSearch, setCommentSearch] = useState('');
-  const [crawlDateLock, setCrawlDateLock] = useState('');
+  const [crawlPostLimit, setCrawlPostLimit] = useState('');
   const [postPendingDelete, setPostPendingDelete] = useState(null);
   const [deletingPostId, setDeletingPostId] = useState('');
   const [previewImage, setPreviewImage] = useState(null);
@@ -926,19 +928,28 @@ export default function FacebookDataPage() {
   }, [dispatch, t]);
 
   const handleOpenCrawlGroupModal = useCallback(async () => {
+    const currentGroup = groups.find((group) => group.group_id === selectedGroupId);
+    const currentGroupLink = currentGroup
+      ? buildFacebookGroupUrl(currentGroup.group_id)
+      : '';
+
+    if (currentGroupLink) {
+      setCrawlGroupLink(currentGroupLink);
+    }
+
     setShowCrawlGroupModal(true);
 
-    let lastDate = crawlDateLock;
-    if (!lastDate && window.electronAPI?.getVariableProfileSamples) {
+    let postLimit = crawlPostLimit;
+    if (!postLimit && window.electronAPI?.getVariableProfileSamples) {
       try {
         const samples = await window.electronAPI.getVariableProfileSamples(FACEBOOK_CRAWL_GROUP_PROFILE_ID);
-        lastDate = toFacebookCrawlDateDisplay(readVariableSampleValue(samples, 'last_date'));
+        postLimit = normalizeFacebookPostLimit(readVariableSampleValue(samples, 'post_limit'));
       } catch {
-        lastDate = '';
+        postLimit = '';
       }
     }
-    if (lastDate) setCrawlDateLock(lastDate);
-  }, [crawlDateLock]);
+    if (postLimit) setCrawlPostLimit(postLimit);
+  }, [crawlPostLimit, groups, selectedGroupId]);
 
   const handleCloseCrawlGroupModal = useCallback(() => {
     if (crawlingGroup) return;
@@ -977,7 +988,7 @@ export default function FacebookDataPage() {
     try {
       const runtimeVariables = buildFacebookGroupCrawlVariables({
         groupId: parsed.group_id,
-        lastDate: normalizeFacebookCrawlDateInput(crawlDateLock),
+        postLimit: crawlPostLimit,
       });
       const launchOptions = readFacebookCrawlLaunchOptions(settings);
       pendingCrawlRef.current = { kind: 'group', scenarioId, postId: null, groupId: parsed.group_id };
@@ -1000,7 +1011,7 @@ export default function FacebookDataPage() {
     } finally {
       setCrawlingGroup(false);
     }
-  }, [crawlDateLock, crawlGroupLink, dispatch, settings, t]);
+  }, [crawlGroupLink, crawlPostLimit, dispatch, settings, t]);
 
   const handleCrawlSinglePost = useCallback(async () => {
     const scenarioId = String(settings[FACEBOOK_CRAWL_SETTINGS.groupScenarioId] || '').trim();
@@ -1290,6 +1301,15 @@ export default function FacebookDataPage() {
 
   const isLoading = loadingGroups || loadingPosts || loadingComments;
   const selectedGroup = groups.find((group) => group.group_id === selectedGroupId);
+  const selectedGroupLabel = selectedGroup
+    ? (selectedGroup.display_name || selectedGroup.group_name || selectedGroup.group_id)
+    : '';
+  const selectedGroupLink = selectedGroup
+    ? buildFacebookGroupUrl(selectedGroup.group_id)
+    : '';
+  const selectedGroupType = selectedGroup
+    ? normalizeGroupTypeLabel(selectedGroup.group_type)
+    : '';
 
   return (
     <div className="page-shell">
@@ -1378,7 +1398,7 @@ export default function FacebookDataPage() {
             <option value="">{t('facebookData.studio.allGroups')}</option>
             {groups.map((group) => (
               <option key={group.group_id} value={group.group_id}>
-                {group.display_name || group.group_name || group.group_id}
+                {formatGroupOptionLabel(group)}
               </option>
             ))}
           </select>
@@ -1386,10 +1406,26 @@ export default function FacebookDataPage() {
       </div>
 
       {selectedGroup && (
-        <p className="mb-3 text-xs text-[#9aa7b7]">
-          {t('facebookData.studio.filteredByGroup', {
-            name: selectedGroup.display_name || selectedGroup.group_name || selectedGroup.group_id,
-          })}
+        <p className="mb-3 flex flex-wrap items-center gap-2 text-xs text-[#9aa7b7]">
+          {t('facebookData.studio.filteredByGroup', { name: '' })}
+          <button
+            type="button"
+            onClick={() => openExternalLink(selectedGroupLink)}
+            className="inline-flex items-center gap-1 text-[#9ec5ff] underline decoration-[#4f8cff]/50 underline-offset-2 hover:text-white"
+          >
+            <span>{selectedGroupLabel}</span>
+            <ExternalLink className="h-3 w-3" aria-hidden />
+          </button>
+          {selectedGroupType && (
+            <span className={`rounded px-2 py-0.5 text-[11px] font-semibold ${
+              selectedGroupType === 'Public'
+                ? 'bg-emerald-500/15 text-emerald-300'
+                : 'bg-amber-500/15 text-amber-300'
+            }`}
+            >
+              {selectedGroupType}
+            </span>
+          )}
         </p>
       )}
 
@@ -1504,10 +1540,10 @@ export default function FacebookDataPage() {
       <CrawlGroupModal
         open={showCrawlGroupModal}
         groupLink={crawlGroupLink}
-        dateLock={crawlDateLock}
+        postLimit={crawlPostLimit}
         crawling={crawlingGroup}
         onGroupLinkChange={setCrawlGroupLink}
-        onDateLockChange={setCrawlDateLock}
+        onPostLimitChange={(value) => setCrawlPostLimit(value.replace(/[^\d]/g, ''))}
         onClose={handleCloseCrawlGroupModal}
         onSubmit={handleCrawlGroup}
         t={t}
@@ -1532,5 +1568,17 @@ export default function FacebookDataPage() {
       />
     </div>
   );
+}
+
+function normalizeGroupTypeLabel(value = '') {
+  const text = String(value || '').trim().toLowerCase();
+  if (text === 'public') return 'Public';
+  return 'Private';
+}
+
+function formatGroupOptionLabel(group = {}) {
+  const name = group.display_name || group.group_name || group.group_id || '';
+  const type = normalizeGroupTypeLabel(group.group_type);
+  return type ? `${name} - ${type}` : name;
 }
 

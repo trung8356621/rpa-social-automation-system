@@ -32,9 +32,9 @@ export class CrawlRequestDumpService {
       || map?.get('group_id')
       || '',
     ).trim();
-    const lastDate = String(map?.get('last_date') || '').trim();
+    const postLimit = String(map?.get('post_limit') || '').trim();
 
-    if (groupId && lastDate) return `group_${groupId}_${lastDate}`;
+    if (groupId && postLimit) return `group_${groupId}_${postLimit}_posts`;
     if (groupId) return `group_${groupId}`;
     if (scenarioId) return `scenario_${scenarioId}`;
     return `execution_${executionId || 'draft'}`;

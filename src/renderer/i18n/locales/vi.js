@@ -64,10 +64,9 @@ export default {
       crawlSinglePostStart: 'Bat dau crawl bai le',
       crawlGroupLinkPlaceholder: 'https://www.facebook.com/groups/295931577185665/',
       crawlGroupLinkHint: 'Mục tiêu crawl — group_id: {groupId}',
-      crawlDateLock: 'Date lock',
-      crawlDateLockPlaceholder: 'dd-mm-yyyy',
-      crawlDateLockClear: 'Xóa ngày',
-      crawlDateLockHint: 'Ngày dừng infinity scroll (điều kiện post_date < last_date).',
+      crawlPostLimit: 'Số bài viết',
+      crawlPostLimitPlaceholder: 'Ví dụ: 100',
+      crawlPostLimitHint: 'Dừng crawl sau khi bắt được số bài viết duy nhất này. Để trống sẽ dùng cấu hình scroll.',
       crawlGroupStart: 'Bắt đầu crawl',
       searchPosts: 'Tìm bài viết...',
       searchComments: 'Tìm comment...',
@@ -103,7 +102,7 @@ export default {
       systemProfile: 'Hệ thống',
       variables: {
         groupId: 'Bắt buộc khi crawl Facebook. Ví dụ: https://www.facebook.com/groups/wordpressvnteam → group_id = wordpressvnteam',
-        lastDate: 'Ngày dừng infinity scroll (điều kiện post_date < last_date).',
+        postLimit: 'Số bài viết duy nhất tối đa cần bắt trước khi dừng crawl nhóm.',
       },
       toast: {
         saved: 'Đã lưu cài đặt crawl Facebook',
@@ -674,7 +673,7 @@ export default {
     actions: {
       import: 'Import',
       testOpen: 'Mở thử',
-      useForRecord: 'Dùng khi Record',
+      detectProfile: 'Dò Profile',
     },
     badge: { active: 'Đang dùng', imported: 'imported', record: 'record' },
     detail: { manual: 'Thủ công', path: 'Path' },

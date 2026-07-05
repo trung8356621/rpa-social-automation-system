@@ -205,11 +205,11 @@ export class PlatformCrawledDataService {
       }
 
       const upsertGroup = db.prepare(`
-        INSERT OR REPLACE INTO groups (group_id, group_name, group_link)
-        VALUES (?, ?, ?)
+        INSERT OR REPLACE INTO groups (group_id, group_name, group_link, group_type)
+        VALUES (?, ?, ?, ?)
       `);
       const existingGroup = db.prepare(`
-        SELECT group_id, group_name, group_link
+        SELECT group_id, group_name, group_link, group_type
         FROM groups
         WHERE group_id = ?
       `).get(normalizedGroup.group_id);
@@ -221,6 +221,10 @@ export class PlatformCrawledDataService {
       const resolvedGroupLink = normalizedGroup.group_link
         || existingGroup?.group_link
         || '';
+      const resolvedGroupType = resolveFacebookGroupTypeForSave(
+        normalizedGroup,
+        existingGroup,
+      );
       const upsertAuthor = db.prepare(`
         INSERT OR REPLACE INTO authors (author_id, author_name, author_link)
         VALUES (?, ?, ?)
@@ -271,6 +275,7 @@ export class PlatformCrawledDataService {
           normalizedGroup.group_id,
           resolvedGroupName,
           resolvedGroupLink,
+          resolvedGroupType,
         );
 
         upsertAuthor.run(
@@ -487,6 +492,7 @@ export class PlatformCrawledDataService {
             ELSE 'Group: ' || g.group_id
           END AS display_name,
           g.group_link,
+          g.group_type,
           (SELECT COUNT(*) FROM posts p WHERE p.group_id = g.group_id) AS post_count
     `;
 
@@ -691,7 +697,8 @@ export function initFacebookSchema(db) {
     CREATE TABLE IF NOT EXISTS groups (
       group_id TEXT PRIMARY KEY,
       group_name TEXT,
-      group_link TEXT
+      group_link TEXT,
+      group_type TEXT
     );
 
     CREATE TABLE IF NOT EXISTS authors (
@@ -733,6 +740,19 @@ export function initFacebookSchema(db) {
 function migrateFacebookSchema(db) {
   const postColumns = db.prepare('PRAGMA table_info(posts)').all();
   const postColumnNames = new Set(postColumns.map((col) => col.name));
+  const groupColumns = db.prepare('PRAGMA table_info(groups)').all();
+  const groupColumnNames = new Set(groupColumns.map((col) => col.name));
+
+  if (!groupColumnNames.has('group_type')) {
+    db.exec('ALTER TABLE groups ADD COLUMN group_type TEXT');
+  }
+  db.exec(`
+    UPDATE groups
+    SET group_type = 'Private'
+    WHERE group_type IS NULL
+       OR TRIM(group_type) = ''
+       OR LOWER(TRIM(group_type)) = 'unknown'
+  `);
 
   if (!postColumnNames.has('post_date')) {
     db.exec('ALTER TABLE posts ADD COLUMN post_date TEXT');
@@ -885,13 +905,14 @@ function normalizeFacebookGroupInfo(groupInfo = {}, postData = {}) {
     ? String(groupInfo.group_name)
     : '';
 
-  const resolvedLink = groupLink
+  const resolvedLink = buildFacebookGroupOnlyLink(groupId, groupLink)
     || (groupId ? `https://www.facebook.com/groups/${groupId}/` : '');
 
   return {
     group_id: groupId,
     group_name: groupName,
     group_link: resolvedLink,
+    group_type: normalizeFacebookGroupType(groupInfo.group_type),
   };
 }
 
@@ -910,6 +931,35 @@ function resolveFacebookGroupNameForSave(groupInfo = {}, postData = {}, existing
     .find((name) => isMeaningfulFacebookGroupName(name, groupInfo.group_id));
 
   return meaningful || '';
+}
+
+function resolveFacebookGroupTypeForSave(groupInfo = {}, existingGroup = null) {
+  const incomingType = normalizeFacebookGroupType(groupInfo.group_type);
+  const existingType = normalizeFacebookGroupType(existingGroup?.group_type);
+  if (incomingType) return incomingType;
+  return existingType
+    || incomingType
+    || 'Private';
+}
+
+function buildFacebookGroupOnlyLink(groupId = '', candidateLink = '') {
+  const id = String(groupId || '').trim();
+  if (!id) return '';
+
+  const link = String(candidateLink || '').trim();
+  if (link && /facebook\.com\/groups\/[^/?#]+\/?(?:[?#].*)?$/i.test(link)) {
+    return link;
+  }
+
+  return `https://www.facebook.com/groups/${id}/`;
+}
+
+function normalizeFacebookGroupType(value = '') {
+  const text = String(value || '').trim().toLowerCase();
+  if (text === 'private') return 'Private';
+  if (text === 'public') return 'Public';
+  if (text === 'unknown') return 'Private';
+  return '';
 }
 
 function isMeaningfulFacebookGroupName(name = '', groupId = '') {

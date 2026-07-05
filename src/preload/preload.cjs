@@ -136,6 +136,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getBrowserProfiles: () => ipcRenderer.invoke('db:get-browser-profiles'),
   scanBrowserProfiles: () => ipcRenderer.invoke('browser:scan-profiles'),
   openBrowserProfile: (profileId) => ipcRenderer.invoke('browser:open-profile', profileId),
+  detectBrowserProfileAccount: (profileId) => ipcRenderer.invoke('browser:detect-profile-account', profileId),
+  onBrowserProfileAccountDetected: (callback) => {
+    const handler = (_event, payload) => callback(payload);
+    ipcRenderer.on('browser:profile-account-detected', handler);
+    return () => ipcRenderer.removeListener('browser:profile-account-detected', handler);
+  },
   openAppBrowserProfile: (profile) => ipcRenderer.invoke('browser:open-app-profile', profile),
   openGuestBrowser: (options) => ipcRenderer.invoke('browser:open-session', options || {}),
   openBrowserSession: (options) => ipcRenderer.invoke('browser:open-session', options),
@@ -147,6 +153,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   createBlankBrowserProfile: (displayName) => ipcRenderer.invoke('browser:create-blank-profile', displayName),
   deleteAppBrowserProfile: (profile) => ipcRenderer.invoke('browser:delete-app-profile', profile),
   saveBrowserProfile: (profile) => ipcRenderer.invoke('db:save-browser-profile', profile),
+  updateBrowserProfileAccountSummary: (payload) => ipcRenderer.invoke('db:update-browser-profile-account-summary', payload),
   deleteBrowserProfile: (id) => ipcRenderer.invoke('db:delete-browser-profile', id),
 
   getSettings: () => ipcRenderer.invoke('settings:get'),

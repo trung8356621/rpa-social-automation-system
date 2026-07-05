@@ -64,10 +64,9 @@ export default {
       crawlGroupLink: 'Group link',
       crawlGroupLinkPlaceholder: 'https://www.facebook.com/groups/295931577185665/',
       crawlGroupLinkHint: 'Crawl target — group_id: {groupId}',
-      crawlDateLock: 'Date lock',
-      crawlDateLockPlaceholder: 'dd-mm-yyyy',
-      crawlDateLockClear: 'Clear date',
-      crawlDateLockHint: 'Stop date for infinity scroll (condition post_date < last_date).',
+      crawlPostLimit: 'Number of posts',
+      crawlPostLimitPlaceholder: 'Example: 100',
+      crawlPostLimitHint: 'Stop crawling after this many unique posts are captured. Leave empty to use scroll settings.',
       crawlGroupStart: 'Start crawl',
       searchPosts: 'Search posts...',
       searchComments: 'Search comments...',
@@ -103,7 +102,7 @@ export default {
       systemProfile: 'System',
       variables: {
         groupId: 'Required for Facebook crawl. Example: https://www.facebook.com/groups/wordpressvnteam → group_id = wordpressvnteam',
-        lastDate: 'Stop date for infinity scroll (condition post_date < last_date).',
+        postLimit: 'Maximum unique posts to capture before stopping the group crawl.',
       },
       toast: {
         saved: 'Facebook crawl settings saved',
@@ -674,10 +673,10 @@ export default {
     actions: {
       import: 'Import',
       testOpen: 'Test open',
-      useForRecord: 'Use when recording',
+      detectProfile: 'Scan Account',
     },
     badge: { active: 'Active', imported: 'imported', record: 'record' },
-    detail: { manual: 'Manual', path: 'Path' },
+    detail: { manual: 'Manual', path: 'Path', loggedIn: 'Logged in' },
     recording: { autoCreated: 'Auto-created when recording a scenario' },
     toast: {
       scanFailed: 'Browser scan failed',
@@ -694,6 +693,9 @@ export default {
       machineDeleted: 'Browser profile deleted',
       added: 'Browser profile added',
       saveFailed: 'Failed to save browser profile',
+      detectedAccount: 'Found FB: {facebookId}, {linkedIn}',
+      detectedEmpty: 'No account found in this profile',
+      detectFailed: 'Profile scan failed',
     },
     confirm: {
       deleteFromApp: 'Remove "{label}" from app?',

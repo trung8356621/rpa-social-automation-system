@@ -226,6 +226,18 @@ class DatabaseService {
       if (!browserProfileColumns.some((col) => col.name === 'import_path')) {
         this.db.exec('ALTER TABLE browser_profiles ADD COLUMN import_path TEXT');
       }
+      if (!browserProfileColumns.some((col) => col.name === 'facebook_id')) {
+        this.db.exec('ALTER TABLE browser_profiles ADD COLUMN facebook_id TEXT');
+      }
+      if (!browserProfileColumns.some((col) => col.name === 'has_linkedin')) {
+        this.db.exec('ALTER TABLE browser_profiles ADD COLUMN has_linkedin INTEGER NOT NULL DEFAULT 0');
+      }
+      if (!browserProfileColumns.some((col) => col.name === 'account_detected_at')) {
+        this.db.exec('ALTER TABLE browser_profiles ADD COLUMN account_detected_at TEXT');
+      }
+      if (!browserProfileColumns.some((col) => col.name === 'account_summary')) {
+        this.db.exec('ALTER TABLE browser_profiles ADD COLUMN account_summary TEXT');
+      }
     }
 
     const executionLogsTable = this.db
@@ -562,6 +574,10 @@ class DatabaseService {
           last_scanned_at   TEXT,
           imported_at       TEXT,
           import_path       TEXT,
+          facebook_id       TEXT,
+          has_linkedin      INTEGER NOT NULL DEFAULT 0,
+          account_detected_at TEXT,
+          account_summary   TEXT,
           is_dirty          INTEGER NOT NULL DEFAULT 1,
           updated_at        TEXT NOT NULL DEFAULT (datetime('now')),
           UNIQUE(browser_key, user_data_dir, profile_dir_name)
@@ -1939,6 +1955,47 @@ class DatabaseService {
       .all();
   }
 
+  updateBrowserProfileAccount(profileId, account = {}) {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(`
+        UPDATE browser_profiles
+        SET facebook_id = ?,
+            has_linkedin = ?,
+            account_detected_at = ?,
+            account_summary = ?,
+            is_dirty = 1,
+            updated_at = ?
+        WHERE id = ?
+      `)
+      .run(
+        account.facebookId || null,
+        account.hasLinkedIn ? 1 : 0,
+        now,
+        account.accountSummary || null,
+        now,
+        profileId,
+      );
+
+    return this.getBrowserProfileById(profileId);
+  }
+
+  updateBrowserProfileAccountSummary(profileId, accountSummary = '') {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(`
+        UPDATE browser_profiles
+        SET account_summary = ?,
+            account_detected_at = COALESCE(account_detected_at, ?),
+            is_dirty = 1,
+            updated_at = ?
+        WHERE id = ?
+      `)
+      .run(String(accountSummary || '').trim() || null, now, now, profileId);
+
+    return this.getBrowserProfileById(profileId);
+  }
+
   markBrowserProfileImported(profileId, importPath, importedAt = new Date().toISOString()) {
     this.db
       .prepare(`
@@ -1965,6 +2022,17 @@ class DatabaseService {
 
   getBrowserProfileById(id) {
     return this.db.prepare('SELECT * FROM browser_profiles WHERE id = ?').get(id);
+  }
+
+  getBrowserProfileByUserDataDir(userDataDir) {
+    return this.db
+      .prepare(`
+        SELECT * FROM browser_profiles
+        WHERE import_path = ? OR user_data_dir = ?
+        ORDER BY imported_at DESC
+        LIMIT 1
+      `)
+      .get(userDataDir, userDataDir);
   }
 
   saveBrowserProfile(profile) {

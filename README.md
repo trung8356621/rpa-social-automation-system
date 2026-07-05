@@ -184,7 +184,7 @@ On save, the app binds the scenario to a **system variable profile** (cannot be 
 
 | Profile | Variables | Use |
 |---------|-----------|-----|
-| `__system:facebook-crawl-group` | `group_id`, `last_date` | Group feed crawl; `last_date` for infinite-scroll stop |
+| `__system:facebook-crawl-group` | `group_id`, `post_limit` | Group feed crawl; `post_limit` stops after that many unique posts |
 
 Helpers: `src/shared/facebookCrawlConfig.js` (`parseFacebookGroupLink`, `buildFacebookGroupUrl`, `enrichFacebookCrawlPosts`, ...).
 
@@ -197,7 +197,7 @@ Fourth scenario type: `request_catching` (alongside `prepare`, `crawl`, `action`
 **Workflow:**
 
 1. Set platform (Facebook) and a group target URL with `{{variables}}`.
-2. Define **Scenario variables** (`local_variables`) such as `group_id` and `last_date`.
+2. Define **Scenario variables** (`local_variables`) such as `group_id` and `post_limit`.
 3. Browse the group feed; the app intercepts matching GraphQL network responses.
 4. Configure request filters in scenario meta (`scenario_meta.request_catching.filters`).
 5. Preview **Final result** as parsed posts/comments JSON.

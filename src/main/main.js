@@ -149,6 +149,14 @@ function registerDatabaseHandlers() {
     return browserProfileService.openBrowserProfile(profileId);
   });
 
+  ipcMain.handle('browser:detect-profile-account', async (_event, profileId) => {
+    const result = await browserProfileService.detectBrowserProfileAccount(profileId);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('browser:profile-account-detected', result);
+    }
+    return result;
+  });
+
   ipcMain.handle('browser:open-app-profile', (_event, profile) => {
     return browserProfileService.openAppBrowserProfile(profile);
   });
@@ -194,6 +202,10 @@ function registerDatabaseHandlers() {
 
   ipcMain.handle('db:save-browser-profile', (_event, profile) => {
     return dbService.saveBrowserProfile(profile);
+  });
+
+  ipcMain.handle('db:update-browser-profile-account-summary', (_event, payload = {}) => {
+    return dbService.updateBrowserProfileAccountSummary(payload?.profileId, payload?.accountSummary || '');
   });
 
   ipcMain.handle('db:delete-browser-profile', (_event, id) => {

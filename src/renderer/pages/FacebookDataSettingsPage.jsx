@@ -267,7 +267,7 @@ export default function FacebookDataSettingsPage() {
                 profile={groupVariableProfile}
                 variableHints={[
                   { key: 'group_id', hint: t('facebookData.settings.variables.groupId') },
-                  { key: 'last_date', hint: t('facebookData.settings.variables.lastDate') },
+                  { key: 'post_limit', hint: t('facebookData.settings.variables.postLimit') },
                 ]}
                 systemBadge={t('facebookData.settings.systemProfile')}
               />

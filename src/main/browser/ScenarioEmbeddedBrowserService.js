@@ -43,6 +43,7 @@ class ScenarioEmbeddedBrowserService {
     this.browserProfileService = browserProfileService || null;
     this.view = null;
     this.sessionKey = null;
+    this.browserProfileId = null;
     this.userDataDir = null;
     this.partition = null;
     this.lastBounds = null;
@@ -451,6 +452,7 @@ class ScenarioEmbeddedBrowserService {
     this.detach();
 
     this.sessionKey = sessionKey;
+    this.browserProfileId = payload.browserProfileId || null;
     this.userDataDir = userDataDir;
     this.partition = partition;
     this._designPickBound = false;
@@ -585,12 +587,18 @@ class ScenarioEmbeddedBrowserService {
     const win = this._getWindow();
     const crawlMeta = payload.crawlMeta || this.requestCatchingAutoConfig?.crawlMeta || {};
     const infinite = crawlMeta.infinity_scroll || {};
-    const shouldCheckStopCondition = infinite.enabled
-      && infinite.stop_mode === 'condition'
-      && !/\/posts\/\d+/i.test(payload.url || this.view?.webContents?.getURL() || '');
     const scenarioId = payload.scenarioId
       || this.requestCatchingAutoConfig?.scenarioId
       || null;
+    const variableMap = this.dbService?.buildVariableMap(scenarioId, null);
+    const postLimit = resolveFacebookPostLimit(variableMap?.get?.('post_limit'));
+    const capturedPostIds = new Set();
+    const shouldCheckStopCondition = infinite.enabled
+      && infinite.stop_mode === 'condition'
+      && !postLimit
+      && !/\/posts\/\d+/i.test(payload.url || this.view?.webContents?.getURL() || '');
+    const shouldCheckPostLimit = postLimit > 0
+      && !/\/posts\/\d+/i.test(payload.url || this.view?.webContents?.getURL() || '');
     const resolvedCondition = {
       ...infinite.condition,
       value: this._resolveVariables(String(infinite.condition?.value ?? ''), scenarioId),
@@ -600,18 +608,23 @@ class ScenarioEmbeddedBrowserService {
     const scrollProgress = { completedBatches: 0 };
 
     const checkCapturedStopCondition = (items = []) => {
-      if (!shouldCheckStopCondition || conditionStopPending) return;
+      if ((!shouldCheckStopCondition && !shouldCheckPostLimit) || conditionStopPending) return;
       if (!Array.isArray(items) || !items.length) return;
 
       const pageUrl = this._requestCatchingPageUrl
         || this.view?.webContents?.getURL()
         || '';
-      const variableMap = this.dbService?.buildVariableMap(scenarioId, null);
       const parsedPosts = parseFacebookGraphQLBatch(items, {
         targetUrl: pageUrl,
         variables: variableMap,
       });
-      if (crawlConditionShouldStopScroll(parsedPosts, resolvedCondition)) {
+      addFacebookPostIds(capturedPostIds, parsedPosts);
+      if (shouldCheckPostLimit && capturedPostIds.size >= postLimit) {
+        conditionStopPending = true;
+        console.log(`[RC] Post limit reached (${capturedPostIds.size}/${postLimit}) - finishing current scroll batch before stopping`);
+        return;
+      }
+      if (shouldCheckStopCondition && crawlConditionShouldStopScroll(parsedPosts, resolvedCondition)) {
         conditionStopPending = true;
         console.log('[RC] Stop condition matched — finishing current scroll batch before stopping');
       }
@@ -982,6 +995,9 @@ class ScenarioEmbeddedBrowserService {
       this._keyboardInputHandler = null;
     }
 
+    const closedUserDataDir = this.userDataDir;
+    const closedBrowserProfileId = this.browserProfileId;
+
     this.stopFindInPage();
     // Preserve requestCatchingAutoConfig — detach() runs during attach() recycle;
     // clearing here breaks auto-start on did-finish-load.
@@ -998,12 +1014,46 @@ class ScenarioEmbeddedBrowserService {
     }
 
     this.sessionKey = null;
+    this.browserProfileId = null;
     this.userDataDir = null;
     this.partition = null;
     this.lastBounds = null;
     this.zoomFactor = 1;
     this._designPickBound = false;
+
+    if (closedUserDataDir && closedBrowserProfileId && this.browserProfileService?.detectBrowserProfileAccount) {
+      void this.browserProfileService.detectBrowserProfileAccount(closedBrowserProfileId)
+        .then((result) => {
+          const targetWin = this._getWindow();
+          if (targetWin && !targetWin.isDestroyed()) {
+            targetWin.webContents.send('browser:profile-account-detected', result);
+          }
+        })
+        .catch((error) => {
+          console.warn(`[EmbeddedBrowser] Auto account detect failed: ${error.message}`);
+        });
+    }
   }
+}
+
+function resolveFacebookPostLimit(value = '') {
+  const limit = Number(String(value ?? '').replace(/,/g, '').trim());
+  if (!Number.isFinite(limit) || limit <= 0) return 0;
+  return Math.floor(limit);
+}
+
+function addFacebookPostIds(targetSet, parsedPosts = []) {
+  if (!(targetSet instanceof Set) || !Array.isArray(parsedPosts)) return;
+  parsedPosts.forEach((post) => {
+    const postId = String(post?.post_id || '').trim();
+    if (
+      postId
+      && post?._comments_only !== true
+      && post?._feedback_only !== true
+    ) {
+      targetSet.add(postId);
+    }
+  });
 }
 
 export { ScenarioEmbeddedBrowserService };

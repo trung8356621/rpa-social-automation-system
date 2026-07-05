@@ -911,6 +911,8 @@ class ExecutorService {
       this.dbService.getSettings(),
     );
     const infinite = crawlMeta.infinity_scroll || {};
+    const postLimit = resolveFacebookPostLimit(map?.get?.('post_limit'));
+    const capturedPostIds = new Set();
     const resolvedCondition = {
       ...infinite.condition,
       value: this._resolveVariables(String(infinite.condition?.value ?? '')),
@@ -926,7 +928,9 @@ class ExecutorService {
     const MAX_EMPTY_SCROLL_BATCHES = 5;
     const shouldCheckStopCondition = infinite.enabled
       && infinite.stop_mode === 'condition'
+      && !postLimit
       && !isSinglePostCrawl;
+    const shouldCheckPostLimit = postLimit > 0 && !isSinglePostCrawl;
 
     this._crawlDumpFolderId = CrawlRequestDumpService.resolveFolderId({
       targetUrl,
@@ -978,10 +982,16 @@ class ExecutorService {
             void CrawlRequestDumpService.appendCapture(this._crawlDumpFolderId, annotatedItems, meta);
           }
 
-          if (!shouldCheckStopCondition || conditionStopPending) return;
+          if ((!shouldCheckStopCondition && !shouldCheckPostLimit) || conditionStopPending) return;
 
           const parsedBatch = parseFacebookGraphQLBatch(annotatedItems, { targetUrl, variables: map });
-          if (crawlConditionShouldStopScroll(parsedBatch, resolvedCondition)) {
+          addFacebookPostIds(capturedPostIds, parsedBatch);
+          if (shouldCheckPostLimit && capturedPostIds.size >= postLimit) {
+            conditionStopPending = true;
+            console.log(`[Executor] Post limit reached (${capturedPostIds.size}/${postLimit}) - finishing current scroll batch before stopping`);
+            return;
+          }
+          if (shouldCheckStopCondition && crawlConditionShouldStopScroll(parsedBatch, resolvedCondition)) {
             conditionStopPending = true;
             console.log('[Executor] Stop condition matched — finishing current scroll batch before stopping');
           }
@@ -1089,6 +1099,9 @@ class ExecutorService {
 
     let facebookDbSave = null;
     if (platform === 'facebook' && this.platformCrawledDataService) {
+      const groupMeta = isSinglePostCrawl
+        ? { groupName: '', groupType: 'Private' }
+        : await readFacebookGroupMeta(this.page);
       const saveCandidates = cleaned.filter((post) => (
         post?.post_id
         && post._comments_only !== true
@@ -1096,7 +1109,11 @@ class ExecutorService {
       ));
       facebookDbSave = await this.platformCrawledDataService.saveFacebookPostsBatch(
         saveCandidates,
-        { group_link: targetUrl },
+        {
+          group_link: targetUrl,
+          group_name: groupMeta.groupName,
+          group_type: groupMeta.groupType,
+        },
         {
           platform: 'facebook',
           supplement: false,
@@ -1121,6 +1138,8 @@ class ExecutorService {
       crawledData: cleaned,
       facebook_db_save: facebookDbSave,
       scroll_stopped_by_condition: conditionStopPending,
+      post_limit: postLimit || null,
+      post_limit_reached: Boolean(postLimit && capturedPostIds.size >= postLimit),
       cards: cleaned.map((item, index) => ({
         card_index: index,
         data: item,
@@ -2324,6 +2343,65 @@ async function extractFacebookInitialStateJson(page, options = {}) {
     console.warn('[Executor] Initial state JSON extraction failed:', error?.message || error);
     return [];
   }
+}
+
+function resolveFacebookPostLimit(value = '') {
+  const limit = Number(String(value ?? '').replace(/,/g, '').trim());
+  if (!Number.isFinite(limit) || limit <= 0) return 0;
+  return Math.floor(limit);
+}
+
+function addFacebookPostIds(targetSet, parsedPosts = []) {
+  if (!(targetSet instanceof Set) || !Array.isArray(parsedPosts)) return;
+  parsedPosts.forEach((post) => {
+    const postId = String(post?.post_id || '').trim();
+    if (
+      postId
+      && post?._comments_only !== true
+      && post?._feedback_only !== true
+    ) {
+      targetSet.add(postId);
+    }
+  });
+}
+
+async function readFacebookGroupMeta(page) {
+  const fallback = { groupName: '', groupType: 'Private' };
+  if (!page || page.isClosed()) return fallback;
+
+  try {
+    const rawTitle = await page.title().catch(() => '');
+    const groupName = normalizeFacebookGroupTitle(String(rawTitle || '').split('|')[0]);
+    const html = await page.content().catch(() => '');
+    const groupType = detectFacebookGroupTypeFromHtml(html);
+
+    return {
+      groupName,
+      groupType,
+    };
+  } catch (error) {
+    console.warn('[Executor] Facebook group meta detect failed:', error?.message || error);
+    return fallback;
+  }
+}
+
+function normalizeFacebookGroupTitle(value = '') {
+  return String(value || '')
+    .replace(/\s+-\s+Facebook\s*$/i, '')
+    .replace(/^Facebook\s*$/i, '')
+    .trim();
+}
+
+function detectFacebookGroupTypeFromHtml(html = '') {
+  const source = String(html || '');
+  if (!source) return 'Private';
+
+  const privatePattern = /"privacy"\s*:\s*"MembersOnly"|"is_group_privacy_private"\s*:\s*true|\bPrivate group\b|Nhóm kín/iu;
+  const publicPattern = /"privacy"\s*:\s*"Open"|"is_group_privacy_private"\s*:\s*false|\bPublic group\b|Nhóm công khai/iu;
+
+  if (privatePattern.test(source)) return 'Private';
+  if (publicPattern.test(source)) return 'Public';
+  return 'Private';
 }
 
 function mergeSinglePostParsedResults(parsedPosts = [], options = {}) {
