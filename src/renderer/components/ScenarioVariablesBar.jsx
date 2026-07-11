@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Braces, Plus, Save, Trash2 } from 'lucide-react';
+import { Braces, Plus, Save, Trash2, Upload } from 'lucide-react';
 import { useTranslation } from '../i18n';
 
 const CREATE_NEW_PROFILE = '__new__';
@@ -9,6 +9,7 @@ function emptyRow() {
     id: null,
     key: '',
     value: '',
+    value_type: 'text',
   };
 }
 
@@ -44,6 +45,7 @@ export default function ScenarioVariablesBar({
       const normalized = (Array.isArray(items) ? items : []).map((item) => ({
         ...item,
         key: item.key || item.name || '',
+        value_type: item.value_type === 'file' ? 'file' : 'text',
       }));
       setRows(normalized.length ? normalized : []);
     } catch (error) {
@@ -81,6 +83,7 @@ export default function ScenarioVariablesBar({
       key,
       name: key,
       value: row.value ?? '',
+      value_type: row.value_type === 'file' ? 'file' : 'text',
     });
     return saved;
   };
@@ -133,6 +136,7 @@ export default function ScenarioVariablesBar({
       .map((row) => ({
         key: String(row.key || '').trim(),
         value: row.value ?? '',
+        value_type: row.value_type === 'file' ? 'file' : 'text',
       }))
       .filter((row) => row.key);
 
@@ -253,7 +257,7 @@ export default function ScenarioVariablesBar({
             ) : (
               <div className="max-h-64 space-y-2 overflow-y-auto pr-1">
                 {rows.map((row, index) => (
-                  <div key={row.id || `new-${index}`} className="grid grid-cols-[1fr_1fr_auto] gap-2">
+                  <div key={row.id || `new-${index}`} className="grid grid-cols-[minmax(0,1fr)_88px_minmax(0,1fr)_auto] gap-2">
                     <input
                       value={row.key || row.name || ''}
                       onChange={(event) => updateRow(index, { key: event.target.value })}
@@ -261,13 +265,50 @@ export default function ScenarioVariablesBar({
                       className="input-field h-8 text-xs"
                       placeholder={t('variables.field.key')}
                     />
-                    <input
-                      value={row.value || ''}
-                      onChange={(event) => updateRow(index, { value: event.target.value })}
-                      onBlur={(event) => handleSaveRow(index, { value: event.target.value })}
-                      className="input-field h-8 text-xs"
-                      placeholder={t('variables.field.value')}
-                    />
+                    <select
+                      value={row.value_type === 'file' ? 'file' : 'text'}
+                      onChange={(event) => {
+                        const value_type = event.target.value === 'file' ? 'file' : 'text';
+                        updateRow(index, { value_type });
+                        handleSaveRow(index, { value_type });
+                      }}
+                      className="select-field h-8 text-xs"
+                    >
+                      <option value="text">{t('variables.field.typeText')}</option>
+                      <option value="file">{t('variables.field.typeFile')}</option>
+                    </select>
+                    {row.value_type === 'file' ? (
+                      <div className="flex min-w-0 gap-1">
+                        <input
+                          value={row.value || ''}
+                          onChange={(event) => updateRow(index, { value: event.target.value })}
+                          onBlur={(event) => handleSaveRow(index, { value: event.target.value })}
+                          className="input-field h-8 min-w-0 flex-1 text-xs"
+                          placeholder={t('variables.field.filePath')}
+                        />
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            const picked = await window.electronAPI?.selectFile?.();
+                            if (!picked) return;
+                            updateRow(index, { value: picked });
+                            handleSaveRow(index, { value: picked });
+                          }}
+                          className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-[#3a465c] text-[#c9d4e8] hover:bg-[#1f2633]"
+                          title={t('variables.field.pickFile')}
+                        >
+                          <Upload className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                    ) : (
+                      <input
+                        value={row.value || ''}
+                        onChange={(event) => updateRow(index, { value: event.target.value })}
+                        onBlur={(event) => handleSaveRow(index, { value: event.target.value })}
+                        className="input-field h-8 text-xs"
+                        placeholder={t('variables.field.value')}
+                      />
+                    )}
                     <button
                       type="button"
                       onClick={() => handleDeleteRow(index)}

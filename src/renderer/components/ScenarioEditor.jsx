@@ -83,6 +83,7 @@ const ACTION_BUTTON_KEYS = [
   { actionType: 'navigate', icon: ExternalLink, labelKey: 'scenarioEditor.actions.navigate' },
   { actionType: 'click', icon: MousePointer2, labelKey: 'scenarioEditor.actions.click' },
   { actionType: 'input', icon: Keyboard, labelKey: 'scenarioEditor.actions.input' },
+  { actionType: 'file', icon: Upload, labelKey: 'scenarioEditor.actions.file' },
   { actionType: 'wait', icon: Timer, labelKey: 'scenarioEditor.actions.wait' },
 ];
 
@@ -130,8 +131,22 @@ const defaultConfig = {
   click: { selector: '', skip_if_checked: false },
   input: { selector: '', text: '' },
   type: { selector: '', text: '' },
+  file: { selector: '', variable_key: '', accept: '', max_size_mb: 0 },
   wait: { duration: 2000 },
 };
+
+function getStepConfig(step) {
+  const anchorConfig = step?.target_anchor?.action_config || {};
+  return { ...anchorConfig, ...(step?.action_config || {}) };
+}
+
+function fileTypeVariables(variables = []) {
+  return variables.filter((item) => item.value_type === 'file');
+}
+
+function supportsGlobalWidgets(scenarioType) {
+  return scenarioType === 'action' || scenarioType === 'prepare';
+}
 
 const defaultUrl = (platform) => {
   const urls = {
@@ -147,7 +162,7 @@ const defaultUrl = (platform) => {
 
 function createStep(actionType, overrides = {}) {
   const now = Date.now();
-  const normalizedType = normalizeActionType(actionType);
+  const normalizedType = actionType === 'file' ? 'file' : normalizeActionType(actionType);
   return {
     id: crypto.randomUUID ? crypto.randomUUID() : `${now}-${Math.random().toString(36).slice(2, 9)}`,
     action_type: normalizedType,
@@ -166,17 +181,53 @@ function toDatabaseStep(step) {
   };
 }
 
+function promoteFileInputStep(step) {
+  if (step.action_type === 'file') return step;
+  if (step.action_type !== 'input' && step.action_type !== 'type') return step;
+
+  const anchor = step.target_anchor || {};
+  const config = getStepConfig(step);
+  const text = config.text || '';
+  const isFileInput = anchor.type === 'file'
+    || (anchor.tagName === 'input' && anchor.type === 'file')
+    || /^C:\\fakepath\\/i.test(text);
+
+  if (!isFileInput) return step;
+
+  const nextConfig = {
+    ...config,
+    selector: config.selector || anchor.selector_value || '',
+    variable_key: config.variable_key || '',
+    accept: config.accept || anchor.accept || '',
+    max_size_mb: Number(config.max_size_mb) || 0,
+    text: /^C:\\fakepath\\/i.test(text) ? '' : text,
+  };
+
+  return {
+    ...step,
+    action_type: 'file',
+    action_config: nextConfig,
+    target_anchor: {
+      ...anchor,
+      action_config: nextConfig,
+    },
+  };
+}
+
 function normalizeSteps(steps) {
   if (!steps || !Array.isArray(steps)) return [];
-  return steps.map((step, idx) => ({
-    ...step,
-    action_type: normalizeActionType(step.action_type),
-    delay_ms: Number(step.delay_ms) || DEFAULT_ACTION_DELAY_MS,
-    order: idx,
-    target_anchor: parseJsonObject(step.target_anchor),
-    action_config:
-      parseJsonObject(step.target_anchor).action_config || {},
-  }));
+  return steps.map((step, idx) => {
+    const normalized = promoteFileInputStep({
+      ...step,
+      action_type: step.action_type === 'file' ? 'file' : normalizeActionType(step.action_type),
+      delay_ms: Number(step.delay_ms) || DEFAULT_ACTION_DELAY_MS,
+      order: idx,
+      target_anchor: parseJsonObject(step.target_anchor),
+      action_config:
+        parseJsonObject(step.target_anchor).action_config || {},
+    });
+    return normalized;
+  });
 }
 
 function createEditorSnapshot(steps, manifestFrames) {
@@ -403,6 +454,7 @@ function describeStep(actionType, config, t) {
     click: t('scenarioEditor.stepDescriptions.click'),
     input: t('scenarioEditor.stepDescriptions.input'),
     type: t('scenarioEditor.stepDescriptions.type'),
+    file: t('scenarioEditor.stepDescriptions.file'),
     wait: t('scenarioEditor.stepDescriptions.wait'),
   };
   return descriptions[actionType] || actionType || 'Unknown';
@@ -414,6 +466,7 @@ function getAction(actionType) {
     click: MousePointer2,
     input: Keyboard,
     type: Keyboard,
+    file: Upload,
     wait: Timer,
     waitForElement: Eye,
     screenshot: SquareCode,
@@ -459,11 +512,12 @@ function StepCard({
   onDelete,
 }) {
   const { t } = useTranslation();
-  const config = step.action_config || {};
+  const config = getStepConfig(step);
   const Icon = getAction(step.action_type);
   const time = getStepTime(step, []);
   const selector = config.selector || step.target_anchor?.selector_value || '';
   const text = config.text || '';
+  const variableKey = config.variable_key || '';
   const duration = config.duration || step.delay_ms || DEFAULT_ACTION_DELAY_MS;
 
   return (
@@ -507,6 +561,15 @@ function StepCard({
           </div>
         )}
 
+        {step.action_type === 'file' && (
+          <div className="mt-0.5 truncate text-[10px] text-[#9aa7b7]">
+            {selector ? `${selector} \u2192 ` : ''}
+            {variableKey ? `{{${variableKey}}}` : (text || t('scenarioEditor.step.fileVariableUnset'))}
+            {config.accept ? ` · ${config.accept}` : ''}
+            {Number(config.max_size_mb) > 0 ? ` · \u2264${config.max_size_mb}MB` : ''}
+          </div>
+        )}
+
         {step.action_type === 'wait' && (
           <div className="mt-0.5 text-[10px] text-[#9aa7b7]">{duration}ms</div>
         )}
@@ -519,6 +582,59 @@ function StepCard({
       >
         <Trash2 className="h-3 w-3" />
       </button>
+    </div>
+  );
+}
+
+function GlobalWidgetsPanel({
+  scenarioMeta,
+  onScenarioChange,
+}) {
+  const { t } = useTranslation();
+  const globalWidgets = defaultGlobalWidgets(scenarioMeta);
+  const patchGlobalWidgets = (patch) => onScenarioChange({
+    nextScenarioMeta: {
+      ...defaultScenarioMeta(scenarioMeta),
+      global_widgets: {
+        ...globalWidgets,
+        ...patch,
+      },
+    },
+  });
+  const patchDebounceKeydown = (patch) => patchGlobalWidgets({
+    debounce_keydown: { ...globalWidgets.debounce_keydown, ...patch },
+  });
+
+  return (
+    <div className="grid grid-cols-2 gap-3 rounded border border-[#2a3144] bg-[#101217] p-3">
+      <p className="col-span-2 text-xs font-semibold text-[#c7d0dc]">
+        {t('scenarioEditor.globalWidgets.title')}
+      </p>
+      <div className="col-span-2 rounded border border-[#243047] bg-[#0d1018] px-3 py-2">
+        <p className="text-xs font-semibold text-[#dce5f2]">
+          {t('scenarioEditor.globalWidgets.debounceKeydown')}
+        </p>
+        <p className="mt-1 text-[11px] leading-relaxed text-[#8b97aa]">
+          {t('scenarioEditor.globalWidgets.debounceKeydownHint')}
+        </p>
+        <p className="mt-1 text-[10px] font-medium uppercase tracking-wide text-[#5f8fff]">
+          {t('scenarioEditor.globalWidgets.debounceKeydownAlwaysOn')}
+        </p>
+      </div>
+      <label className="col-span-2 block">
+        <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">{t('scenarioEditor.globalWidgets.debounceMs')}</span>
+        <input
+          type="number"
+          min="50"
+          max="5000"
+          value={globalWidgets.debounce_keydown.debounce_ms}
+          onChange={(event) => patchDebounceKeydown({ debounce_ms: Number(event.target.value) || 300 })}
+          className="input-field h-9"
+        />
+        <span className="mt-1 block text-[11px] leading-relaxed text-[#8b97aa]">
+          {t('scenarioEditor.globalWidgets.debounceMsHint')}
+        </span>
+      </label>
     </div>
   );
 }
@@ -787,7 +903,11 @@ function StepEditPanel({
   onStepChange,
 }) {
   const { t } = useTranslation();
-  const config = selectedStep?.action_config || {};
+  const config = getStepConfig(selectedStep);
+  const fileVariables = fileTypeVariables(variables);
+  const fileVariableKey = config.variable_key
+    || (String(config.text || '').match(/^\{\{([^}]+)\}\}$/) || [])[1]
+    || '';
 
   const updateActionConfig = (patch) => {
     onStepChange({
@@ -821,9 +941,11 @@ function StepEditPanel({
             <label className="block">
               <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">{t('scenarioEditor.step.type')}</span>
               <select
-                value={normalizeActionType(selectedStep.action_type)}
+                value={selectedStep.action_type === 'file' ? 'file' : normalizeActionType(selectedStep.action_type)}
                 onChange={(event) => {
-                  const nextType = normalizeActionType(event.target.value);
+                  const nextType = event.target.value === 'file'
+                    ? 'file'
+                    : normalizeActionType(event.target.value);
                   onStepChange({
                     action_type: nextType,
                     action_config: defaultConfig[nextType] || {},
@@ -838,6 +960,7 @@ function StepEditPanel({
                 <option value="navigate">{t('scenarioEditor.actions.navigate')}</option>
                 <option value="click">{t('scenarioEditor.actions.click')}</option>
                 <option value="input">{t('scenarioEditor.actions.input')}</option>
+                <option value="file">{t('scenarioEditor.actions.file')}</option>
                 <option value="wait">{t('scenarioEditor.actions.wait')}</option>
               </select>
             </label>
@@ -873,6 +996,52 @@ function StepEditPanel({
                   placeholder="Nội dung hoặc {{variable}}"
                 />
               </label>
+            )}
+
+            {selectedStep.action_type === 'file' && (
+              <>
+                <label className="col-span-2 block">
+                  <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">{t('scenarioEditor.step.fileVariable')}</span>
+                  <select
+                    value={fileVariableKey || ''}
+                    onChange={(event) => updateActionConfig({ variable_key: event.target.value, text: '' })}
+                    className="select-field h-9"
+                  >
+                    <option value="">{t('scenarioEditor.step.fileVariablePlaceholder')}</option>
+                    {fileVariables.map((item) => (
+                      <option key={item.key} value={item.key}>{item.key}</option>
+                    ))}
+                  </select>
+                  {!fileVariables.length && (
+                    <span className="mt-1 block text-[11px] leading-relaxed text-[#8b97aa]">
+                      {t('scenarioEditor.step.fileVariableHint')}
+                    </span>
+                  )}
+                </label>
+                <label className="block">
+                  <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">{t('scenarioEditor.step.fileAccept')}</span>
+                  <input
+                    value={config.accept || ''}
+                    onChange={(event) => updateActionConfig({ accept: event.target.value })}
+                    className="input-field h-9"
+                    placeholder="image/*,video/*,.png"
+                  />
+                </label>
+                <label className="block">
+                  <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">{t('scenarioEditor.step.fileMaxSize')}</span>
+                  <input
+                    type="number"
+                    min="0"
+                    value={Number(config.max_size_mb) || 0}
+                    onChange={(event) => updateActionConfig({ max_size_mb: Number(event.target.value) || 0 })}
+                    className="input-field h-9"
+                    placeholder="0"
+                  />
+                  <span className="mt-1 block text-[11px] leading-relaxed text-[#8b97aa]">
+                    {t('scenarioEditor.step.fileMaxSizeHint')}
+                  </span>
+                </label>
+              </>
             )}
 
             {selectedStep.action_type === 'click' && (
@@ -1078,10 +1247,21 @@ function defaultCrawlMeta(meta = {}) {
   };
 }
 
+function defaultGlobalWidgets(meta = {}) {
+  const widgets = meta?.global_widgets || {};
+  const debounceKeydown = widgets.debounce_keydown || {};
+  return {
+    debounce_keydown: {
+      debounce_ms: Number(debounceKeydown.debounce_ms) || 300,
+    },
+  };
+}
+
 function defaultScenarioMeta(meta = {}) {
   return {
     ...(meta || {}),
     crawl: defaultCrawlMeta(meta),
+    global_widgets: defaultGlobalWidgets(meta),
   };
 }
 
@@ -1142,6 +1322,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
   const [inspectorOpen, setInspectorOpen] = useState(true);
   const [scenarioInfoOpen, setScenarioInfoOpen] = useState(true);
   const [stepEditorOpen, setStepEditorOpen] = useState(true);
+  const [globalWidgetsOpen, setGlobalWidgetsOpen] = useState(true);
   const [timelineOpen, setTimelineOpen] = useState(true);
   const [previewPlaying, setPreviewPlaying] = useState(false);
   const [previewCurrentTime, setPreviewCurrentTime] = useState(0);
@@ -1694,6 +1875,19 @@ export default function ScenarioEditor({ scenario, onBack }) {
   const persist = useCallback(async () => {
     setSaving(true);
     try {
+      // Never pass empty preview_manifest_frames during metadata-only saves.
+      // DatabaseService.writePreviewManifest would overwrite a real frame list with [].
+      const previewExtras = manifestFrames.length
+        ? {
+          preview_manifest_path: scenarioManifestPath,
+          preview_manifest_frames: manifestFrames,
+          preview_duration_ms: manifestDuration,
+        }
+        : {
+          // Keep existing DB/manifest paths; omit frames so saveScenario skips rewrite.
+          ...(scenarioManifestPath ? { preview_manifest_path: scenarioManifestPath } : {}),
+        };
+
       const scenarioData = {
         ...(currentScenarioId ? { id: currentScenarioId } : {}),
         name: scenarioDraftRef.current.name || name,
@@ -1702,9 +1896,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
           recorded_width: activeViewport.width,
           recorded_height: activeViewport.height,
           preview_trim_ranges: [],
-          preview_manifest_path: scenarioManifestPath,
-          preview_manifest_frames: manifestFrames,
-          preview_duration_ms: manifestDuration,
+          ...previewExtras,
         }),
       };
       const dbSteps = steps.map(toDatabaseStep);
@@ -2372,6 +2564,14 @@ export default function ScenarioEditor({ scenario, onBack }) {
           setScenarioInfoOpen={setScenarioInfoOpen}
           stepEditorOpen={stepEditorOpen}
           setStepEditorOpen={setStepEditorOpen}
+          globalWidgetsOpen={globalWidgetsOpen}
+          setGlobalWidgetsOpen={setGlobalWidgetsOpen}
+          showGlobalWidgets={supportsGlobalWidgets(scenarioType)}
+          GlobalWidgetsPanelComponent={GlobalWidgetsPanel}
+          globalWidgetsProps={{
+            scenarioMeta,
+            onScenarioChange: updateScenarioDraft,
+          }}
           PanelSectionHeaderComponent={PanelSectionHeader}
           ActionIconBarComponent={ActionIconBar}
           IconOnlyComponent={IconOnly}

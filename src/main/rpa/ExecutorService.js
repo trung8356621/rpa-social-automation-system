@@ -836,6 +836,9 @@ class ExecutorService {
       case 'keypress':
         await this._executeType(step);
         break;
+      case 'file':
+        await this._executeFile(step);
+        break;
       case 'scroll':
         await this._executeScroll(step);
         break;
@@ -1507,6 +1510,75 @@ class ExecutorService {
     await this.page.keyboard.type(text, { delay: randomRuntimeDelay(config.delay || 50, 25, 120) });
   }
 
+  async _executeFile(step) {
+    await ensureRememberMeChecked(this.page);
+
+    const anchor = step.target_anchor || {};
+    const config = anchor.action_config || {};
+    const variableKey = String(config.variable_key || '').trim();
+    const rawPath = variableKey
+      ? this._resolveVariables(`{{${variableKey}}}`)
+      : this._resolveVariables(config.text || '');
+    if (!rawPath) {
+      throw new Error(variableKey
+        ? `File step thiếu giá trị cho biến {{${variableKey}}}.`
+        : 'File step thiếu biến file hoặc đường dẫn.');
+    }
+    if (/^C:\\fakepath\\/i.test(rawPath)) {
+      throw new Error('Đường dẫn file không hợp lệ (C:\\fakepath). Gán biến type=file trong Variables.');
+    }
+
+    const filePaths = String(rawPath)
+      .split(';')
+      .map((item) => item.trim())
+      .filter(Boolean);
+    if (!filePaths.length) {
+      throw new Error('File step không có file hợp lệ.');
+    }
+
+    validateFilePathsForUpload(filePaths, {
+      accept: config.accept || anchor.accept || '',
+      maxSizeMb: config.max_size_mb,
+    });
+
+    const selector = this._resolveSelector(anchor, config);
+    const viewport = this._getExecutionViewport();
+    const focused = await this._focusTarget(anchor, config, selector);
+
+    if (!focused) {
+      const coords = anchor.relative_coords;
+      if (coords?.x !== undefined && coords?.y !== undefined) {
+        const x = Math.round((coords.x / 100) * viewport.width);
+        const y = Math.round((coords.y / 100) * viewport.height);
+        await this.page.mouse.click(x, y);
+      }
+    }
+
+    if (selector) {
+      const handle = await this.page.$(selector).catch(() => null);
+      if (handle) {
+        await handle.uploadFile(...filePaths);
+        return;
+      }
+    }
+
+    const fallbackSelectors = [
+      anchor.selector_value,
+      anchor.id ? `#${anchor.id}` : '',
+      anchor.name ? `[name="${anchor.name}"]` : '',
+      anchor.ariaLabel ? `[aria-label="${anchor.ariaLabel}"]` : '',
+    ].filter(Boolean);
+
+    for (const item of fallbackSelectors) {
+      const handle = await this.page.$(item).catch(() => null);
+      if (!handle) continue;
+      await handle.uploadFile(...filePaths);
+      return;
+    }
+
+    throw new Error('Không tìm thấy input file để upload.');
+  }
+
   _getExecutionViewport() {
     const pageViewport = this.page?.viewport?.();
     if (pageViewport?.width && pageViewport?.height) {
@@ -1777,6 +1849,64 @@ function normalizeExecutionViewport(viewport) {
   if (!Number.isFinite(width) || !Number.isFinite(height)) return null;
   if (width < 320 || height < 240 || width > 4096 || height > 4096) return null;
   return { width, height };
+}
+
+const FILE_EXT_CATEGORY = {
+  '.jpg': 'image',
+  '.jpeg': 'image',
+  '.png': 'image',
+  '.gif': 'image',
+  '.webp': 'image',
+  '.bmp': 'image',
+  '.svg': 'image',
+  '.mp4': 'video',
+  '.webm': 'video',
+  '.mov': 'video',
+  '.avi': 'video',
+  '.mkv': 'video',
+};
+
+function fileMatchesAccept(filePath, acceptRaw) {
+  const accept = String(acceptRaw || '').trim();
+  if (!accept) return true;
+
+  const ext = path.extname(filePath).toLowerCase();
+  const parts = accept.split(',').map((item) => item.trim()).filter(Boolean);
+  for (const part of parts) {
+    if (part.startsWith('.')) {
+      if (ext === part.toLowerCase()) return true;
+      continue;
+    }
+    if (part.endsWith('/*')) {
+      const category = part.slice(0, -2);
+      if (FILE_EXT_CATEGORY[ext] === category) return true;
+      continue;
+    }
+    if (part.includes('/')) {
+      const extGuess = ext.replace(/^\./, '');
+      if (part.endsWith(`/${extGuess}`)) return true;
+    }
+  }
+  return false;
+}
+
+function validateFilePathsForUpload(filePaths, { accept, maxSizeMb } = {}) {
+  const maxBytes = Number(maxSizeMb) > 0 ? Number(maxSizeMb) * 1024 * 1024 : 0;
+  for (const filePath of filePaths) {
+    if (!fs.existsSync(filePath)) {
+      throw new Error(`File không tồn tại: ${filePath}`);
+    }
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) {
+      throw new Error(`Đường dẫn không phải file: ${filePath}`);
+    }
+    if (maxBytes && stat.size > maxBytes) {
+      throw new Error(`File vượt giới hạn ${Number(maxSizeMb)}MB: ${path.basename(filePath)}`);
+    }
+    if (!fileMatchesAccept(filePath, accept)) {
+      throw new Error(`File không đúng loại (${accept}): ${path.basename(filePath)}`);
+    }
+  }
 }
 
 function randomRuntimeDelay(baseMs = DEFAULT_ACTION_DELAY_MS, minMs = 120, maxMs = 1500) {

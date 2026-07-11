@@ -7,6 +7,7 @@ import {
   Eye,
   FolderOpen,
   Info,
+  Keyboard,
   MousePointer2,
   PanelRightClose,
   PanelRightOpen,
@@ -25,6 +26,11 @@ export default function StandardScenarioEditorContent({
   setScenarioInfoOpen,
   stepEditorOpen,
   setStepEditorOpen,
+  globalWidgetsOpen,
+  setGlobalWidgetsOpen,
+  showGlobalWidgets,
+  GlobalWidgetsPanelComponent,
+  globalWidgetsProps,
   PanelSectionHeaderComponent,
   ActionIconBarComponent,
   IconOnlyComponent,
@@ -233,6 +239,21 @@ export default function StandardScenarioEditorContent({
 
             {inspectorOpen && (
               <div className="flex min-h-0 min-w-0 flex-col border-l border-[#2a2d34] bg-[#15171d]">
+                {showGlobalWidgets && GlobalWidgetsPanelComponent && (
+                  <>
+                    <PanelSectionHeaderComponent
+                      icon={Keyboard}
+                      title={t('scenarioEditor.globalWidgets.title')}
+                      onToggle={() => setGlobalWidgetsOpen((current) => !current)}
+                      open={globalWidgetsOpen}
+                    />
+                    {globalWidgetsOpen && (
+                      <div className="shrink-0 border-b border-[#2a2d34] p-3">
+                        <GlobalWidgetsPanelComponent {...globalWidgetsProps} />
+                      </div>
+                    )}
+                  </>
+                )}
                 <PanelSectionHeaderComponent
                   icon={MousePointer2}
                   title={t('scenarioEditor.step.editTitle')}

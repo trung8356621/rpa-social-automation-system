@@ -51,6 +51,10 @@ class RecorderService {
     this._lastScreenshotPromise = null;
     // Luu lai importProfileId de dung khi openBrowser
     this.lastImportProfileId = null;
+    this._stopping = false;
+    this._stopPromise = null;
+    this._recordingFrameHandler = null;
+    this._recordingWidgetConfig = { debounce_keydown: { debounce_ms: 300 } };
   }
 
   async startRecording({ scenario, scenarioId: payloadScenarioId, targetUrl, viewport = DEFAULT_VIEWPORT, mode = 'replace', importProfileId = null } = {}) {
@@ -76,7 +80,13 @@ class RecorderService {
       recorded_height: effectiveViewport.height,
       device_pixel_ratio: sourceScenario?.device_pixel_ratio || 1,
       browser_profile_id: sourceScenario?.browser_profile_id || existingScenario?.browser_profile_id || null,
+      scenario_type: sourceScenario?.scenario_type || existingScenario?.scenario_type || 'action',
+      parent_id: sourceScenario?.parent_id || existingScenario?.parent_id || null,
+      dom_check_anchor: sourceScenario?.dom_check_anchor || existingScenario?.dom_check_anchor || null,
+      scenario_meta: sourceScenario?.scenario_meta || existingScenario?.scenario_meta || {},
     };
+
+    this._recordingWidgetConfig = this._resolveGlobalWidgetConfig(safeScenario.scenario_meta);
 
     const effectiveImportProfileId = importProfileId
       ?? existingScenario?.browser_profile_id
@@ -118,8 +128,13 @@ class RecorderService {
     this.usedUserDataDir = userDataDir;
 
     this.isRecording = true;
+    this._stopping = false;
 
     try {
+      if (this.browserProfileService) {
+        await this.browserProfileService.waitForProfileUnlock(userDataDir);
+      }
+
       this.browser = await puppeteer.launch({
         headless: false,
         defaultViewport: this.viewport,
@@ -134,7 +149,7 @@ class RecorderService {
       });
 
       this.browser.on('disconnected', () => {
-        this.isRecording = false;
+        this._handleBrowserDisconnected();
       });
       await this._releaseBrowserTopMost();
 
@@ -149,10 +164,7 @@ class RecorderService {
         variableMap,
       });
 
-      await this.page.exposeFunction('onRpaRecordedAction', (payload) => {
-        this._handleClientAction(payload);
-      });
-      await this.page.evaluateOnNewDocument(this._getInjectionScript());
+      await this._installRecordingBridge(this.page);
 
       // Chromium restores cookies natively from userDataDir — just navigate to the target.
       await this.page.goto(resolvedTargetUrl, {
@@ -175,7 +187,7 @@ class RecorderService {
       await this._releaseBrowserTopMost();
       // Chromium may re-assert topmost after first paint; release again after render settles
       setTimeout(() => this._releaseBrowserTopMost().catch(() => {}), 1000);
-      await this.page.evaluate(this._getInjectionScript()).catch(() => {});
+      await this._injectRecordingScript(this.page);
 
       this.devicePixelRatio = await this.page.evaluate(() => window.devicePixelRatio || 1).catch(() => 1);
       this.scenario.device_pixel_ratio = this.devicePixelRatio;
@@ -198,13 +210,32 @@ class RecorderService {
   }
 
   async stopRecording() {
+    if (this._stopping) {
+      return this._stopPromise;
+    }
     if (!this.isRecording && !this.scenario) {
       throw new Error('Khong co phien record nao dang chay.');
     }
 
+    this._stopping = true;
+    this._stopPromise = this._finalizeRecordingSession();
+    try {
+      return await this._stopPromise;
+    } finally {
+      this._stopping = false;
+      this._stopPromise = null;
+    }
+  }
+
+  async _finalizeRecordingSession() {
     const endTime = Date.now();
     const durationMs = Math.max(0, endTime - this.startTime);
     this.isRecording = false;
+
+    if (this._recordingFrameHandler && this.page) {
+      this.page.off('framenavigated', this._recordingFrameHandler);
+      this._recordingFrameHandler = null;
+    }
 
     // Dung screenshot timer
     if (this._screenshotTimer) {
@@ -225,8 +256,14 @@ class RecorderService {
     }
 
     await this._mirrorFramesToStorage();
+    // Disk frames may outlive in-memory list when browser crashed mid-session.
+    await this._hydrateFramesFromDiskIfNeeded();
     const recordedSteps = this._buildSteps();
-    const previewManifest = await this._writePreviewManifest(durationMs);
+    const effectiveDurationMs = Math.max(
+      durationMs,
+      this.frames.length ? Math.max(...this.frames.map((frame) => Number(frame.timestamp) || 0)) : 0,
+    );
+    const previewManifest = await this._writePreviewManifest(effectiveDurationMs);
     // Khong tu dong render video — chi xuat ban moi render
     const currentScenario = this.scenario?.id ? this.dbService.getScenarioById(this.scenario.id) : null;
     const existingSteps = this.mode === 'append' ? currentScenario?.steps || [] : [];
@@ -240,7 +277,14 @@ class RecorderService {
       // Giu nguyen preview_path cu neu co, tranh mat video da xuat ban
       preview_path: currentScenario?.preview_path || null,
       preview_manifest_path: previewManifest,
-      preview_duration_ms: durationMs,
+      preview_duration_ms: effectiveDurationMs,
+      // Avoid empty UI persist wiping a real frame list later in the same save path.
+      preview_manifest_frames: this.frames.map((frame) => ({
+        time: frame.timestamp,
+        name: frame.fileName,
+        path: frame.filePath,
+        url: frame.filePath ? toCacheUrl(frame.filePath) : null,
+      })),
     };
     const saved = this.dbService.saveScenario(scenarioToSave, steps);
 
@@ -248,7 +292,7 @@ class RecorderService {
       scenario: saved,
       steps: saved.steps || [],
       metadata: {
-        durationMs,
+        durationMs: effectiveDurationMs,
         totalEvents: this.recordedEvents.length,
         totalSteps: recordedSteps.length,
         totalFrames: this.frames.length,
@@ -263,6 +307,18 @@ class RecorderService {
 
     this._resetSession();
     return result;
+  }
+
+  _handleBrowserDisconnected() {
+    if (this._stopping || !this.scenario) {
+      this.isRecording = false;
+      return;
+    }
+    console.warn('[Recorder] Browser disconnected — tu dong dung va luu phien record.');
+    this.stopRecording().catch((error) => {
+      console.warn(`[Recorder] Auto-stop sau disconnect that bai: ${error.message}`);
+      this.isRecording = false;
+    });
   }
 
   async openBrowser(scenarioId, targetUrl, viewport = DEFAULT_VIEWPORT) {
@@ -369,12 +425,8 @@ class RecorderService {
       });
 
       // Sau khi phat lai xong, bat dau record append mode
-      // Tien inject script va CDP screencast
-      await page.exposeFunction('onRpaRecordedAction', (payload) => {
-        this._handleClientAction(payload);
-      });
-      await page.evaluateOnNewDocument(this._getInjectionScript());
-      await page.evaluate(this._getInjectionScript()).catch(() => {});
+      this._recordingWidgetConfig = this._resolveGlobalWidgetConfig(scenario.scenario_meta || {});
+      await this._installRecordingBridge(page);
 
       this.scenario = {
         id: scenarioId,
@@ -385,6 +437,10 @@ class RecorderService {
         recorded_width: effectiveViewport.width,
         recorded_height: effectiveViewport.height,
         device_pixel_ratio: scenario.device_pixel_ratio || 1,
+        scenario_type: scenario.scenario_type || 'action',
+        parent_id: scenario.parent_id || null,
+        browser_profile_id: scenario.browser_profile_id || effectiveImportProfileId || null,
+        scenario_meta: scenario.scenario_meta || {},
       };
       this.mode = 'append';
       this.lastImportProfileId = effectiveImportProfileId;
@@ -401,17 +457,18 @@ class RecorderService {
 
       this.devicePixelRatio = await page.evaluate(() => window.devicePixelRatio || 1).catch(() => 1);
       this.isRecording = true;
+      this._stopping = false;
       this.browser = browser;
       this.page = page;
 
-      // Thay CDP screencast bang screenshot 30 FPS
+      // Screenshot capture ~4 FPS (same as startRecording)
       this._screenshotTimer = setInterval(() => {
         this._lastScreenshotPromise = this._takeScreenshot();
       }, 250);
       await this._takeScreenshot();
 
       browser.on('disconnected', () => {
-        this.isRecording = false;
+        this._handleBrowserDisconnected();
       });
 
       return {
@@ -495,6 +552,9 @@ class RecorderService {
       } else if (action_type === 'input' || action_type === 'type') {
         const text = resolveVariableTemplate(config.text || '', variableMap);
         await this._replayType(page, anchor, selector, text, viewport, config.delay || 50);
+      } else if (action_type === 'file') {
+        const filePath = resolveVariableTemplate(config.text || '', variableMap);
+        await this._replayFile(page, anchor, selector, filePath, viewport);
       } else if (action_type === 'scroll') {
         const scrollX = anchor.scroll_x ?? config.scrollX ?? 0;
         const scrollY = anchor.scroll_y ?? config.scrollY ?? 0;
@@ -588,6 +648,49 @@ class RecorderService {
     await page.keyboard.press('A').catch(() => {});
     await page.keyboard.up('Control').catch(() => {});
     await page.keyboard.type(String(text || ''), { delay: randomRuntimeDelay(delay, 25, 120) }).catch(() => {});
+  }
+
+  async _replayFile(page, anchor = {}, selector = '', filePath = '', viewport = DEFAULT_VIEWPORT) {
+    if (!filePath || /^C:\\fakepath\\/i.test(filePath)) return;
+
+    const focused = await this._replayFocus(page, anchor, selector);
+    if (!focused) {
+      const coords = anchor.relative_coords;
+      if (coords?.x !== undefined && coords?.y !== undefined) {
+        const x = Math.round((coords.x / 100) * viewport.width);
+        const y = Math.round((coords.y / 100) * viewport.height);
+        await page.mouse.click(x, y).catch(() => {});
+      }
+    }
+
+    const handle = selector ? await page.$(selector).catch(() => null) : null;
+    if (handle) {
+      await handle.uploadFile(filePath).catch(() => {});
+      return;
+    }
+
+    const selectors = [
+      selector,
+      anchor.selector_value,
+      anchor.id ? `#${anchor.id}` : '',
+      anchor.name ? `[name="${anchor.name}"]` : '',
+    ].filter(Boolean);
+
+    for (const item of selectors) {
+      const candidate = await page.$(item).catch(() => null);
+      if (!candidate) continue;
+      await candidate.uploadFile(filePath).catch(() => {});
+      return;
+    }
+  }
+
+  _resolveGlobalWidgetConfig(scenarioMeta = {}) {
+    const debounceKeydown = scenarioMeta?.global_widgets?.debounce_keydown || {};
+    return {
+      debounce_keydown: {
+        debounce_ms: Math.max(50, Math.min(5000, Number(debounceKeydown.debounce_ms) || 300)),
+      },
+    };
   }
 
   async _replayFocus(page, anchor = {}, selector = '') {
@@ -1024,22 +1127,24 @@ class RecorderService {
 
   _mergeTypeEvents(events) {
     const merged = [];
+    const inputLike = new Set(['input', 'type', 'file']);
 
     for (const event of events) {
-      if (event.action_type !== 'input' && event.action_type !== 'type') {
+      if (!inputLike.has(event.action_type)) {
         merged.push(event);
         continue;
       }
 
       const previous = merged[merged.length - 1];
       const sameTarget = previous
-        && (previous.action_type === 'input' || previous.action_type === 'type')
+        && inputLike.has(previous.action_type)
         && previous.selector_value === event.selector_value
         && JSON.stringify(previous.target_anchor || {}) === JSON.stringify(event.target_anchor || {})
         && event.time_offset - previous.time_offset < 2500;
 
       if (sameTarget && event.text !== undefined) {
         previous.text = event.text;
+        previous.action_type = event.action_type;
         previous.delay_ms += event.delay_ms;
         previous.time_offset = event.time_offset;
       } else {
@@ -1074,6 +1179,9 @@ class RecorderService {
     if (event.action_type === 'input' || event.action_type === 'type') {
       return { selector: selectorValue || '', text: event.text || '', delay: randomRuntimeDelay(50, 25, 120) };
     }
+    if (event.action_type === 'file') {
+      return { selector: selectorValue || '', text: event.text || '' };
+    }
     if (event.action_type === 'scroll') {
       return { scrollX: event.scroll_x || 0, scrollY: event.scroll_y || 0 };
     }
@@ -1082,6 +1190,7 @@ class RecorderService {
 
   _describeEvent(event, selectorValue) {
     if (event.action_type === 'input' || event.action_type === 'type') return `Nhap: "${event.text || ''}"`;
+    if (event.action_type === 'file') return `File: "${event.text || ''}"`;
     if (event.action_type === 'scroll') return `Scroll den ${event.scroll_y || 0}px`;
     if (event.action_type === 'navigate') return event.url || 'Mo URL';
     return `Bam: ${selectorValue || event.target_anchor?.innerText || 'target'}`;
@@ -1187,14 +1296,83 @@ class RecorderService {
     }
   }
 
-  _getInjectionScript() {
+  async _installRecordingBridge(page) {
+    if (!page || page.isClosed()) return;
+
+    try {
+      await page.exposeFunction('onRpaRecordedAction', (payload) => {
+        this._handleClientAction(payload);
+      });
+    } catch (error) {
+      const message = String(error?.message || error);
+      if (!/already|been exposed/i.test(message)) {
+        throw error;
+      }
+    }
+
+    await page.evaluateOnNewDocument(this._getInjectionScriptSource());
+    await this._injectRecordingScript(page);
+
+    if (this._recordingFrameHandler) {
+      page.off('framenavigated', this._recordingFrameHandler);
+    }
+    this._recordingFrameHandler = async (frame) => {
+      if (!this.isRecording || frame !== page.mainFrame()) return;
+      await this._injectRecordingScript(page);
+    };
+    page.on('framenavigated', this._recordingFrameHandler);
+  }
+
+  async _injectRecordingScript(page) {
+    if (!page || page.isClosed()) return;
+    try {
+      const ok = await page.evaluate(this._getInjectionScriptSource());
+      if (!ok) {
+        console.warn('[Recorder] Recording inject script khong chay duoc tren trang hien tai.');
+      }
+    } catch (error) {
+      console.warn(`[Recorder] Inject recording script that bai: ${error.message}`);
+    }
+  }
+
+  async _hydrateFramesFromDiskIfNeeded() {
+    if (this.frames.length || !this.framesDir) return;
+
+    let entries = [];
+    try {
+      entries = await fs.readdir(this.framesDir);
+    } catch {
+      return;
+    }
+
+    const frameFiles = entries
+      .filter((name) => /^frame_\d+\.(png|jpe?g)$/i.test(name))
+      .sort();
+    if (!frameFiles.length) return;
+
+    console.warn(`[Recorder] Khoi phuc ${frameFiles.length} frame tu disk (bo nho mat sau disconnect).`);
+    this.frames = frameFiles.map((fileName, index) => ({
+      timestamp: index * 250,
+      fileName,
+      filePath: path.join(this.framesDir, fileName),
+    }));
+    this.frameCounter = frameFiles.length;
+  }
+
+  _getInjectionScriptSource() {
     const anchorHelpers = getElementAnchorHelpersScript();
-
+    const widgetConfig = this._recordingWidgetConfig || this._resolveGlobalWidgetConfig();
+    const configJson = JSON.stringify(widgetConfig);
+    // Concatenate helpers + recorder listeners as one function body.
+    // Do not call eval() inside the page — Facebook Trusted Types blocks it.
+    // eslint-disable-next-line no-new-func
     return new Function(`
-      if (window.__rpaRecorderInjected) return;
-      window.__rpaRecorderInjected = true;
+      ${anchorHelpers}
 
-      eval(${JSON.stringify(anchorHelpers)});
+      const __rpaWidgetConfig = ${configJson};
+
+      if (window.__rpaRecorderInjected) return true;
+      window.__rpaRecorderInjected = true;
 
       const send = (payload) => {
         if (typeof window.onRpaRecordedAction === 'function') {
@@ -1223,12 +1401,74 @@ class RecorderService {
         if (!target || !('value' in target)) return;
 
         const anchor = getAnchor(target);
+        const tagType = (target.getAttribute && target.getAttribute('type')) || target.type || '';
+        const isFileInput = String(target.tagName || '').toLowerCase() === 'input' && tagType === 'file';
         send({
-          action_type: 'input',
+          action_type: isFileInput ? 'file' : 'input',
           selector_value: pickSelector(anchor),
           target_anchor: anchor,
           text: target.value || '',
         });
+      }, true);
+
+      function findEditableRoot(element) {
+        let node = element;
+        while (node) {
+          if (node.isContentEditable) return node;
+          const tag = String(node.tagName || '').toLowerCase();
+          if (tag === 'textarea') return node;
+          if (tag === 'input') {
+            const inputType = String((node.getAttribute && node.getAttribute('type')) || node.type || 'text').toLowerCase();
+            if (!['button', 'submit', 'checkbox', 'radio', 'file', 'hidden', 'reset'].includes(inputType)) {
+              return node;
+            }
+          }
+          if (node.getAttribute && node.getAttribute('role') === 'textbox') return node;
+          node = node.parentElement;
+        }
+        return null;
+      }
+
+      function readEditableText(target) {
+        if (!target) return '';
+        if ('value' in target && typeof target.value === 'string') return target.value;
+        if (target.isContentEditable) return target.innerText || target.textContent || '';
+        return '';
+      }
+
+      const debounceKeydown = __rpaWidgetConfig.debounce_keydown || {};
+      const debounceMs = Math.max(50, Math.min(5000, Number(debounceKeydown.debounce_ms) || 300));
+      let keydownTimer = null;
+      let keydownTarget = null;
+
+      document.addEventListener('keydown', (event) => {
+        if (event.repeat) return;
+        if (event.ctrlKey || event.metaKey || event.altKey) return;
+        if (event.key === 'Tab' || event.key === 'Escape') return;
+
+        const editable = findEditableRoot(event.target);
+        if (!editable) return;
+
+        keydownTarget = editable;
+        if (keydownTimer) window.clearTimeout(keydownTimer);
+        keydownTimer = window.setTimeout(() => {
+          const target = keydownTarget || document.activeElement;
+          keydownTarget = null;
+          const activeEditable = findEditableRoot(target);
+          if (!activeEditable) return;
+
+          const text = readEditableText(activeEditable);
+          if (!text) return;
+
+          const anchor = getAnchor(activeEditable);
+          send({
+            action_type: 'input',
+            selector_value: pickSelector(anchor),
+            target_anchor: anchor,
+            text,
+            source: 'debounce_keydown',
+          });
+        }, debounceMs);
       }, true);
 
       let scrollTimer = null;
@@ -1243,11 +1483,23 @@ class RecorderService {
           });
         }, 180);
       }, true);
+
+      return true;
     `);
+  }
+
+  // Keep old name used by any historical call sites.
+  _getInjectionScript() {
+    return this._getInjectionScriptSource();
   }
 
   async _cleanupBrowser() {
     this.cdpSession = null;
+
+    if (this._recordingFrameHandler && this.page) {
+      this.page.off('framenavigated', this._recordingFrameHandler);
+      this._recordingFrameHandler = null;
+    }
 
     if (this._screenshotTimer) {
       clearInterval(this._screenshotTimer);
@@ -1350,6 +1602,8 @@ $flags = 0x0001 -bor 0x0002 -bor 0x0010
     this.previewWarning = null;
     this.usedUserDataDir = null;
     this.lastImportProfileId = null;
+    this._stopping = false;
+    this._recordingFrameHandler = null;
   }
 }
 

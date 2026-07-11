@@ -967,12 +967,18 @@ class DatabaseService {
     if (Array.isArray(scenario.preview_manifest_frames)) {
       const manifestPath = scenario.preview_manifest_path || existingScenario?.preview_manifest_path;
       if (manifestPath) {
-        const durationMs = scenario.preview_duration_ms != null
-          ? Number(scenario.preview_duration_ms)
-          : (scenario.preview_manifest_frames.length
-            ? Math.max(...scenario.preview_manifest_frames.map((frame) => Number(frame.time) || 0))
-            : 0);
-        this.writePreviewManifest(manifestPath, scenario.preview_manifest_frames, durationMs);
+        // Refuse to clobber an existing non-empty preview with an empty frame list
+        // from metadata-only UI saves (e.g. persist-before-record).
+        const incomingEmpty = scenario.preview_manifest_frames.length === 0;
+        const existingFrames = incomingEmpty ? readPreviewFrames(manifestPath) : [];
+        if (!(incomingEmpty && existingFrames.length > 0)) {
+          const durationMs = scenario.preview_duration_ms != null
+            ? Number(scenario.preview_duration_ms)
+            : (scenario.preview_manifest_frames.length
+              ? Math.max(...scenario.preview_manifest_frames.map((frame) => Number(frame.time) || 0))
+              : 0);
+          this.writePreviewManifest(manifestPath, scenario.preview_manifest_frames, durationMs);
+        }
       }
     }
 
@@ -1084,6 +1090,7 @@ class DatabaseService {
       scenario_id: scenarioId,
       key: item.key,
       value: item.value ?? '',
+      value_type: item.value_type === 'file' ? 'file' : 'text',
     }));
   }
 
@@ -1140,9 +1147,17 @@ class DatabaseService {
       if (oldKeyFromId && oldKeyFromId !== key) {
         this._renameVariableProfileKeys(oldKeyFromId, key);
       }
-      current[index] = { key, value };
+      current[index] = {
+        key,
+        value,
+        value_type: variable.value_type === 'file' ? 'file' : 'text',
+      };
     } else {
-      current.push({ key, value });
+      current.push({
+        key,
+        value,
+        value_type: variable.value_type === 'file' ? 'file' : 'text',
+      });
     }
 
     return this.saveScenarioLocalVariables(scenarioId, current)
@@ -2605,6 +2620,7 @@ function normalizeVariableEntries(raw) {
     .map((item) => ({
       key: String(item?.key || item?.variable_key || item?.name || '').trim(),
       value: item?.value ?? '',
+      value_type: item?.value_type === 'file' ? 'file' : 'text',
     }))
     .filter((item) => item.key);
 }
@@ -2614,6 +2630,7 @@ function serializeVariableEntries(entries = []) {
     .map((item) => ({
       key: String(item?.key || item?.variable_key || item?.name || '').trim(),
       value: item?.value ?? '',
+      value_type: item?.value_type === 'file' ? 'file' : 'text',
     }))
     .filter((item) => item.key);
   return JSON.stringify(normalized);

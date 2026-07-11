@@ -69,6 +69,7 @@ export function getElementAnchorHelpersScript() {
         tagName: element.tagName.toLowerCase(),
         type: element.getAttribute('type') || '',
         innerText: text,
+        contentEditable: Boolean(element.isContentEditable),
         classList: stableClasses(element),
         card_class: stableClasses(element)[0] || '',
         xpath: '',
