@@ -7,7 +7,6 @@ import {
   Eye,
   FolderOpen,
   Info,
-  Keyboard,
   MousePointer2,
   PanelRightClose,
   PanelRightOpen,
@@ -26,17 +25,13 @@ export default function StandardScenarioEditorContent({
   setScenarioInfoOpen,
   stepEditorOpen,
   setStepEditorOpen,
-  globalWidgetsOpen,
-  setGlobalWidgetsOpen,
-  showGlobalWidgets,
-  GlobalWidgetsPanelComponent,
-  globalWidgetsProps,
   PanelSectionHeaderComponent,
   ActionIconBarComponent,
   IconOnlyComponent,
   ProgramMonitorComponent,
   StepCardComponent,
   StepEditPanelComponent,
+  stepEditPanelProps = {},
   TimelineComponent,
   ScenarioInfoPanelComponent,
   scenarioInfoProps,
@@ -45,6 +40,8 @@ export default function StandardScenarioEditorContent({
   browserProfileOptions,
   onBrowserProfileChange,
   activeViewport,
+  browserZoom = 67,
+  onBrowserZoomChange,
   platform,
   targetUrl,
   selectedStep,
@@ -105,6 +102,19 @@ export default function StandardScenarioEditorContent({
               </select>
             </label>
             <span className="shrink-0 text-[11px] text-[#7e8da5]">RES: {activeViewport.width} x {activeViewport.height}</span>
+            <label className="flex shrink-0 items-center gap-1.5 text-[11px] text-[#7e8da5]">
+              <span>ZOOM</span>
+              <select
+                value={Number(browserZoom) || 67}
+                onChange={(event) => onBrowserZoomChange?.(parseInt(event.target.value, 10) || 67)}
+                className="select-field h-7 w-[72px] px-1.5 text-xs"
+                title={t('scenarioEditor.browserZoomHint')}
+              >
+                {[50, 67, 75, 80, 90, 100].map((percent) => (
+                  <option key={percent} value={percent}>{percent}%</option>
+                ))}
+              </select>
+            </label>
           </div>
 
           <div className="flex min-h-0 flex-1 flex-col p-4">
@@ -202,6 +212,7 @@ export default function StandardScenarioEditorContent({
                       key={step.id || idx}
                       step={step}
                       index={idx}
+                      steps={steps}
                       isSelected={idx === selectedStepIndex}
                       isMultiSelected={selectedStepIndexes?.has(idx)}
                       onSelect={handleSelectStep}
@@ -239,21 +250,6 @@ export default function StandardScenarioEditorContent({
 
             {inspectorOpen && (
               <div className="flex min-h-0 min-w-0 flex-col border-l border-[#2a2d34] bg-[#15171d]">
-                {showGlobalWidgets && GlobalWidgetsPanelComponent && (
-                  <>
-                    <PanelSectionHeaderComponent
-                      icon={Keyboard}
-                      title={t('scenarioEditor.globalWidgets.title')}
-                      onToggle={() => setGlobalWidgetsOpen((current) => !current)}
-                      open={globalWidgetsOpen}
-                    />
-                    {globalWidgetsOpen && (
-                      <div className="shrink-0 border-b border-[#2a2d34] p-3">
-                        <GlobalWidgetsPanelComponent {...globalWidgetsProps} />
-                      </div>
-                    )}
-                  </>
-                )}
                 <PanelSectionHeaderComponent
                   icon={MousePointer2}
                   title={t('scenarioEditor.step.editTitle')}
@@ -280,6 +276,7 @@ export default function StandardScenarioEditorContent({
                     <StepEditPanelComponent
                       selectedStep={selectedStep}
                       variables={scenarioVariables}
+                      {...stepEditPanelProps}
                       onStepChange={(updates) => {
                         if (selectedStepIndex === null) return;
                         handleUpdateStep(selectedStepIndex, updates);
@@ -338,6 +335,8 @@ export default function StandardScenarioEditorContent({
                 currentTime={previewCurrentTime}
                 totalTime={totalTime || 20000}
                 onSeek={handleSeek}
+                selectedStepIndex={selectedStepIndex}
+                onSelectStep={handleSelectStep}
                 selectingTrim={selectingTrim}
                 pendingTrimRange={pendingTrimRange}
                 onTrimRangeChange={(range) => setPendingTrimRange(normalizeTrimRanges([range], totalTime || 20000)[0] || null)}

@@ -6,6 +6,10 @@ import puppeteer from 'puppeteer';
 import Database from 'better-sqlite3';
 import { resolveGuestSessionDir, resolveSessionStartUrl } from './BrowserSessionPaths.js';
 import { resolveScenarioTargetUrl } from '../rpa/VariableResolver.js';
+import {
+  getBrowserZoomService,
+  resolveBrowserZoomPercent,
+} from '../rpa/BrowserZoomService.js';
 
 const BROWSER_DEFINITIONS = [
   {
@@ -696,6 +700,14 @@ class BrowserProfileService {
     const settings = this.dbService.getSettings();
     const viewportWidth = Number(settings['browser.viewportWidth']) || 1280;
     const viewportHeight = Number(settings['browser.viewportHeight']) || 720;
+    const zoomPercent = resolveBrowserZoomPercent(settings);
+    const zoomService = getBrowserZoomService();
+    let zoomPrepare = null;
+    try {
+      zoomPrepare = await zoomService.prepareUserDataDir(userDataDir, zoomPercent);
+    } catch (error) {
+      console.warn(`[BrowserZoom] prepareUserDataDir failed: ${error.message}`);
+    }
 
     const browser = await puppeteer.launch({
       headless: false,
@@ -731,6 +743,17 @@ class BrowserProfileService {
         const effectiveUrl = this.resolveSessionStartUrl(url) || url;
         await page.goto(effectiveUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
       }
+
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      await zoomService.applyDefaultZoom({
+        page,
+        browser,
+        userDataDir,
+        percent: zoomPercent,
+        prepareResult: zoomPrepare,
+      }).catch((error) => {
+        console.warn(`[BrowserZoom] applyDefaultZoom failed: ${error.message}`);
+      });
     } catch {
       // Browser vẫn mở, bỏ qua lỗi điều hướng
     }

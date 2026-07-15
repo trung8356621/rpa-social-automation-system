@@ -2,6 +2,7 @@ import React from 'react';
 import { useDispatch } from 'react-redux';
 import { Database } from 'lucide-react';
 import { showToast } from '../slices/uiSlice';
+import { fetchLocalScenarios } from '../slices/scenarioSlice';
 import DataProfilesManager from '../components/DataProfilesManager';
 import { useTranslation } from '../i18n';
 
@@ -23,6 +24,9 @@ export default function DataProfilesPage() {
 
       <DataProfilesManager
         onToast={(payload) => dispatch(showToast(payload))}
+        onChanged={() => {
+          dispatch(fetchLocalScenarios());
+        }}
       />
     </div>
   );

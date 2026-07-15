@@ -31,7 +31,7 @@ import {
   X,
 } from 'lucide-react';
 import { setCurrentPage, showToast } from '../slices/uiSlice';
-import { fetchScenarios } from '../slices/scenarioSlice';
+import { fetchLocalScenarios, fetchScenarios } from '../slices/scenarioSlice';
 import { useTranslation } from '../i18n/index.jsx';
 import VariableInput from './VariableInput';
 import ScenarioVariablesBar from './ScenarioVariablesBar';
@@ -45,6 +45,7 @@ import {
   getSelectionHighlightAnchor,
   normalizeCrawlSteps,
 } from '../utils/crawlWidget';
+import { getPlatformFileRules } from '../../shared/platformFileAccept.js';
 
 const DEFAULT_ACTION_DELAY_MS = 300;
 const MAX_UNDO_STEPS = 20;
@@ -83,6 +84,7 @@ const ACTION_BUTTON_KEYS = [
   { actionType: 'navigate', icon: ExternalLink, labelKey: 'scenarioEditor.actions.navigate' },
   { actionType: 'click', icon: MousePointer2, labelKey: 'scenarioEditor.actions.click' },
   { actionType: 'input', icon: Keyboard, labelKey: 'scenarioEditor.actions.input' },
+  { actionType: 'debounce_keydown', icon: KeyRound, labelKey: 'scenarioEditor.actions.debounceKeydown' },
   { actionType: 'file', icon: Upload, labelKey: 'scenarioEditor.actions.file' },
   { actionType: 'wait', icon: Timer, labelKey: 'scenarioEditor.actions.wait' },
 ];
@@ -131,7 +133,9 @@ const defaultConfig = {
   click: { selector: '', skip_if_checked: false },
   input: { selector: '', text: '' },
   type: { selector: '', text: '' },
+  debounce_keydown: { selector: '', text: '' },
   file: { selector: '', variable_key: '', accept: '', max_size_mb: 0 },
+  scroll: {},
   wait: { duration: 2000 },
 };
 
@@ -142,10 +146,6 @@ function getStepConfig(step) {
 
 function fileTypeVariables(variables = []) {
   return variables.filter((item) => item.value_type === 'file');
-}
-
-function supportsGlobalWidgets(scenarioType) {
-  return scenarioType === 'action' || scenarioType === 'prepare';
 }
 
 const defaultUrl = (platform) => {
@@ -454,7 +454,9 @@ function describeStep(actionType, config, t) {
     click: t('scenarioEditor.stepDescriptions.click'),
     input: t('scenarioEditor.stepDescriptions.input'),
     type: t('scenarioEditor.stepDescriptions.type'),
+    debounce_keydown: t('scenarioEditor.stepDescriptions.debounceKeydown'),
     file: t('scenarioEditor.stepDescriptions.file'),
+    scroll: t('scenarioEditor.stepDescriptions.scroll'),
     wait: t('scenarioEditor.stepDescriptions.wait'),
   };
   return descriptions[actionType] || actionType || 'Unknown';
@@ -466,6 +468,7 @@ function getAction(actionType) {
     click: MousePointer2,
     input: Keyboard,
     type: Keyboard,
+    debounce_keydown: KeyRound,
     file: Upload,
     wait: Timer,
     waitForElement: Eye,
@@ -505,6 +508,7 @@ function drawImageContain(ctx, img, canvasWidth, canvasHeight) {
 function StepCard({
   step,
   index,
+  steps = [],
   isSelected,
   isMultiSelected = false,
   onSelect,
@@ -514,7 +518,8 @@ function StepCard({
   const { t } = useTranslation();
   const config = getStepConfig(step);
   const Icon = getAction(step.action_type);
-  const time = getStepTime(step, []);
+  // Prefer recording time_offset so list timestamps match timeline keyframes.
+  const time = getStepTimestamp(step, index, steps);
   const selector = config.selector || step.target_anchor?.selector_value || '';
   const text = config.text || '';
   const variableKey = config.variable_key || '';
@@ -555,7 +560,7 @@ function StepCard({
           </div>
         )}
 
-        {(['input', 'type'].includes(step.action_type)) && (
+        {(['input', 'type', 'debounce_keydown'].includes(step.action_type)) && (
           <div className="mt-0.5 truncate text-[10px] text-[#9aa7b7]">
             {selector ? `${selector} \u2192 ` : ''}{text ? `"${text}"` : ''}
           </div>
@@ -565,8 +570,6 @@ function StepCard({
           <div className="mt-0.5 truncate text-[10px] text-[#9aa7b7]">
             {selector ? `${selector} \u2192 ` : ''}
             {variableKey ? `{{${variableKey}}}` : (text || t('scenarioEditor.step.fileVariableUnset'))}
-            {config.accept ? ` · ${config.accept}` : ''}
-            {Number(config.max_size_mb) > 0 ? ` · \u2264${config.max_size_mb}MB` : ''}
           </div>
         )}
 
@@ -582,59 +585,6 @@ function StepCard({
       >
         <Trash2 className="h-3 w-3" />
       </button>
-    </div>
-  );
-}
-
-function GlobalWidgetsPanel({
-  scenarioMeta,
-  onScenarioChange,
-}) {
-  const { t } = useTranslation();
-  const globalWidgets = defaultGlobalWidgets(scenarioMeta);
-  const patchGlobalWidgets = (patch) => onScenarioChange({
-    nextScenarioMeta: {
-      ...defaultScenarioMeta(scenarioMeta),
-      global_widgets: {
-        ...globalWidgets,
-        ...patch,
-      },
-    },
-  });
-  const patchDebounceKeydown = (patch) => patchGlobalWidgets({
-    debounce_keydown: { ...globalWidgets.debounce_keydown, ...patch },
-  });
-
-  return (
-    <div className="grid grid-cols-2 gap-3 rounded border border-[#2a3144] bg-[#101217] p-3">
-      <p className="col-span-2 text-xs font-semibold text-[#c7d0dc]">
-        {t('scenarioEditor.globalWidgets.title')}
-      </p>
-      <div className="col-span-2 rounded border border-[#243047] bg-[#0d1018] px-3 py-2">
-        <p className="text-xs font-semibold text-[#dce5f2]">
-          {t('scenarioEditor.globalWidgets.debounceKeydown')}
-        </p>
-        <p className="mt-1 text-[11px] leading-relaxed text-[#8b97aa]">
-          {t('scenarioEditor.globalWidgets.debounceKeydownHint')}
-        </p>
-        <p className="mt-1 text-[10px] font-medium uppercase tracking-wide text-[#5f8fff]">
-          {t('scenarioEditor.globalWidgets.debounceKeydownAlwaysOn')}
-        </p>
-      </div>
-      <label className="col-span-2 block">
-        <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">{t('scenarioEditor.globalWidgets.debounceMs')}</span>
-        <input
-          type="number"
-          min="50"
-          max="5000"
-          value={globalWidgets.debounce_keydown.debounce_ms}
-          onChange={(event) => patchDebounceKeydown({ debounce_ms: Number(event.target.value) || 300 })}
-          className="input-field h-9"
-        />
-        <span className="mt-1 block text-[11px] leading-relaxed text-[#8b97aa]">
-          {t('scenarioEditor.globalWidgets.debounceMsHint')}
-        </span>
-      </label>
     </div>
   );
 }
@@ -659,6 +609,7 @@ function ScenarioInfoPanel({
   const showScrollSettings = scenarioType === 'crawl' || scenarioType === 'request_catching';
   const isRequestCatching = scenarioType === 'request_catching';
   const crawlMeta = defaultCrawlMeta(scenarioMeta);
+  const globalWidgets = defaultGlobalWidgets(scenarioMeta);
   const patchCrawlMeta = (patch) => onScenarioChange({
     nextScenarioMeta: {
       ...defaultScenarioMeta(scenarioMeta),
@@ -676,6 +627,18 @@ function ScenarioInfoPanel({
   });
   const patchCondition = (patch) => patchInfinity({
     condition: { ...crawlMeta.infinity_scroll.condition, ...patch },
+  });
+  const patchDebounceKeydown = (patch) => onScenarioChange({
+    nextScenarioMeta: {
+      ...defaultScenarioMeta(scenarioMeta),
+      global_widgets: {
+        ...globalWidgets,
+        debounce_keydown: {
+          ...globalWidgets.debounce_keydown,
+          ...patch,
+        },
+      },
+    },
   });
 
   return (
@@ -771,6 +734,28 @@ function ScenarioInfoPanel({
         <p className="col-span-2 text-[11px] leading-relaxed text-[#8b97aa]">
           {t('scenarioEditor.info.parentHint')}
         </p>
+      )}
+
+      {!showScrollSettings && (
+        <div className="col-span-2 rounded border border-[#2a3144] bg-[#101217] p-3">
+          <label className="flex cursor-pointer items-start gap-2">
+            <input
+              type="checkbox"
+              checked={globalWidgets.debounce_keydown.enabled}
+              onChange={(event) => patchDebounceKeydown({ enabled: event.target.checked })}
+              className="mt-0.5"
+            />
+            <span className="min-w-0">
+              <span className="flex items-center gap-2 text-xs font-semibold text-[#c7d0dc]">
+                <KeyRound className="h-3.5 w-3.5 text-[#7288ff]" />
+                {t('scenarioEditor.globalWidgets.debounceKeydown')}
+              </span>
+              <span className="mt-1 block text-[11px] leading-relaxed text-[#8b97aa]">
+                {t('scenarioEditor.globalWidgets.debounceKeydownHint')}
+              </span>
+            </span>
+          </label>
+        </div>
       )}
 
       {showScrollSettings && (
@@ -900,11 +885,13 @@ function ScenarioInfoPanel({
 function StepEditPanel({
   selectedStep,
   variables,
+  platform = 'custom',
   onStepChange,
 }) {
   const { t } = useTranslation();
   const config = getStepConfig(selectedStep);
   const fileVariables = fileTypeVariables(variables);
+  const fileRules = getPlatformFileRules(platform);
   const fileVariableKey = config.variable_key
     || (String(config.text || '').match(/^\{\{([^}]+)\}\}$/) || [])[1]
     || '';
@@ -960,7 +947,9 @@ function StepEditPanel({
                 <option value="navigate">{t('scenarioEditor.actions.navigate')}</option>
                 <option value="click">{t('scenarioEditor.actions.click')}</option>
                 <option value="input">{t('scenarioEditor.actions.input')}</option>
+                <option value="debounce_keydown">{t('scenarioEditor.actions.debounceKeydown')}</option>
                 <option value="file">{t('scenarioEditor.actions.file')}</option>
+                <option value="scroll">{t('scenarioEditor.actions.scroll')}</option>
                 <option value="wait">{t('scenarioEditor.actions.wait')}</option>
               </select>
             </label>
@@ -986,7 +975,7 @@ function StepEditPanel({
               )}
             </label>
 
-            {(['input', 'type'].includes(selectedStep.action_type)) && (
+            {(['input', 'type', 'debounce_keydown'].includes(selectedStep.action_type)) && (
               <label className="col-span-2 block">
                 <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">{t('scenarioEditor.step.text')}</span>
                 <VariableInput
@@ -1018,29 +1007,14 @@ function StepEditPanel({
                     </span>
                   )}
                 </label>
-                <label className="block">
-                  <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">{t('scenarioEditor.step.fileAccept')}</span>
-                  <input
-                    value={config.accept || ''}
-                    onChange={(event) => updateActionConfig({ accept: event.target.value })}
-                    className="input-field h-9"
-                    placeholder="image/*,video/*,.png"
-                  />
-                </label>
-                <label className="block">
-                  <span className="mb-1 block text-xs font-semibold text-[#b7c4d8]">{t('scenarioEditor.step.fileMaxSize')}</span>
-                  <input
-                    type="number"
-                    min="0"
-                    value={Number(config.max_size_mb) || 0}
-                    onChange={(event) => updateActionConfig({ max_size_mb: Number(event.target.value) || 0 })}
-                    className="input-field h-9"
-                    placeholder="0"
-                  />
-                  <span className="mt-1 block text-[11px] leading-relaxed text-[#8b97aa]">
-                    {t('scenarioEditor.step.fileMaxSizeHint')}
-                  </span>
-                </label>
+                <div className="col-span-2 rounded border border-[#243047] bg-[#0d1018] px-3 py-2.5">
+                  <p className="text-xs font-semibold text-[#dce5f2]">{t(fileRules.labelKey)}</p>
+                  <ul className="mt-1.5 list-disc space-y-0.5 pl-4 text-[11px] leading-relaxed text-[#8b97aa]">
+                    {fileRules.linesKeys.map((key) => (
+                      <li key={key}>{t(key)}</li>
+                    ))}
+                  </ul>
+                </div>
               </>
             )}
 
@@ -1090,6 +1064,8 @@ function Timeline({
   currentTime,
   totalTime,
   onSeek,
+  selectedStepIndex = null,
+  onSelectStep,
   selectingTrim = false,
   pendingTrimRange = null,
   onTrimRangeChange,
@@ -1176,21 +1152,25 @@ function Timeline({
         <div className="absolute left-4 right-4 top-1/2 h-px bg-[#344054]" />
 
         {steps.map((step, idx) => {
-          const stepTime = getStepTime(step, steps);
-          // Prefer time_offset (actual recording timestamp) over cumulative delay_ms so
-          // keyframe diamonds spread across the full recording timeline.
-          const displayTime = step.target_anchor?.time_offset != null
-            ? Number(step.target_anchor.time_offset)
-            : stepTime;
+          const displayTime = getStepTimestamp(step, idx, steps);
           const left = maxTime > 0 ? Math.min(98, (displayTime / maxTime) * 100) : 0;
+          const isActive = selectedStepIndex === idx
+            || (selectedStepIndex == null
+              && Math.abs(displayTime - currentTime) < Math.max(120, step.delay_ms || DEFAULT_ACTION_DELAY_MS));
           return (
             <button
               key={step.id || idx}
               type="button"
-              className="absolute top-1/2 h-4 w-4 -translate-x-1/2 -translate-y-1/2 rotate-45 border border-[#7e8da5] bg-[#20242c] data-[active=true]:border-[#ffd2d2] data-[active=true]:bg-[#ff3b59]"
+              className="absolute top-1/2 z-10 h-4 w-4 -translate-x-1/2 -translate-y-1/2 rotate-45 border border-[#7e8da5] bg-[#20242c] data-[active=true]:border-[#ffd2d2] data-[active=true]:bg-[#ff3b59]"
               style={{ left: `${left}%` }}
-              data-active={Math.abs(displayTime - currentTime) < Math.max(120, step.delay_ms || DEFAULT_ACTION_DELAY_MS)}
+              data-active={isActive}
               title={`${describeStep(step.action_type, {}, t)} - ${formatSeconds(displayTime)}`}
+              onClick={(event) => {
+                event.stopPropagation();
+                if (selectingTrim) return;
+                if (onSelectStep) onSelectStep(idx);
+                else onSeek?.(displayTime);
+              }}
             />
           );
         })}
@@ -1252,6 +1232,7 @@ function defaultGlobalWidgets(meta = {}) {
   const debounceKeydown = widgets.debounce_keydown || {};
   return {
     debounce_keydown: {
+      enabled: debounceKeydown.enabled !== false,
       debounce_ms: Number(debounceKeydown.debounce_ms) || 300,
     },
   };
@@ -1322,7 +1303,6 @@ export default function ScenarioEditor({ scenario, onBack }) {
   const [inspectorOpen, setInspectorOpen] = useState(true);
   const [scenarioInfoOpen, setScenarioInfoOpen] = useState(true);
   const [stepEditorOpen, setStepEditorOpen] = useState(true);
-  const [globalWidgetsOpen, setGlobalWidgetsOpen] = useState(true);
   const [timelineOpen, setTimelineOpen] = useState(true);
   const [previewPlaying, setPreviewPlaying] = useState(false);
   const [previewCurrentTime, setPreviewCurrentTime] = useState(0);
@@ -1344,7 +1324,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
   const [scenarioVariables, setScenarioVariables] = useState([]);
   const [variablesRefreshKey, setVariablesRefreshKey] = useState(0);
   const [profilesRefreshKey, setProfilesRefreshKey] = useState(0);
-  const [activeVariableProfileId, setActiveVariableProfileId] = useState('');
+  const [activeVariableProfileId, setActiveVariableProfileId] = useState(scenario?.variable_profile_id || '');
   const [designMode, setDesignMode] = useState(false);
   const [selectedCrawlWidgetId, setSelectedCrawlWidgetId] = useState(null);
   const undoStackRef = useRef([]);
@@ -1353,6 +1333,10 @@ export default function ScenarioEditor({ scenario, onBack }) {
   const isApplyingHistoryRef = useRef(false);
   const stepEditUndoPushedRef = useRef(false);
   const stepEditUndoTimerRef = useRef(null);
+  const currentScenarioIdRef = useRef(scenario?.id || null);
+  const activeVariableProfileIdRef = useRef(scenario?.variable_profile_id || '');
+  const persistInFlightRef = useRef(null);
+  const scenarioDetailsLoadGenRef = useRef(0);
   const scenarioDraftRef = useRef({
     name: scenario?.name || '',
     description: scenario?.description || '',
@@ -1365,6 +1349,17 @@ export default function ScenarioEditor({ scenario, onBack }) {
     parentId: scenario?.parent_id || '',
     domCheckSelector: readDomCheckSelector(scenario?.dom_check_anchor),
   });
+
+  const setScenarioIdSafe = useCallback((nextId) => {
+    currentScenarioIdRef.current = nextId || null;
+    setCurrentScenarioId(nextId || null);
+  }, []);
+
+  const setVariableProfileIdSafe = useCallback((nextId) => {
+    const normalized = nextId || '';
+    activeVariableProfileIdRef.current = normalized;
+    setActiveVariableProfileId(normalized);
+  }, []);
 
   const parentScenarioOptions = useMemo(() => (
     allScenarios.filter((item) => (
@@ -1397,20 +1392,23 @@ export default function ScenarioEditor({ scenario, onBack }) {
   }, [currentScenarioId, variablesRefreshKey, loadScenarioVariables]);
 
   const handleVariableProfileChange = useCallback(async (profileId) => {
-    setActiveVariableProfileId(profileId);
-    if (!currentScenarioId || !window.electronAPI?.setScenarioVariableProfile) return;
+    const nextProfileId = profileId || '';
+    setVariableProfileIdSafe(nextProfileId);
+    const scenarioId = currentScenarioIdRef.current;
+    if (!scenarioId || !window.electronAPI?.setScenarioVariableProfile) return;
 
     try {
       await window.electronAPI.setScenarioVariableProfile({
-        scenarioId: currentScenarioId,
-        profileId: profileId || null,
+        scenarioId,
+        profileId: nextProfileId || null,
       });
       setVariablesRefreshKey((value) => value + 1);
       setProfilesRefreshKey((value) => value + 1);
+      dispatch(fetchLocalScenarios());
     } catch (error) {
       dispatch(showToast({ type: 'error', message: error.message || 'Không áp dụng được hồ sơ biến' }));
     }
-  }, [currentScenarioId, dispatch]);
+  }, [dispatch, setVariableProfileIdSafe]);
 
   // ======== Derived State ========
   const hasSteps = steps.length > 0;
@@ -1724,8 +1722,15 @@ export default function ScenarioEditor({ scenario, onBack }) {
 
   // ======== Load Scenario Frames ========
   useEffect(() => {
-    if (!currentScenarioId) return;
-    window.electronAPI.getScenarioDetails(currentScenarioId).then((s) => {
+    if (!currentScenarioId) return undefined;
+
+    const loadGen = ++scenarioDetailsLoadGenRef.current;
+    const requestedId = currentScenarioId;
+
+    window.electronAPI.getScenarioDetails(requestedId).then((s) => {
+      if (loadGen !== scenarioDetailsLoadGenRef.current) return;
+      if (currentScenarioIdRef.current !== requestedId) return;
+
       if (s?.steps) {
         setSteps(normalizeCrawlSteps(normalizeSteps(s.steps)));
       }
@@ -1752,7 +1757,10 @@ export default function ScenarioEditor({ scenario, onBack }) {
         setScenarioMeta(defaultScenarioMeta(s.scenario_meta));
         setParentId(s.parent_id || '');
         setDomCheckSelector(readDomCheckSelector(s.dom_check_anchor));
-        setActiveVariableProfileId(s.variable_profile_id || '');
+        // Prefer server profile, but never wipe a newer local selection with stale null.
+        const serverProfile = s.variable_profile_id || '';
+        const localProfile = activeVariableProfileIdRef.current || '';
+        setVariableProfileIdSafe(serverProfile || localProfile);
       }
       if (s?.preview_path) {
         setScenarioPreviewPath(s.preview_path);
@@ -1767,13 +1775,11 @@ export default function ScenarioEditor({ scenario, onBack }) {
       setManifestFrames(Array.isArray(s?.preview_frames) ? s.preview_frames : []);
       clearUndoHistory();
     }).catch(() => {});
-  }, [clearUndoHistory, currentScenarioId]);
 
-  useEffect(() => {
-    if (!currentScenarioId) {
-      setActiveVariableProfileId('');
-    }
-  }, [currentScenarioId]);
+    return () => {
+      scenarioDetailsLoadGenRef.current += 1;
+    };
+  }, [clearUndoHistory, currentScenarioId, setVariableProfileIdSafe]);
 
   useEffect(() => {
     const missingPaths = [
@@ -1872,55 +1878,126 @@ export default function ScenarioEditor({ scenario, onBack }) {
 
   // ======== Callbacks ========
 
-  const persist = useCallback(async () => {
-    setSaving(true);
-    try {
-      // Never pass empty preview_manifest_frames during metadata-only saves.
-      // DatabaseService.writePreviewManifest would overwrite a real frame list with [].
-      const previewExtras = manifestFrames.length
-        ? {
-          preview_manifest_path: scenarioManifestPath,
-          preview_manifest_frames: manifestFrames,
-          preview_duration_ms: manifestDuration,
-        }
-        : {
-          // Keep existing DB/manifest paths; omit frames so saveScenario skips rewrite.
-          ...(scenarioManifestPath ? { preview_manifest_path: scenarioManifestPath } : {}),
-        };
-
-      const scenarioData = {
-        ...(currentScenarioId ? { id: currentScenarioId } : {}),
-        name: scenarioDraftRef.current.name || name,
-        ...buildScenarioMetaPayload(scenarioDraftRef.current, {
-          variable_profile_id: activeVariableProfileId || null,
-          recorded_width: activeViewport.width,
-          recorded_height: activeViewport.height,
-          preview_trim_ranges: [],
-          ...previewExtras,
-        }),
-      };
-      const dbSteps = steps.map(toDatabaseStep);
-      const saved = await window.electronAPI.saveScenario(scenarioData, dbSteps);
-      if (saved) {
-        setCurrentScenarioId(saved.id);
-        window.electronAPI.getScenarios?.()
-          .then((items) => setAllScenarios(Array.isArray(items) ? items : []))
-          .catch(() => {});
-        dispatch(showToast({ type: 'success', message: 'Đã lưu kịch bản' }));
-      }
-      return saved;
-    } catch (error) {
-      dispatch(showToast({ type: 'error', message: error.message || 'Lưu thất bại' }));
-      return null;
-    } finally {
-      setSaving(false);
+  const persist = useCallback(async (options = {}) => {
+    if (persistInFlightRef.current) {
+      return persistInFlightRef.current;
     }
-  }, [currentScenarioId, name, platform, activeViewport, steps, manifestFrames, manifestDuration, scenarioManifestPath, activeVariableProfileId, dispatch]);
+
+    const run = (async () => {
+      setSaving(true);
+      try {
+        const stepsToSave = Array.isArray(options.steps) ? options.steps : steps;
+        const framesToSave = Array.isArray(options.manifestFrames) ? options.manifestFrames : manifestFrames;
+        const durationToSave = options.manifestDuration != null ? options.manifestDuration : manifestDuration;
+
+        // Never pass empty preview_manifest_frames during metadata-only saves.
+        // DatabaseService.writePreviewManifest would overwrite a real frame list with [].
+        // Exception: replace-record intentionally wipes frames via options.wipePreview.
+        const previewExtras = options.wipePreview
+          ? {
+            preview_manifest_path: scenarioManifestPath || null,
+            preview_manifest_frames: [],
+            preview_duration_ms: 0,
+            force_preview_wipe: true,
+          }
+          : framesToSave.length
+            ? {
+              preview_manifest_path: scenarioManifestPath,
+              preview_manifest_frames: framesToSave,
+              preview_duration_ms: durationToSave,
+            }
+            : {
+              ...(scenarioManifestPath ? { preview_manifest_path: scenarioManifestPath } : {}),
+            };
+
+        // Use refs so rapid Save/Record cannot create a second scenario before state commits.
+        const scenarioId = currentScenarioIdRef.current;
+        const profileId = activeVariableProfileIdRef.current || null;
+
+        const scenarioData = {
+          ...(scenarioId ? { id: scenarioId } : {}),
+          name: scenarioDraftRef.current.name || name,
+          ...buildScenarioMetaPayload(scenarioDraftRef.current, {
+            variable_profile_id: profileId,
+            recorded_width: activeViewport.width,
+            recorded_height: activeViewport.height,
+            preview_trim_ranges: [],
+            ...previewExtras,
+          }),
+        };
+        const dbSteps = stepsToSave.map(toDatabaseStep);
+        const saved = await window.electronAPI.saveScenario(scenarioData, dbSteps);
+        if (saved) {
+          setScenarioIdSafe(saved.id);
+          if (saved.variable_profile_id) {
+            setVariableProfileIdSafe(saved.variable_profile_id);
+          } else if (profileId) {
+            // Keep local template if save returned null due to race; re-attach explicitly.
+            setVariableProfileIdSafe(profileId);
+            try {
+              await window.electronAPI.setScenarioVariableProfile?.({
+                scenarioId: saved.id,
+                profileId,
+              });
+            } catch {
+              // ignore — template remains selected in UI
+            }
+          }
+          window.electronAPI.getScenarios?.()
+            .then((items) => setAllScenarios(Array.isArray(items) ? items : []))
+            .catch(() => {});
+          dispatch(showToast({ type: 'success', message: 'Đã lưu kịch bản' }));
+        }
+        return saved;
+      } catch (error) {
+        dispatch(showToast({ type: 'error', message: error.message || 'Lưu thất bại' }));
+        return null;
+      } finally {
+        setSaving(false);
+      }
+    })();
+
+    persistInFlightRef.current = run;
+    try {
+      return await run;
+    } finally {
+      if (persistInFlightRef.current === run) {
+        persistInFlightRef.current = null;
+      }
+    }
+  }, [
+    activeViewport,
+    dispatch,
+    manifestDuration,
+    manifestFrames,
+    name,
+    scenarioManifestPath,
+    setScenarioIdSafe,
+    setVariableProfileIdSafe,
+    steps,
+  ]);
 
   const resolveRecordImportProfileId = useCallback(() => {
     const selected = scenarioDraftRef.current.browserProfileId || browserProfileId;
     return selected || null;
   }, [browserProfileId]);
+
+  const handleBrowserZoomChange = useCallback(async (percent) => {
+    const zoom = [50, 67, 75, 80, 90, 100].includes(Number(percent)) ? Number(percent) : 67;
+    const nextSettings = { ...settings, default_browser_zoom: zoom };
+    setSettings(nextSettings);
+    try {
+      const saved = await window.electronAPI.saveSettings(nextSettings);
+      if (saved && typeof saved === 'object') {
+        setSettings((current) => ({ ...current, ...saved, default_browser_zoom: zoom }));
+      }
+    } catch (error) {
+      dispatch(showToast({
+        type: 'error',
+        message: error.message || t('settings.toast.saveFailed'),
+      }));
+    }
+  }, [dispatch, settings, t]);
 
   const handleRecordClick = useCallback(async () => {
     if (recording) {
@@ -1933,7 +2010,10 @@ export default function ScenarioEditor({ scenario, onBack }) {
 
         if (result?.scenario) {
           const savedScenario = result.scenario;
-          setCurrentScenarioId(savedScenario.id);
+          setScenarioIdSafe(savedScenario.id);
+          if (savedScenario.variable_profile_id) {
+            setVariableProfileIdSafe(savedScenario.variable_profile_id);
+          }
           setSteps(normalizeSteps(savedScenario.steps || result.steps || []));
           setScenarioPreviewPath(savedScenario.preview_path || null);
           setScenarioPreviewUrl(savedScenario.preview_url || result.metadata?.previewVideo?.fileUrl || null);
@@ -1947,6 +2027,9 @@ export default function ScenarioEditor({ scenario, onBack }) {
           const details = await window.electronAPI.getScenarioDetails(savedScenario.id);
           if (details?.steps) {
             setSteps(normalizeSteps(details.steps));
+          }
+          if (details?.variable_profile_id) {
+            setVariableProfileIdSafe(details.variable_profile_id);
           }
           if (details?.preview_manifest_path) {
             setScenarioManifestPath(details.preview_manifest_path);
@@ -1970,12 +2053,14 @@ export default function ScenarioEditor({ scenario, onBack }) {
 
     // No steps yet - start recording immediately
     startRecording('replace');
-  }, [recording, hasSteps, dispatch]);
+  }, [recording, hasSteps, dispatch, clearUndoHistory, setScenarioIdSafe, setVariableProfileIdSafe]);
 
   const startRecording = useCallback(async (mode) => {
     setShowRecordMode(false);
     setRecordingBusy(true);
     setPreviewPlaying(false);
+
+    const recordMode = mode === 'append' ? 'append' : 'replace';
 
     try {
       const canSave = currentScenarioId || scenarioDraftRef.current.name || name;
@@ -1984,8 +2069,21 @@ export default function ScenarioEditor({ scenario, onBack }) {
         return;
       }
 
-      // Save first to ensure we have an ID
-      const saved = await persist();
+      // Replace must wipe steps/frames BEFORE record starts. Otherwise persist() keeps the
+      // old step list in DB and finalize can look like "append" if mode is mishandled.
+      if (recordMode === 'replace') {
+        setSteps([]);
+        setManifestFrames([]);
+        setPreviewCurrentTime(0);
+        setSelectedStepIndex(0);
+        clearUndoHistory();
+      }
+
+      const saved = await persist(
+        recordMode === 'replace'
+          ? { steps: [], manifestFrames: [], manifestDuration: 0, wipePreview: true }
+          : {},
+      );
       if (!saved?.id) {
         dispatch(showToast({ type: 'error', message: 'Lưu kịch bản thất bại, không thể Record.' }));
         return;
@@ -2003,12 +2101,12 @@ export default function ScenarioEditor({ scenario, onBack }) {
         scenarioId: saved.id,
         targetUrl: latestTargetUrl || defaultUrl(latestPlatform) || 'about:blank',
         viewport,
-        mode,
+        mode: recordMode,
         importProfileId: resolveRecordImportProfileId(),
       });
 
       if (result) {
-        setCurrentScenarioId(result.scenarioId);
+        setScenarioIdSafe(result.scenarioId);
         setActiveViewport(result.viewport || viewport);
         setRecording(true);
       }
@@ -2017,7 +2115,19 @@ export default function ScenarioEditor({ scenario, onBack }) {
     } finally {
       setRecordingBusy(false);
     }
-  }, [currentScenarioId, name, targetUrl, platform, activeViewport, resolveRecordImportProfileId, persist, dispatch]);
+  }, [
+    name,
+    targetUrl,
+    platform,
+    activeViewport,
+    currentScenarioId,
+    resolveRecordImportProfileId,
+    persist,
+    dispatch,
+    setScenarioIdSafe,
+    clearUndoHistory,
+    settings,
+  ]);
 
   const handleRun = useCallback(async () => {
     if (!hasSteps) {
@@ -2078,7 +2188,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
       });
 
       if (result.success) {
-        setCurrentScenarioId(result.scenarioId);
+        setScenarioIdSafe(result.scenarioId);
         setRecordStatus({ isRecording: true, eventsCount: 0, frameCount: 0, elapsedMs: 0, ...result });
         setRecording(true);
         dispatch(showToast({
@@ -2133,7 +2243,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
       }
       setFrameDataUrls({});
       frameLoadFailedRef.current = new Set();
-      setCurrentScenarioId(result.scenario.id);
+      setScenarioIdSafe(result.scenario.id);
       setVariablesRefreshKey((value) => value + 1);
       dispatch(fetchScenarios());
       dispatch(showToast({ type: 'success', message: t('scenarios.editor.toast.imported') }));
@@ -2142,7 +2252,7 @@ export default function ScenarioEditor({ scenario, onBack }) {
     } finally {
       setVariablesTransferBusy(false);
     }
-  }, [dispatch, t]);
+  }, [dispatch, setScenarioIdSafe, t]);
 
   const handlePublish = useCallback(async () => {
     let id = currentScenarioId;
@@ -2174,13 +2284,81 @@ export default function ScenarioEditor({ scenario, onBack }) {
 
   const addStep = useCallback((actionType) => {
     pushUndoSnapshot();
-    const newStep = createStep(actionType);
-    setSteps((prev) => [...prev, newStep]);
-  }, [pushUndoSnapshot]);
+    const insertAfter = selectedStepIndex != null
+      && selectedStepIndex >= 0
+      && selectedStepIndex < steps.length
+      ? selectedStepIndex
+      : (steps.length > 0 ? steps.length - 1 : null);
+
+    const afterTime = insertAfter == null
+      ? 0
+      : getStepTimestamp(steps[insertAfter], insertAfter, steps);
+    const gapMs = DEFAULT_ACTION_DELAY_MS;
+    const newTime = insertAfter == null ? 0 : afterTime + gapMs;
+    const insertAt = insertAfter == null ? 0 : insertAfter + 1;
+
+    const newStep = createStep(actionType, {
+      target_anchor: {
+        action_config: defaultConfig[actionType === 'file' ? 'file' : normalizeActionType(actionType)] || {},
+        time_offset: newTime,
+      },
+    });
+
+    setSteps((prev) => {
+      const next = [...prev];
+      // Push later keyframes forward so the new diamond has its own second.
+      for (let i = insertAt; i < next.length; i += 1) {
+        const anchor = parseJsonObject(next[i].target_anchor);
+        if (anchor.time_offset == null) continue;
+        next[i] = {
+          ...next[i],
+          target_anchor: {
+            ...anchor,
+            time_offset: Number(anchor.time_offset) + gapMs,
+          },
+        };
+      }
+      next.splice(insertAt, 0, newStep);
+      return next;
+    });
+
+    setSelectedStepIndex(insertAt);
+    setSelectedStepIndexes(new Set([insertAt]));
+    stepSelectionAnchorRef.current = insertAt;
+    setPreviewCurrentTime(Math.max(0, newTime));
+  }, [pushUndoSnapshot, selectedStepIndex, steps]);
 
   const handleDeleteStep = useCallback((index) => {
     const targets = selectedStepIndexes.has(index) ? selectedStepIndexes : new Set([index]);
     pushUndoSnapshot();
+
+    // Keep deleted step screenshots in the preview timeline so Program Monitor
+    // does not jump/flicker when the step's associated_frame is no longer in steps.
+    const framesToRetain = steps
+      .filter((_, i) => targets.has(i))
+      .map((step) => {
+        const framePath = step.target_anchor?.associated_frame;
+        if (!framePath) return null;
+        return {
+          time: Number(step.target_anchor?.time_offset ?? getStepTime(step, steps)) || 0,
+          path: framePath,
+          name: step.target_anchor?.associated_frame_name || null,
+          url: step.target_anchor?.associated_frame_url
+            || frameDataUrls[framePath]
+            || null,
+        };
+      })
+      .filter(Boolean);
+
+    if (framesToRetain.length) {
+      setManifestFrames((current) => {
+        const existing = new Set(current.map((frame) => frame.path).filter(Boolean));
+        const additions = framesToRetain.filter((frame) => frame.path && !existing.has(frame.path));
+        if (!additions.length) return current;
+        return [...current, ...additions].sort((a, b) => (Number(a.time) || 0) - (Number(b.time) || 0));
+      });
+    }
+
     setSteps((prev) => prev.filter((_, i) => !targets.has(i)));
     setSelectedStepIndex((prev) => {
       if (prev === null || targets.has(prev)) return null;
@@ -2193,18 +2371,44 @@ export default function ScenarioEditor({ scenario, onBack }) {
     setSelectedStepIndexes(new Set());
     stepSelectionAnchorRef.current = null;
     setStepContextMenu(null);
-  }, [pushUndoSnapshot, selectedStepIndexes]);
+  }, [frameDataUrls, pushUndoSnapshot, selectedStepIndexes, steps]);
 
   const handleDeleteSelectedSteps = useCallback(() => {
     if (!selectedStepIndexes.size) return;
 
     pushUndoSnapshot();
+
+    const framesToRetain = steps
+      .filter((_, i) => selectedStepIndexes.has(i))
+      .map((step) => {
+        const framePath = step.target_anchor?.associated_frame;
+        if (!framePath) return null;
+        return {
+          time: Number(step.target_anchor?.time_offset ?? getStepTime(step, steps)) || 0,
+          path: framePath,
+          name: step.target_anchor?.associated_frame_name || null,
+          url: step.target_anchor?.associated_frame_url
+            || frameDataUrls[framePath]
+            || null,
+        };
+      })
+      .filter(Boolean);
+
+    if (framesToRetain.length) {
+      setManifestFrames((current) => {
+        const existing = new Set(current.map((frame) => frame.path).filter(Boolean));
+        const additions = framesToRetain.filter((frame) => frame.path && !existing.has(frame.path));
+        if (!additions.length) return current;
+        return [...current, ...additions].sort((a, b) => (Number(a.time) || 0) - (Number(b.time) || 0));
+      });
+    }
+
     setSteps((prev) => prev.filter((_, i) => !selectedStepIndexes.has(i)));
     setSelectedStepIndex(null);
     setSelectedStepIndexes(new Set());
     stepSelectionAnchorRef.current = null;
     setStepContextMenu(null);
-  }, [pushUndoSnapshot, selectedStepIndexes]);
+  }, [frameDataUrls, pushUndoSnapshot, selectedStepIndexes, steps]);
 
   const handleSelectStep = useCallback((index, event = {}) => {
     if (event.shiftKey && stepSelectionAnchorRef.current !== null) {
@@ -2289,11 +2493,13 @@ export default function ScenarioEditor({ scenario, onBack }) {
       const nextDuration = nextManifestFrames.length
         ? Math.max(...nextManifestFrames.map((frame) => Number(frame.time) || 0))
         : nextSteps.reduce((sum, s) => sum + (s.delay_ms || DEFAULT_ACTION_DELAY_MS), 0);
+      const scenarioId = currentScenarioIdRef.current;
+      const profileId = activeVariableProfileIdRef.current || null;
       const scenarioData = {
-        ...(currentScenarioId ? { id: currentScenarioId } : {}),
+        ...(scenarioId ? { id: scenarioId } : {}),
         name: scenarioDraftRef.current.name || name,
         ...buildScenarioMetaPayload(scenarioDraftRef.current, {
-          variable_profile_id: activeVariableProfileId || null,
+          variable_profile_id: profileId,
           recorded_width: activeViewport.width,
           recorded_height: activeViewport.height,
           preview_path: scenarioPreviewPath,
@@ -2305,14 +2511,19 @@ export default function ScenarioEditor({ scenario, onBack }) {
       };
       const saved = await window.electronAPI.saveScenario(scenarioData, nextSteps.map(toDatabaseStep));
       if (saved?.id) {
-        setCurrentScenarioId(saved.id);
+        setScenarioIdSafe(saved.id);
+        if (saved.variable_profile_id) {
+          setVariableProfileIdSafe(saved.variable_profile_id);
+        } else if (profileId) {
+          setVariableProfileIdSafe(profileId);
+        }
       }
       return saved;
     } catch (error) {
       dispatch(showToast({ type: 'error', message: error.message || 'Không lưu được thay đổi' }));
       return null;
     }
-  }, [activeViewport, currentScenarioId, dispatch, name, platform, scenarioManifestPath, scenarioPreviewPath, targetUrl]);
+  }, [activeViewport, dispatch, name, scenarioManifestPath, scenarioPreviewPath, setScenarioIdSafe, setVariableProfileIdSafe]);
 
   const applyAndSaveTrim = useCallback(async (ranges) => {
     const merged = mergeTrimRanges(ranges);
@@ -2407,11 +2618,13 @@ export default function ScenarioEditor({ scenario, onBack }) {
           />
           <ScenarioVariablesBar
             scenarioId={currentScenarioId}
+            variableProfileId={activeVariableProfileId}
             refreshKey={variablesRefreshKey}
             onToast={(payload) => dispatch(showToast(payload))}
             onChanged={() => {
               setVariablesRefreshKey((value) => value + 1);
               setProfilesRefreshKey((value) => value + 1);
+              dispatch(fetchLocalScenarios());
             }}
           />
           <button
@@ -2564,20 +2777,15 @@ export default function ScenarioEditor({ scenario, onBack }) {
           setScenarioInfoOpen={setScenarioInfoOpen}
           stepEditorOpen={stepEditorOpen}
           setStepEditorOpen={setStepEditorOpen}
-          globalWidgetsOpen={globalWidgetsOpen}
-          setGlobalWidgetsOpen={setGlobalWidgetsOpen}
-          showGlobalWidgets={supportsGlobalWidgets(scenarioType)}
-          GlobalWidgetsPanelComponent={GlobalWidgetsPanel}
-          globalWidgetsProps={{
-            scenarioMeta,
-            onScenarioChange: updateScenarioDraft,
-          }}
           PanelSectionHeaderComponent={PanelSectionHeader}
           ActionIconBarComponent={ActionIconBar}
           IconOnlyComponent={IconOnly}
           ProgramMonitorComponent={ProgramMonitor}
           StepCardComponent={StepCard}
           StepEditPanelComponent={StepEditPanel}
+          stepEditPanelProps={{
+            platform,
+          }}
           TimelineComponent={Timeline}
           ScenarioInfoPanelComponent={ScenarioInfoPanel}
           scenarioInfoProps={{
@@ -2600,6 +2808,8 @@ export default function ScenarioEditor({ scenario, onBack }) {
           browserProfileOptions={browserProfileOptions}
           onBrowserProfileChange={(value) => updateScenarioDraft({ nextBrowserProfileId: value })}
           activeViewport={activeViewport}
+          browserZoom={Number(settings.default_browser_zoom) || 67}
+          onBrowserZoomChange={handleBrowserZoomChange}
           platform={platform}
           targetUrl={targetUrl}
           selectedStep={selectedStep}
@@ -2707,6 +2917,15 @@ function ProgramMonitor({ platform, selectedStep, targetUrl, hasSteps, recording
   const isFacebook = platform === 'facebook' || targetUrl?.includes('facebook');
   const canvasRef = useRef(null);
   const imageRef = useRef(null);
+  const lastFrameUrlRef = useRef(null);
+
+  // Keep showing the last good frame when URL briefly drops (e.g. delete step / selection clear).
+  if (currentFrameUrl) {
+    lastFrameUrlRef.current = currentFrameUrl;
+  } else if (!hasSteps && !frameCount) {
+    lastFrameUrlRef.current = null;
+  }
+  const displayFrameUrl = currentFrameUrl || lastFrameUrlRef.current;
 
   const drawFrame = useCallback((img = imageRef.current) => {
     const canvas = canvasRef.current;
@@ -2737,21 +2956,11 @@ function ProgramMonitor({ platform, selectedStep, targetUrl, hasSteps, recording
 
     resizeObserver.observe(parent);
     return () => resizeObserver.disconnect();
-  }, [drawFrame, currentFrameUrl]);
-
-  useEffect(() => {
-    if (!currentFrameUrl) {
-      const canvas = canvasRef.current;
-      if (canvas) {
-        const ctx = canvas.getContext('2d');
-        if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
-      }
-    }
-  }, [currentFrameUrl]);
+  }, [drawFrame, displayFrameUrl]);
 
   return (
     <div className="relative flex aspect-video max-h-full w-full flex-none items-center justify-center overflow-hidden rounded border border-[#2b3038] bg-[#e9edf3]">
-      {currentFrameUrl ? (
+      {displayFrameUrl ? (
         <>
           <canvas
             ref={canvasRef}
@@ -2759,7 +2968,7 @@ function ProgramMonitor({ platform, selectedStep, targetUrl, hasSteps, recording
           />
           <img
             ref={imageRef}
-            src={currentFrameUrl}
+            src={displayFrameUrl}
             alt=""
             className="hidden"
             onLoad={(event) => drawFrame(event.currentTarget)}

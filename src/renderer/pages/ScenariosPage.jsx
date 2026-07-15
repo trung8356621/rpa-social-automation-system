@@ -149,7 +149,13 @@ export default function ScenariosPage() {
   }, [dispatch]);
 
   if (currentScenario) {
-    return <ScenarioEditor scenario={currentScenario} onBack={() => dispatch(setCurrentScenario(null))} />;
+    return (
+      <ScenarioEditor
+        key={currentScenario.id || 'draft'}
+        scenario={currentScenario}
+        onBack={() => dispatch(setCurrentScenario(null))}
+      />
+    );
   }
 
   return (

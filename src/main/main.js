@@ -10,6 +10,7 @@ import DatabaseService from './database/DatabaseService.js';
 import PlatformCrawledDataService from './database/PlatformCrawledDataService.js';
 import BrowserProfileService from './browser/BrowserProfileService.js';
 import { ExecutorService } from './rpa/ExecutorService.js';
+import { getExecutionBrowserLockService } from './rpa/ExecutionBrowserLockService.js';
 import { initRecorderService } from './rpa/RecorderService.js';
 import {
   cleanupScenarioBundleTempDir,
@@ -307,12 +308,19 @@ function registerDatabaseHandlers() {
     return result.canceled ? null : result.filePaths[0];
   });
 
-  ipcMain.handle('dialog:select-file', async (_event, filters = []) => {
+  ipcMain.handle('dialog:select-file', async (_event, options = []) => {
+    // Backward compatible: filters array OR { filters, multiple }
+    const isFiltersArray = Array.isArray(options);
+    const filters = isFiltersArray
+      ? options
+      : (Array.isArray(options?.filters) ? options.filters : []);
+    const multiple = !isFiltersArray && Boolean(options?.multiple);
     const result = await showNativeOpenDialog({
-      properties: ['openFile'],
-      filters: Array.isArray(filters) && filters.length > 0 ? filters : undefined,
+      properties: multiple ? ['openFile', 'multiSelections'] : ['openFile'],
+      filters: filters.length > 0 ? filters : undefined,
     });
-    return result.canceled ? null : result.filePaths[0];
+    if (result.canceled) return null;
+    return multiple ? result.filePaths : result.filePaths[0];
   });
 
   ipcMain.handle('dialog:save-file', async (_event, options = {}) => {
@@ -871,6 +879,7 @@ function withDefaultSettings(settings) {
     'browser.userDataDir':
       settings['browser.userDataDir'] || path.join(app.getPath('userData'), 'browser-data'),
     'execution.browserCloseDelayMs': Number(settings['execution.browserCloseDelayMs']) || 5000,
+    'execution_browser_lock': settings['execution_browser_lock'] !== false,
     'facebook.crawlGroupScenarioId': settings['facebook.crawlGroupScenarioId'] || '',
     'facebook.crawlScrollSettleSeconds': Number(settings['facebook.crawlScrollSettleSeconds']) || 4,
     'facebook.crawlBrowserProfileId': settings['facebook.crawlBrowserProfileId'] || '',
@@ -1053,6 +1062,7 @@ app.on('window-all-closed', () => {
 // Đảm bảo đóng database trước khi thoát
 app.on('before-quit', () => {
   embeddedBrowserService?.detach();
+  getExecutionBrowserLockService().unlockAll('before-quit').catch(() => {});
   if (dbService) dbService.close();
   platformCrawledDataService?.closeAll();
 });

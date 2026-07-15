@@ -95,7 +95,7 @@ Main database sử dụng:
 | `preview_trim_ranges` | TEXT DEFAULT '[]' | Mảng JSON các khoảng trim |
 | `browser_profile_id` | TEXT | FK → browser_profiles(id) |
 | `variable_profile_id` | TEXT | FK → variable_profiles(id) |
-| `local_variables` | TEXT DEFAULT '[]' | Mảng JSON `{key, value}` |
+| `local_variables` | TEXT DEFAULT '[]' | Mảng JSON `{key, value, value_type}` |
 | `scenario_type` | TEXT DEFAULT 'action' | `prepare`, `crawl`, `action`, `request_catching` |
 | `result_type` | TEXT DEFAULT 'simple' | `simple`, `list` |
 | `parent_id` | TEXT | FK → scenarios(id) ON DELETE SET NULL |
@@ -111,9 +111,21 @@ Main database sử dụng:
 | `id` | TEXT PK | UUID v4 |
 | `scenario_id` | TEXT NOT NULL | FK → scenarios(id) CASCADE |
 | `meta_key` | TEXT NOT NULL | Khóa metadata |
-| `meta_value` | TEXT | Giá trị metadata (JSON) |
+| `meta_value` | TEXT | Giá trị metadata (JSON hoặc scalar) |
 | `updated_at` | TEXT | ISO timestamp |
 | *UNIQUE* | `(scenario_id, meta_key)` | |
+
+**Meta keys quan trọng** (một số cột legacy trên `scenarios` đã migrate sang đây):
+
+| `meta_key` | Nội dung |
+|------------|----------|
+| `variable_profile_id` | FK text → `variable_profiles.id` |
+| `local_variables` | JSON `[{key, value, value_type}]` |
+| `recorded_width` / `recorded_height` | Viewport đã ghi |
+| `result_type` | `simple` \| `list` |
+| `dom_check_anchor` | JSON anchor readiness |
+
+`buildScenarioMetaForStorage()` merge payload Save với `existingMeta`; **không** cho `scenario_meta` draft ghi đè `variable_profile_id` / `local_variables` khi không truyền top-level.
 
 #### `scenario_steps`
 
@@ -141,6 +153,17 @@ Main database sử dụng:
 | `created_at` | TEXT | ISO timestamp |
 | *UNIQUE* | `(step_id, frame_path, role)` | |
 
+**Lifecycle frame screenshot:**
+
+| Sự kiện | Hành vi |
+|---------|---------|
+| Save scenario | Ghi lại `scenario_step_frames` theo `target_anchor.associated_frame` của từng step |
+| Xóa step (UI) | Gỡ row step + step_frame; file **giữ** nếu còn trong preview manifest |
+| Trim timeline | Xóa frame khỏi manifest → có thể orphan cleanup |
+| `_deleteOrphanedScenarioFrames` | `unlink` chỉ khi không còn step_frame **và** không còn trong `preview.json` |
+
+Preview playback đọc `preview_manifest_path` (`preview.json`), không chỉ phụ thuộc `scenario_step_frames`.
+
 #### `scenario_variables`
 
 | Column | Type | Mô tả |
@@ -157,7 +180,7 @@ Main database sử dụng:
 |--------|------|-------------|
 | `id` | TEXT PK | UUID v4 |
 | `name` | TEXT NOT NULL UNIQUE | Tên profile |
-| `variables_json` | TEXT DEFAULT '[]' | JSON template keys |
+| `variables_json` | TEXT DEFAULT '[]' | JSON template keys `{key, value_type}` |
 | `is_system` | INTEGER DEFAULT 0 | System profile (được bảo vệ) |
 | `is_dirty` | INTEGER DEFAULT 1 | Cờ đồng bộ |
 | `updated_at` | TEXT | ISO timestamp |
@@ -169,7 +192,7 @@ Main database sử dụng:
 | `id` | TEXT PK | UUID v4 |
 | `profile_id` | TEXT NOT NULL | FK → variable_profiles(id) CASCADE |
 | `name` | TEXT NOT NULL | Tên mẫu (ví dụ: 'Default') |
-| `values_json` | TEXT DEFAULT '[]' | Mục JSON `{key, value}` |
+| `values_json` | TEXT DEFAULT '[]' | Mục JSON `{key, value, value_type}` |
 | `is_dirty` | INTEGER DEFAULT 1 | Cờ đồng bộ |
 | `updated_at` | TEXT | ISO timestamp |
 | *UNIQUE* | `(profile_id, name)` | |
@@ -351,12 +374,13 @@ Các trường sau lưu trữ JSON có cấu trúc dưới dạng TEXT trong SQL
 
 | Table | Column | Nội dung |
 |-------|--------|---------|
-| `scenarios` | `local_variables` | `[{key, value}]` |
+| `scenarios` | `local_variables` | `[{key, value, value_type}]` — `file` = path thư mục (canonical: `scenarios_meta`) |
 | `scenarios` | `preview_trim_ranges` | `[{start, end}]` |
-| `scenario_steps` | `target_anchor` | `{selector_value, relative_coords, action_config}` |
+| `scenarios_meta` | `variable_profile_id`, `local_variables`, … | Metadata scenario (xem bảng meta keys §2) |
+| `scenario_steps` | `target_anchor` | `{selector_value, relative_coords, action_config, time_offset, associated_frame}` |
 | `scenarios_meta` | `meta_value` | JSON metadata tùy ý |
-| `variable_profiles` | `variables_json` | `[{key}]` |
-| `variable_profile_samples` | `values_json` | `[{key, value}]` |
+| `variable_profiles` | `variables_json` | `[{key, value_type}]` — skeleton schema (xem [06_variable_templates.md](./06_variable_templates.md)) |
+| `variable_profile_samples` | `values_json` | `[{key, value, value_type}]` |
 | `execution_logs` | `result_json` | Kết quả thực thi đầy đủ |
 | `tasks` | `flow_data` | `{nodes, edges}` |
 | `browser_profiles` (tương lai) | `account_summary` | Thông tin tài khoản linh hoạt |

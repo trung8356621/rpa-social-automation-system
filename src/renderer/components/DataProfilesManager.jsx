@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Loader2, Plus, Save, Trash2, X } from 'lucide-react';
+import { Loader2, FolderOpen, Plus, Save, Trash2, X } from 'lucide-react';
 import { useTranslation } from '../i18n';
 import { isSystemVariableProfile } from '../../shared/facebookCrawlConfig.js';
 
@@ -14,11 +14,36 @@ function emptyDraft() {
 }
 
 function emptyKeyRow() {
-  return { id: createRowId(), key: '' };
+  return {
+    id: createRowId(),
+    key: '',
+    value_type: 'text',
+  };
 }
 
 function emptySampleDraft() {
   return { name: '' };
+}
+
+function normalizeKeyRow(item = {}) {
+  return {
+    id: createRowId(),
+    key: item.key || item.variable_key || '',
+    value_type: item.value_type === 'file' ? 'file' : 'text',
+  };
+}
+
+function serializeKeyRows(rows = []) {
+  return rows
+    .map((row) => {
+      const key = String(row.key || '').trim();
+      if (!key) return null;
+      return {
+        key,
+        value_type: row.value_type === 'file' ? 'file' : 'text',
+      };
+    })
+    .filter(Boolean);
 }
 
 export default function DataProfilesManager({
@@ -67,10 +92,9 @@ export default function DataProfilesManager({
 
     try {
       const detail = await window.electronAPI.getVariableProfile(profileId);
-      const keys = (detail?.variables || detail?.keys || []).map((item) => ({
-        id: createRowId(),
-        key: item.key || item.variable_key || '',
-      }));
+      const keys = (detail?.variables || detail?.keys || []).map((item) => (
+        typeof item === 'string' ? normalizeKeyRow({ key: item }) : normalizeKeyRow(item)
+      ));
       setKeyRows(keys.length ? keys : [emptyKeyRow()]);
       setDraft({ name: detail?.name || '' });
 
@@ -126,16 +150,17 @@ export default function DataProfilesManager({
     loadSampleDetail(selectedSampleId);
   }, [selectedSampleId]);
 
-  const templateKeys = useMemo(
-    () => keyRows.map((row) => String(row.key || '').trim()).filter(Boolean),
-    [keyRows],
-  );
+  const serializedKeys = useMemo(() => serializeKeyRows(keyRows), [keyRows]);
 
   const isSelectedSystemProfile = isSystemVariableProfile(selectedProfileId);
 
   const sampleDisplayRows = useMemo(
-    () => templateKeys.map((key) => ({ key, value: sampleValueMap[key] ?? '' })),
-    [templateKeys, sampleValueMap],
+    () => serializedKeys.map((item) => ({
+      key: item.key,
+      value: sampleValueMap[item.key] ?? '',
+      value_type: item.value_type,
+    })),
+    [serializedKeys, sampleValueMap],
   );
 
   const handleCreateProfile = async () => {
@@ -164,15 +189,10 @@ export default function DataProfilesManager({
 
     setSaving(true);
     try {
-      const keys = keyRows
-        .map((row) => String(row.key || '').trim())
-        .filter(Boolean)
-        .map((key) => ({ key }));
-
       await window.electronAPI.saveVariableProfile({
         id: selectedProfileId,
         name,
-        keys,
+        keys: serializedKeys,
       });
       await loadProfiles();
       await loadProfileDetail(selectedProfileId);
@@ -209,7 +229,11 @@ export default function DataProfilesManager({
         id: selectedSampleId,
         profile_id: selectedProfileId,
         name,
-        variables: templateKeys.map((key) => ({ key, value: sampleValueMap[key] ?? '' })),
+        variables: sampleDisplayRows.map((row) => ({
+          key: row.key,
+          value: sampleValueMap[row.key] ?? '',
+          value_type: row.value_type,
+        })),
       });
       await loadProfileDetail(selectedProfileId);
       await loadSampleDetail(selectedSampleId);
@@ -225,8 +249,7 @@ export default function DataProfilesManager({
   const openCreateSampleModal = () => {
     if (!selectedProfileId) return;
 
-    const templateKeys = keyRows.map((row) => String(row.key || '').trim()).filter(Boolean);
-    if (!templateKeys.length) {
+    if (!serializedKeys.length) {
       onToast?.({ type: 'error', message: t('dataProfiles.toast.noTemplateKeys') });
       return;
     }
@@ -240,8 +263,7 @@ export default function DataProfilesManager({
     const name = String(newSampleName || '').trim();
     if (!name) return;
 
-    const templateKeys = keyRows.map((row) => String(row.key || '').trim()).filter(Boolean);
-    if (!templateKeys.length) {
+    if (!serializedKeys.length) {
       onToast?.({ type: 'error', message: t('dataProfiles.toast.noTemplateKeys') });
       return;
     }
@@ -257,13 +279,17 @@ export default function DataProfilesManager({
       await window.electronAPI.saveVariableProfile({
         id: selectedProfileId,
         name: profileName,
-        keys: templateKeys.map((key) => ({ key })),
+        keys: serializedKeys,
       });
 
       const saved = await window.electronAPI.saveVariableProfileSample({
         profile_id: selectedProfileId,
         name,
-        variables: templateKeys.map((key) => ({ key, value: '' })),
+        variables: serializedKeys.map((item) => ({
+          key: item.key,
+          value: '',
+          value_type: item.value_type,
+        })),
       });
       setShowSampleModal(false);
       setNewSampleName('');
@@ -306,6 +332,12 @@ export default function DataProfilesManager({
 
   const updateSampleValue = (key, value) => {
     setSampleValueMap((prev) => ({ ...prev, [key]: value }));
+  };
+
+  const handlePickSampleFolder = async (key) => {
+    const picked = await window.electronAPI?.selectDirectory?.();
+    if (!picked) return;
+    updateSampleValue(key, picked);
   };
 
   return (
@@ -409,7 +441,7 @@ export default function DataProfilesManager({
 
               <div className="space-y-2">
                 {keyRows.map((row, index) => (
-                  <div key={row.id} className="grid grid-cols-[1fr_auto] gap-2">
+                  <div key={row.id} className="grid grid-cols-[minmax(0,1fr)_100px_auto] gap-2">
                     <input
                       value={row.key}
                       onChange={(event) => updateKeyRow(index, { key: event.target.value })}
@@ -417,6 +449,19 @@ export default function DataProfilesManager({
                       placeholder={t('variables.field.key')}
                       readOnly={isSelectedSystemProfile}
                     />
+                    <select
+                      value={row.value_type === 'file' ? 'file' : 'text'}
+                      onChange={(event) => {
+                        updateKeyRow(index, {
+                          value_type: event.target.value === 'file' ? 'file' : 'text',
+                        });
+                      }}
+                      className="select-field h-9 text-xs"
+                      disabled={isSelectedSystemProfile}
+                    >
+                      <option value="text">{t('variables.field.typeText')}</option>
+                      <option value="file">{t('variables.field.typeFile')}</option>
+                    </select>
                     {!isSelectedSystemProfile ? (
                       <button type="button" onClick={() => removeKeyRow(index)} className="flex h-9 w-9 items-center justify-center rounded-lg text-slate-400 hover:bg-red-950 hover:text-red-300" title={t('variables.delete')}>
                         <Trash2 className="h-4 w-4" />
@@ -478,14 +523,41 @@ export default function DataProfilesManager({
                   </div>
                   <div className="space-y-2">
                     {sampleDisplayRows.map((row) => (
-                      <div key={row.key} className="grid grid-cols-[120px_1fr] gap-2">
-                        <span className="flex h-9 items-center truncate text-xs text-slate-400">{row.key}</span>
-                        <input
-                          value={row.value}
-                          onChange={(event) => updateSampleValue(row.key, event.target.value)}
-                          className="input-field h-9 text-sm"
-                          placeholder={t('variables.field.value')}
-                        />
+                      <div key={row.key} className="space-y-1">
+                        <div className="grid grid-cols-[120px_minmax(0,1fr)] gap-2">
+                          <span className="flex h-9 items-center truncate text-xs text-slate-400" title={row.key}>
+                            {row.key}
+                            {row.value_type === 'file' ? (
+                              <span className="ml-1 text-[10px] text-slate-500">({t('variables.field.typeFile')})</span>
+                            ) : null}
+                          </span>
+                          {row.value_type === 'file' ? (
+                            <div className="flex min-w-0 gap-1">
+                              <input
+                                value={row.value}
+                                onChange={(event) => updateSampleValue(row.key, event.target.value)}
+                                className="input-field h-9 min-w-0 flex-1 text-sm"
+                                placeholder={t('variables.field.folderPath')}
+                                title={row.value || ''}
+                              />
+                              <button
+                                type="button"
+                                onClick={() => handlePickSampleFolder(row.key)}
+                                className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-slate-600 text-slate-200 hover:bg-slate-800"
+                                title={t('variables.field.pickFolder')}
+                              >
+                                <FolderOpen className="h-3.5 w-3.5" />
+                              </button>
+                            </div>
+                          ) : (
+                            <input
+                              value={row.value}
+                              onChange={(event) => updateSampleValue(row.key, event.target.value)}
+                              className="input-field h-9 text-sm"
+                              placeholder={t('variables.field.value')}
+                            />
+                          )}
+                        </div>
                       </div>
                     ))}
                   </div>

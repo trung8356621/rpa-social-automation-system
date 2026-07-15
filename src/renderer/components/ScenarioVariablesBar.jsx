@@ -1,8 +1,8 @@
 import React, { useEffect, useState } from 'react';
-import { Braces, Plus, Save, Trash2, Upload } from 'lucide-react';
+import { Braces, FolderOpen, Plus, Save, Trash2 } from 'lucide-react';
 import { useTranslation } from '../i18n';
 
-const CREATE_NEW_PROFILE = '__new__';
+const NO_SAMPLE = '';
 
 function emptyRow() {
   return {
@@ -18,8 +18,17 @@ function randomName(prefix) {
   return `${prefix}-${token}`;
 }
 
+function normalizeRows(items = []) {
+  return (Array.isArray(items) ? items : []).map((item) => ({
+    ...item,
+    key: item.key || item.name || '',
+    value_type: item.value_type === 'file' ? 'file' : 'text',
+  }));
+}
+
 export default function ScenarioVariablesBar({
   scenarioId,
+  variableProfileId = '',
   refreshKey = 0,
   onToast,
   onChanged,
@@ -27,11 +36,13 @@ export default function ScenarioVariablesBar({
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const [rows, setRows] = useState([]);
-  const [profiles, setProfiles] = useState([]);
-  const [sampleProfileId, setSampleProfileId] = useState(CREATE_NEW_PROFILE);
+  const [samples, setSamples] = useState([]);
+  const [selectedSampleId, setSelectedSampleId] = useState(NO_SAMPLE);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [busyAction, setBusyAction] = useState('');
+
+  const hasTemplate = Boolean(variableProfileId);
 
   const loadVariables = async () => {
     if (!scenarioId || !window.electronAPI?.getScenarioLocalVariables) {
@@ -42,12 +53,7 @@ export default function ScenarioVariablesBar({
     setLoading(true);
     try {
       const items = await window.electronAPI.getScenarioLocalVariables(scenarioId);
-      const normalized = (Array.isArray(items) ? items : []).map((item) => ({
-        ...item,
-        key: item.key || item.name || '',
-        value_type: item.value_type === 'file' ? 'file' : 'text',
-      }));
-      setRows(normalized.length ? normalized : []);
+      setRows(normalizeRows(items));
     } catch (error) {
       onToast?.({ type: 'error', message: error.message || t('variables.toast.loadFailed') });
     } finally {
@@ -55,35 +61,46 @@ export default function ScenarioVariablesBar({
     }
   };
 
-  const loadProfiles = async () => {
-    if (!window.electronAPI?.getVariableProfiles) {
-      setProfiles([]);
+  const loadSamples = async () => {
+    if (!variableProfileId || !window.electronAPI?.getVariableProfileSamples) {
+      setSamples([]);
+      setSelectedSampleId(NO_SAMPLE);
       return;
     }
     try {
-      const items = await window.electronAPI.getVariableProfiles();
-      setProfiles(Array.isArray(items) ? items : []);
+      const items = await window.electronAPI.getVariableProfileSamples(variableProfileId);
+      setSamples(Array.isArray(items) ? items : []);
     } catch {
-      setProfiles([]);
+      setSamples([]);
     }
   };
 
   useEffect(() => {
     loadVariables();
-    loadProfiles();
   }, [scenarioId, refreshKey]);
+
+  useEffect(() => {
+    loadSamples();
+    setSelectedSampleId(NO_SAMPLE);
+  }, [scenarioId, variableProfileId]);
+
+  useEffect(() => {
+    if (!variableProfileId) return;
+    loadSamples();
+  }, [refreshKey]);
 
   const persistRow = async (row) => {
     const key = String(row.key || row.name || '').trim();
     if (!scenarioId || !key) return null;
 
+    const valueType = row.value_type === 'file' ? 'file' : 'text';
     const saved = await window.electronAPI.saveScenarioVariable({
       id: row.id || undefined,
       scenario_id: scenarioId,
       key,
       name: key,
       value: row.value ?? '',
-      value_type: row.value_type === 'file' ? 'file' : 'text',
+      value_type: valueType,
     });
     return saved;
   };
@@ -98,6 +115,7 @@ export default function ScenarioVariablesBar({
       const saved = await persistRow(row);
       if (!saved) return;
       setRows((prev) => prev.map((item, idx) => (idx === index ? saved : item)));
+      setSelectedSampleId(NO_SAMPLE);
       onChanged?.();
     } catch (error) {
       onToast?.({ type: 'error', message: error.message || t('variables.toast.saveFailed') });
@@ -110,6 +128,7 @@ export default function ScenarioVariablesBar({
     const row = rows[index];
     const nextRows = rows.filter((_, idx) => idx !== index);
     setRows(nextRows);
+    setSelectedSampleId(NO_SAMPLE);
 
     if (!row?.id) return;
 
@@ -124,6 +143,7 @@ export default function ScenarioVariablesBar({
 
   const handleAddRow = () => {
     setRows((prev) => [...prev, emptyRow()]);
+    setSelectedSampleId(NO_SAMPLE);
     setOpen(true);
   };
 
@@ -131,7 +151,52 @@ export default function ScenarioVariablesBar({
     setRows((prev) => prev.map((row, idx) => (idx === index ? { ...row, ...patch } : row)));
   };
 
+  const handlePickFolder = async (index) => {
+    const picked = await window.electronAPI?.selectDirectory?.();
+    if (!picked) return;
+    updateRow(index, { value: picked });
+    handleSaveRow(index, { value: picked });
+  };
+
+  const handleApplySample = async (sampleId) => {
+    setSelectedSampleId(sampleId);
+    if (!scenarioId || !sampleId) return;
+
+    setBusyAction('apply');
+    try {
+      const detail = await window.electronAPI.getVariableProfileSample(sampleId);
+      const variables = normalizeRows(detail?.variables || detail?.values || []).map((item) => ({
+        key: item.key,
+        value: item.value ?? '',
+        value_type: item.value_type === 'file' ? 'file' : 'text',
+      }));
+
+      if (!variables.length) {
+        onToast?.({ type: 'error', message: t('variables.toast.sampleEmpty') });
+        return;
+      }
+
+      const saved = await window.electronAPI.saveScenarioLocalVariables({
+        scenarioId,
+        variables,
+      });
+      setRows(normalizeRows(saved));
+      onToast?.({ type: 'success', message: t('variables.toast.sampleApplied') });
+      onChanged?.();
+    } catch (error) {
+      onToast?.({ type: 'error', message: error.message || t('variables.toast.sampleApplyFailed') });
+      setSelectedSampleId(NO_SAMPLE);
+    } finally {
+      setBusyAction('');
+    }
+  };
+
   const handleQuickSaveSample = async () => {
+    if (!hasTemplate) {
+      onToast?.({ type: 'error', message: t('variables.toast.selectProfileFirst') });
+      return;
+    }
+
     const variables = rows
       .map((row) => ({
         key: String(row.key || '').trim(),
@@ -147,26 +212,13 @@ export default function ScenarioVariablesBar({
 
     setBusyAction('sample');
     try {
-      let profileId = sampleProfileId;
-
-      if (profileId === CREATE_NEW_PROFILE) {
-        const profile = await window.electronAPI.saveVariableProfileQuick({
-          name: randomName('profile'),
-          keys: variables.map((row) => row.key),
-        });
-        profileId = profile?.id;
-        if (!profileId) {
-          throw new Error(t('variables.toast.profileSaveFailed'));
-        }
-        await loadProfiles();
-      }
-
-      await window.electronAPI.saveVariableProfileSampleQuick({
-        profileId,
+      const saved = await window.electronAPI.saveVariableProfileSampleQuick({
+        profileId: variableProfileId,
         name: randomName('sample'),
         variables,
       });
-
+      await loadSamples();
+      if (saved?.id) setSelectedSampleId(saved.id);
       onToast?.({ type: 'success', message: t('variables.toast.sampleSaved') });
       onChanged?.();
     } catch (error) {
@@ -210,7 +262,7 @@ export default function ScenarioVariablesBar({
             onClick={() => setOpen(false)}
             aria-label={t('variables.closePanel')}
           />
-          <div className="absolute right-0 top-full z-50 mt-2 w-[480px] rounded-xl border border-[#2f3748] bg-[#12151c] p-3 shadow-2xl">
+          <div className="absolute right-0 top-full z-50 mt-2 w-[560px] rounded-xl border border-[#2f3748] bg-[#12151c] p-3 shadow-2xl">
             <div className="mb-3 flex items-center justify-between gap-2">
               <div>
                 <p className="text-sm font-semibold text-white">{t('variables.panel.title')}</p>
@@ -228,25 +280,38 @@ export default function ScenarioVariablesBar({
 
             <div className="mb-3 flex items-center gap-2 border-b border-[#2f3748] pb-3">
               <select
-                value={sampleProfileId}
-                onChange={(event) => setSampleProfileId(event.target.value)}
-                className="select-field h-8 min-w-0 flex-1 text-xs"
+                value={selectedSampleId}
+                onChange={(event) => handleApplySample(event.target.value)}
+                disabled={!hasTemplate || !!busyAction}
+                className="select-field h-8 min-w-0 flex-1 text-xs disabled:opacity-60"
+                title={!hasTemplate ? t('variables.toast.selectProfileFirst') : undefined}
               >
-                <option value={CREATE_NEW_PROFILE}>{t('variables.createNewProfile')}</option>
-                {profiles.map((profile) => (
-                  <option key={profile.id} value={profile.id}>{profile.name}</option>
+                <option value={NO_SAMPLE}>
+                  {hasTemplate
+                    ? t('variables.selectSample')
+                    : t('variables.selectProfileFirst')}
+                </option>
+                {samples.map((sample) => (
+                  <option key={sample.id} value={sample.id}>{sample.name}</option>
                 ))}
               </select>
               <button
                 type="button"
                 onClick={handleQuickSaveSample}
-                disabled={!!busyAction}
+                disabled={!hasTemplate || !!busyAction}
                 className="inline-flex h-8 shrink-0 items-center gap-1 rounded-md border border-[#3a465c] px-2.5 text-xs text-[#c9d4e8] hover:bg-[#1f2633] disabled:opacity-60"
+                title={!hasTemplate ? t('variables.toast.selectProfileFirst') : t('variables.quickSaveSample')}
               >
                 <Save className="h-3.5 w-3.5" />
                 {t('variables.quickSaveSample')}
               </button>
             </div>
+
+            {!hasTemplate ? (
+              <p className="mb-3 rounded-lg border border-dashed border-[#2f3748] px-3 py-2 text-[11px] text-[#76849b]">
+                {t('variables.panel.needTemplate')}
+              </p>
+            ) : null}
 
             {loading ? (
               <p className="text-xs text-[#76849b]">{t('common.loading')}</p>
@@ -255,68 +320,67 @@ export default function ScenarioVariablesBar({
                 {t('variables.panel.empty')}
               </p>
             ) : (
-              <div className="max-h-64 space-y-2 overflow-y-auto pr-1">
+              <div className="max-h-72 space-y-2 overflow-y-auto pr-1">
                 {rows.map((row, index) => (
-                  <div key={row.id || `new-${index}`} className="grid grid-cols-[minmax(0,1fr)_88px_minmax(0,1fr)_auto] gap-2">
-                    <input
-                      value={row.key || row.name || ''}
-                      onChange={(event) => updateRow(index, { key: event.target.value })}
-                      onBlur={(event) => handleSaveRow(index, { key: event.target.value })}
-                      className="input-field h-8 text-xs"
-                      placeholder={t('variables.field.key')}
-                    />
-                    <select
-                      value={row.value_type === 'file' ? 'file' : 'text'}
-                      onChange={(event) => {
-                        const value_type = event.target.value === 'file' ? 'file' : 'text';
-                        updateRow(index, { value_type });
-                        handleSaveRow(index, { value_type });
-                      }}
-                      className="select-field h-8 text-xs"
-                    >
-                      <option value="text">{t('variables.field.typeText')}</option>
-                      <option value="file">{t('variables.field.typeFile')}</option>
-                    </select>
-                    {row.value_type === 'file' ? (
-                      <div className="flex min-w-0 gap-1">
+                  <div key={row.id || `new-${index}`} className="rounded-lg border border-[#2a3144] bg-[#101217] p-2">
+                    <div className="grid grid-cols-[minmax(0,1fr)_88px_minmax(0,1fr)_auto] gap-2">
+                      <input
+                        value={row.key || row.name || ''}
+                        onChange={(event) => updateRow(index, { key: event.target.value })}
+                        onBlur={(event) => handleSaveRow(index, { key: event.target.value })}
+                        className="input-field h-8 text-xs"
+                        placeholder={t('variables.field.key')}
+                      />
+                      <select
+                        value={row.value_type === 'file' ? 'file' : 'text'}
+                        onChange={(event) => {
+                          const value_type = event.target.value === 'file' ? 'file' : 'text';
+                          const patch = { value_type };
+                          updateRow(index, patch);
+                          handleSaveRow(index, patch);
+                        }}
+                        className="select-field h-8 text-xs"
+                      >
+                        <option value="text">{t('variables.field.typeText')}</option>
+                        <option value="file">{t('variables.field.typeFile')}</option>
+                      </select>
+                      {row.value_type === 'file' ? (
+                        <div className="flex min-w-0 gap-1">
+                          <input
+                            value={row.value || ''}
+                            onChange={(event) => updateRow(index, { value: event.target.value })}
+                            onBlur={(event) => handleSaveRow(index, { value: event.target.value })}
+                            className="input-field h-8 min-w-0 flex-1 text-xs"
+                            placeholder={t('variables.field.folderPath')}
+                            title={row.value || ''}
+                          />
+                          <button
+                            type="button"
+                            onClick={() => handlePickFolder(index)}
+                            className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-[#3a465c] text-[#c9d4e8] hover:bg-[#1f2633]"
+                            title={t('variables.field.pickFolder')}
+                          >
+                            <FolderOpen className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
+                      ) : (
                         <input
                           value={row.value || ''}
                           onChange={(event) => updateRow(index, { value: event.target.value })}
                           onBlur={(event) => handleSaveRow(index, { value: event.target.value })}
-                          className="input-field h-8 min-w-0 flex-1 text-xs"
-                          placeholder={t('variables.field.filePath')}
+                          className="input-field h-8 text-xs"
+                          placeholder={t('variables.field.value')}
                         />
-                        <button
-                          type="button"
-                          onClick={async () => {
-                            const picked = await window.electronAPI?.selectFile?.();
-                            if (!picked) return;
-                            updateRow(index, { value: picked });
-                            handleSaveRow(index, { value: picked });
-                          }}
-                          className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-[#3a465c] text-[#c9d4e8] hover:bg-[#1f2633]"
-                          title={t('variables.field.pickFile')}
-                        >
-                          <Upload className="h-3.5 w-3.5" />
-                        </button>
-                      </div>
-                    ) : (
-                      <input
-                        value={row.value || ''}
-                        onChange={(event) => updateRow(index, { value: event.target.value })}
-                        onBlur={(event) => handleSaveRow(index, { value: event.target.value })}
-                        className="input-field h-8 text-xs"
-                        placeholder={t('variables.field.value')}
-                      />
-                    )}
-                    <button
-                      type="button"
-                      onClick={() => handleDeleteRow(index)}
-                      className="flex h-8 w-8 items-center justify-center rounded-md text-[#76849b] hover:bg-[#2a1f24] hover:text-[#ff8fa0]"
-                      title={t('variables.delete')}
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteRow(index)}
+                        className="flex h-8 w-8 items-center justify-center rounded-md text-[#76849b] hover:bg-[#2a1f24] hover:text-[#ff8fa0]"
+                        title={t('variables.delete')}
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
                   </div>
                 ))}
               </div>

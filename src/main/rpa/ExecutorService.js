@@ -4,6 +4,10 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer';
+import {
+  getBrowserZoomService,
+  resolveBrowserZoomPercent,
+} from './BrowserZoomService.js';
 import { getCrawlExtractionScript } from './CardExtractorScript.js';
 import {
   buildFacebookPostLink,
@@ -35,6 +39,11 @@ import {
 } from './RequestCatchingPuppeteerCapture.js';
 import { CrawlRequestDumpService } from './CrawlRequestDumpService.js';
 import { resolveScenarioTargetUrl, resolveVariableTemplate } from './VariableResolver.js';
+import { expandUploadPaths } from './expandUploadPaths.js';
+import {
+  getExecutionBrowserLockService,
+  resolveExecutionBrowserLockEnabled,
+} from './ExecutionBrowserLockService.js';
 import { ensureRememberMeChecked, isCheckboxAlreadyChecked, resolveGuestSessionDir, resolveSessionStartUrl } from '../browser/BrowserSessionPaths.js';
 
 const DEFAULT_ACTION_DELAY_MS = 300;
@@ -88,6 +97,7 @@ class ExecutorService {
     this._releaseDirLock = null;
     this._crawlResults = [];
     this._requestCatchingCapture = null;
+    this._browserLockExecutionId = null;
   }
 
   async startScenario(scenarioId, options = {}) {
@@ -174,6 +184,7 @@ class ExecutorService {
       });
 
       await this._launchBrowser(scenario, options);
+      await this._lockExecutionBrowser(executionId, options);
 
       if (!isRequestCatching && scenarioType !== 'prepare') {
         await this._ensureSessionReady(scenario, executionId);
@@ -417,11 +428,46 @@ class ExecutorService {
       });
       throw error;
     } finally {
-      await this._cleanupBrowser();
-      this.isRunning = false;
-      this.currentScenario = null;
-      this._executionViewport = null;
-      this._crawlResults = [];
+      // Unlock always runs — even if cleanup throws — so the browser is never left locked.
+      try {
+        await this._cleanupBrowser();
+      } finally {
+        await this._unlockExecutionBrowser();
+        this.isRunning = false;
+        this.currentScenario = null;
+        this._executionViewport = null;
+        this._crawlResults = [];
+      }
+    }
+  }
+
+  async _lockExecutionBrowser(executionId, options = {}) {
+    const settings = this.dbService?.getSettings?.() || {};
+    if (!resolveExecutionBrowserLockEnabled(settings)) {
+      console.log('[BrowserLock] Skip lock (execution_browser_lock=false).');
+      return;
+    }
+
+    const lockService = getExecutionBrowserLockService();
+    const result = await lockService.lock({
+      executionId,
+      browser: this.browser,
+      page: this.page,
+      headless: options.headless === true,
+    });
+    if (result?.ok && !result.skipped) {
+      this._browserLockExecutionId = executionId;
+    }
+  }
+
+  async _unlockExecutionBrowser() {
+    const executionId = this._browserLockExecutionId || this._currentExecutionId;
+    this._browserLockExecutionId = null;
+    if (!executionId) return;
+    try {
+      await getExecutionBrowserLockService().unlock(executionId);
+    } catch (error) {
+      console.warn('[BrowserLock] Unlock in finally failed:', error?.message || error);
     }
   }
 
@@ -480,6 +526,9 @@ class ExecutorService {
       await this.browserProfileService.waitForProfileUnlock(userDataDir);
     }
 
+    const settings = this.dbService.getSettings();
+    const zoomPrepare = await this._prepareBrowserZoom(userDataDir, settings);
+
     const headless = options.headless === true;
     const proxyId = options.proxyId ?? null;
     const proxyConfig = proxyId ? this.dbService.getProxyById?.(proxyId) : null;
@@ -529,6 +578,41 @@ class ExecutorService {
       });
       await ensureRememberMeChecked(this.page);
       await this._sleep(400);
+    }
+
+    await this._applyBrowserZoom(this.page, {
+      userDataDir,
+      settings,
+      browser: this.browser,
+      prepareResult: zoomPrepare,
+    });
+  }
+
+  async _prepareBrowserZoom(userDataDir, settings = {}) {
+    const percent = resolveBrowserZoomPercent(settings);
+    try {
+      return await getBrowserZoomService().prepareUserDataDir(userDataDir, percent);
+    } catch (error) {
+      console.warn(`[BrowserZoom] prepareUserDataDir failed: ${error.message}`);
+      return { alreadyAtTarget: false, percent, prepared: false };
+    }
+  }
+
+  async _applyBrowserZoom(page, { userDataDir, settings = {}, browser = null, prepareResult = null } = {}) {
+    const percent = resolveBrowserZoomPercent(settings);
+    try {
+      // Let Chromium finish first paint / create HWND before Menu Zoom hotkeys.
+      await this._sleep(400);
+      return await getBrowserZoomService().applyDefaultZoom({
+        page,
+        browser: browser || this.browser,
+        userDataDir,
+        percent,
+        prepareResult,
+      });
+    } catch (error) {
+      console.warn(`[BrowserZoom] applyDefaultZoom failed: ${error.message}`);
+      return { ok: false, percent, error: error.message };
     }
   }
 
@@ -681,6 +765,10 @@ class ExecutorService {
 
     const parentId = String(scenario.parent_id || '').trim();
     if (!parentId) {
+      if (normalizeScenarioType(scenario.scenario_type) === 'action') {
+        console.log('[Executor] Action scenario khong co parent_id — bo qua DOM guard va tiep tuc chay.');
+        return;
+      }
       throw new Error('[Executor] DOM chua san sang. Hay gan parent_id (kich ban prepare/login) cho kich ban nay.');
     }
 
@@ -834,6 +922,7 @@ class ExecutorService {
       case 'input':
       case 'type':
       case 'keypress':
+      case 'debounce_keydown':
         await this._executeType(step);
         break;
       case 'file':
@@ -1528,55 +1617,134 @@ class ExecutorService {
       throw new Error('Đường dẫn file không hợp lệ (C:\\fakepath). Gán biến type=file trong Variables.');
     }
 
-    const filePaths = String(rawPath)
-      .split(';')
-      .map((item) => item.trim())
-      .filter(Boolean);
-    if (!filePaths.length) {
-      throw new Error('File step không có file hợp lệ.');
-    }
-
-    validateFilePathsForUpload(filePaths, {
-      accept: config.accept || anchor.accept || '',
-      maxSizeMb: config.max_size_mb,
+    // value_type=file stores a folder path — expand to all valid media files inside.
+    const filePaths = expandUploadPaths(rawPath, {
+      accept: config.accept || '',
+      maxSizeMb: Number(config.max_size_mb) || 0,
     });
+    console.log(`[Executor] Upload ${filePaths.length} file(s) từ: ${rawPath}`);
 
     const selector = this._resolveSelector(anchor, config);
-    const viewport = this._getExecutionViewport();
-    const focused = await this._focusTarget(anchor, config, selector);
-
-    if (!focused) {
-      const coords = anchor.relative_coords;
-      if (coords?.x !== undefined && coords?.y !== undefined) {
-        const x = Math.round((coords.x / 100) * viewport.width);
-        const y = Math.round((coords.y / 100) * viewport.height);
-        await this.page.mouse.click(x, y);
-      }
-    }
-
-    if (selector) {
-      const handle = await this.page.$(selector).catch(() => null);
-      if (handle) {
-        await handle.uploadFile(...filePaths);
-        return;
-      }
-    }
-
-    const fallbackSelectors = [
-      anchor.selector_value,
-      anchor.id ? `#${anchor.id}` : '',
-      anchor.name ? `[name="${anchor.name}"]` : '',
-      anchor.ariaLabel ? `[aria-label="${anchor.ariaLabel}"]` : '',
-    ].filter(Boolean);
-
-    for (const item of fallbackSelectors) {
-      const handle = await this.page.$(item).catch(() => null);
-      if (!handle) continue;
-      await handle.uploadFile(...filePaths);
-      return;
-    }
+    const uploaded = await this._uploadFilesToPage(filePaths, {
+      anchor,
+      config,
+      selector,
+    });
+    if (uploaded) return;
 
     throw new Error('Không tìm thấy input file để upload.');
+  }
+
+  /**
+   * Upload without opening the native OS file dialog.
+   * Prefer hidden input[type=file].uploadFile(); only use FileChooser as last resort.
+   */
+  async _uploadFilesToPage(filePaths, { anchor = {}, config = {}, selector = '' } = {}) {
+    if (!this.page || this.page.isClosed() || !filePaths?.length) return false;
+
+    const candidateSelectors = [
+      ...this._collectSelectors(anchor, config, selector),
+      'input[type="file"]',
+      'input[type=file]',
+      'form input[type="file"]',
+      'div[role="dialog"] input[type="file"]',
+      '[aria-label*="photo" i] input[type="file"]',
+      '[aria-label*="Photo" i] input[type="file"]',
+      '[aria-label*="Ảnh" i] input[type="file"]',
+    ].filter(Boolean);
+
+    for (const item of candidateSelectors) {
+      const handles = await this.page.$$(item).catch(() => []);
+      for (const handle of handles) {
+        const ok = await this._tryUploadHandle(handle, filePaths);
+        if (ok) {
+          console.log(`[Executor] uploadFile ok via selector: ${item}`);
+          return true;
+        }
+      }
+    }
+
+    // Any file input currently in DOM (including hidden / opacity 0).
+    const allFileInputs = await this.page.$$('input[type="file"]').catch(() => []);
+    for (const handle of allFileInputs) {
+      const ok = await this._tryUploadHandle(handle, filePaths);
+      if (ok) {
+        console.log('[Executor] uploadFile ok via page-wide input[type=file]');
+        return true;
+      }
+    }
+
+    // Last resort: click recorded trigger while capturing FileChooser (no manual OS dialog).
+    const triggerSelectors = this._collectSelectors(anchor, config, selector)
+      .filter((item) => !/input\[type\s*=\s*["']?file/i.test(item));
+    if (triggerSelectors.length || anchor.relative_coords) {
+      try {
+        const chooserPromise = this.page.waitForFileChooser({ timeout: 8000 });
+        let clicked = false;
+        for (const item of triggerSelectors) {
+          const handle = await this.page.$(item).catch(() => null);
+          if (!handle) continue;
+          await handle.click({ delay: 20 }).catch(() => {});
+          clicked = true;
+          break;
+        }
+        if (!clicked && anchor.relative_coords?.x != null && anchor.relative_coords?.y != null) {
+          const viewport = this._getExecutionViewport();
+          const x = Math.round((anchor.relative_coords.x / 100) * viewport.width);
+          const y = Math.round((anchor.relative_coords.y / 100) * viewport.height);
+          // Skip bogus (0,0) clicks from bad recording anchors.
+          if (x > 0 || y > 0) {
+            await this.page.mouse.click(x, y);
+            clicked = true;
+          }
+        }
+        if (!clicked) {
+          chooserPromise.catch(() => {});
+          return false;
+        }
+        const chooser = await chooserPromise;
+        await chooser.accept(filePaths);
+        console.log('[Executor] FileChooser.accept ok');
+        return true;
+      } catch (error) {
+        console.warn(`[Executor] FileChooser fallback failed: ${error.message}`);
+      }
+    }
+
+    return false;
+  }
+
+  async _tryUploadHandle(handle, filePaths) {
+    if (!handle) return false;
+    try {
+      const isFileInput = await handle.evaluate((el) => {
+        const tag = String(el?.tagName || '').toLowerCase();
+        if (tag !== 'input') return false;
+        return String(el.getAttribute('type') || el.type || '').toLowerCase() === 'file';
+      }).catch(() => false);
+      if (!isFileInput) return false;
+
+      // Make sure Puppeteer can set files even if the input is display:none.
+      await handle.evaluate((el) => {
+        el.removeAttribute('disabled');
+        el.disabled = false;
+        if (el.style) {
+          el.style.display = 'block';
+          el.style.visibility = 'visible';
+          el.style.opacity = '1';
+        }
+      }).catch(() => {});
+
+      await handle.uploadFile(...filePaths);
+      await handle.evaluate((el) => {
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      }).catch(() => {});
+      return true;
+    } catch (error) {
+      console.warn(`[Executor] uploadFile handle failed: ${error.message}`);
+      return false;
+    }
   }
 
   _getExecutionViewport() {
@@ -1849,64 +2017,6 @@ function normalizeExecutionViewport(viewport) {
   if (!Number.isFinite(width) || !Number.isFinite(height)) return null;
   if (width < 320 || height < 240 || width > 4096 || height > 4096) return null;
   return { width, height };
-}
-
-const FILE_EXT_CATEGORY = {
-  '.jpg': 'image',
-  '.jpeg': 'image',
-  '.png': 'image',
-  '.gif': 'image',
-  '.webp': 'image',
-  '.bmp': 'image',
-  '.svg': 'image',
-  '.mp4': 'video',
-  '.webm': 'video',
-  '.mov': 'video',
-  '.avi': 'video',
-  '.mkv': 'video',
-};
-
-function fileMatchesAccept(filePath, acceptRaw) {
-  const accept = String(acceptRaw || '').trim();
-  if (!accept) return true;
-
-  const ext = path.extname(filePath).toLowerCase();
-  const parts = accept.split(',').map((item) => item.trim()).filter(Boolean);
-  for (const part of parts) {
-    if (part.startsWith('.')) {
-      if (ext === part.toLowerCase()) return true;
-      continue;
-    }
-    if (part.endsWith('/*')) {
-      const category = part.slice(0, -2);
-      if (FILE_EXT_CATEGORY[ext] === category) return true;
-      continue;
-    }
-    if (part.includes('/')) {
-      const extGuess = ext.replace(/^\./, '');
-      if (part.endsWith(`/${extGuess}`)) return true;
-    }
-  }
-  return false;
-}
-
-function validateFilePathsForUpload(filePaths, { accept, maxSizeMb } = {}) {
-  const maxBytes = Number(maxSizeMb) > 0 ? Number(maxSizeMb) * 1024 * 1024 : 0;
-  for (const filePath of filePaths) {
-    if (!fs.existsSync(filePath)) {
-      throw new Error(`File không tồn tại: ${filePath}`);
-    }
-    const stat = fs.statSync(filePath);
-    if (!stat.isFile()) {
-      throw new Error(`Đường dẫn không phải file: ${filePath}`);
-    }
-    if (maxBytes && stat.size > maxBytes) {
-      throw new Error(`File vượt giới hạn ${Number(maxSizeMb)}MB: ${path.basename(filePath)}`);
-    }
-    if (!fileMatchesAccept(filePath, accept)) {
-      throw new Error(`File không đúng loại (${accept}): ${path.basename(filePath)}`);
-    }
-  }
 }
 
 function randomRuntimeDelay(baseMs = DEFAULT_ACTION_DELAY_MS, minMs = 120, maxMs = 1500) {

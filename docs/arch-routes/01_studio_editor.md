@@ -30,8 +30,10 @@ Studio Editor **từ chối cơ chế rendering video native của cửa sổ ru
 ```
 RecorderService.startRecording()
   → puppeteer.launch() với viewport đã ghi
-  → Page.startScreencast({ quality: 80, maxWidth: 1280, maxHeight: 720 })
-  → Frame events được ghi vào {cacheRoot}/scenarios/{scenarioId}/frames/
+  → Tái sử dụng tab about:blank mặc định của Chromium (đóng tab thừa) — tránh mở 2 tab trống
+  → page.goto(targetUrl) sau khi resolve {{variables}}
+  → Screenshot ~4 FPS sau khi trang load
+  → Frame events được ghi vào {storageDir}/scenarios/{scenarioId}/frames/
   → Mỗi step được liên kết với một frame qua bảng scenario_step_frames
 ```
 
@@ -84,8 +86,19 @@ Mỗi step được hiển thị dưới dạng hình thoi (♦) trên track tim
 ```
 
 - **Recording mode:** Steps tự động được thêm vào khi người dùng tương tác với embedded browser. Frame được chụp tại mỗi tương tác.
-- **Edit mode:** Steps có thể được sắp xếp lại thứ tự, xóa, hoặc chỉnh sửa thuộc tính qua `StepEditor.jsx`.
+- **Edit mode:** Steps có thể được sắp xếp lại thứ tự, xóa, hoặc chỉnh sửa thuộc tính qua `StepEditPanel`.
 - **Trim mode:** `preview_trim_ranges` (mảng JSON) lưu điểm trim in/out để nén video xuất bản.
+
+**Đồng bộ thời gian step ↔ keyframe:**
+
+| Thành phần | Hàm / hành vi |
+|------------|----------------|
+| Timestamp trên `StepCard` | `getStepTimestamp(step, index, steps)` — ưu tiên `target_anchor.time_offset`, fallback tích lũy `delay_ms` |
+| Vị trí diamond trên `Timeline` | Cùng `getStepTimestamp` |
+| Click diamond | Gọi `handleSelectStep(index)` → nhảy playhead + highlight step trong LIST |
+| Highlight diamond đỏ | `selectedStepIndex === idx` hoặc playhead gần `displayTime` |
+
+**Program Monitor:** giữ frame URL gần nhất khi selection/URL tạm mất (xóa step, bỏ chọn) — tránh chớp canvas.
 
 ### 3.2 Panel LIST SCENARIO STEPS
 
@@ -111,8 +124,9 @@ Panel **List scenario steps** nằm ở cột phải của `StandardScenarioEdit
 | Danh sách step | `StepCard` trong `ScenarioEditor.jsx` | Card mỗi bước: icon, mô tả i18n, timestamp, selector/text phụ |
 | Thanh action thủ công | `ActionIconBar` | Thêm `navigate` / `click` / `input` / `wait` bằng icon |
 | Inspector step | `StepEditPanel` | Form chỉnh `action_type`, selector/URL, text, delay |
-| Đồng bộ timeline | `handleSelectStep` | Click card → nhảy playhead + chọn keyframe tương ứng |
+| Đồng bộ timeline | `handleSelectStep` | Click card hoặc diamond → nhảy playhead + chọn keyframe tương ứng |
 | Chuẩn hóa state | `normalizeSteps()` | Parse `target_anchor` JSON, nâng `action_config` lên top-level step |
+| Timestamp chung | `getStepTimestamp()` | Nguồn thời gian duy nhất cho LIST + TIMELINE KEYFRAMES |
 
 **Hiển thị mỗi card (`StepCard`):**
 
@@ -120,9 +134,44 @@ Panel **List scenario steps** nằm ở cột phải của `StandardScenarioEdit
 - `click`: hiện CSS selector + badge skip-if-checked (nếu có)
 - `input` / `type`: hiện `selector → "text"` (cả file input)
 - `wait`: hiện `duration` ms
-- Timestamp: tích lũy `delay_ms` các step trước (`getStepTime`)
+- Timestamp: ưu tiên `target_anchor.time_offset` (thời điểm ghi thật), fallback tích lũy `delay_ms` — **cùng nguồn** với vị trí diamond trên TIMELINE KEYFRAMES
 
 **Sau khi Stop Record**, renderer nhận steps từ IPC `scenario:stop-recording` → `normalizeSteps()` → `setSteps()` → panel refresh ngay, không cần Save thủ công (DB đã ghi trong `RecorderService._finalizeRecordingSession`).
+
+**Xóa step:** chỉ gỡ step khỏi LIST / timeline keyframe ♦ — **không xóa** file screenshot tương ứng. Preview timeline giữ nguyên frame (tránh chớp Program Monitor). File frame chỉ bị dọn khi trim timeline bỏ khỏi preview manifest, hoặc khi xóa cả scenario.
+
+**Giữ frame khi xóa step (renderer + main):**
+
+1. `handleDeleteStep` / `handleDeleteSelectedSteps` — chuyển `associated_frame` của step bị xóa sang `manifestFrames` nếu chưa có.
+2. `DatabaseService._deleteOrphanedScenarioFrames` — **không** `unlink` file còn nằm trong preview manifest (`preview.json`).
+3. `ProgramMonitor` — hiển thị `lastFrameUrlRef` khi `currentFrameUrl` tạm null.
+
+### 3.3 Lưu kịch bản & Record
+
+**Luồng Save (`persist`):**
+
+```
+User bấm Save / Record (chưa có id)
+  → persist() dùng currentScenarioIdRef + activeVariableProfileIdRef (sync, không chờ React state)
+  → persistInFlightRef khóa — tránh 2 lần Save tạo 2 scenario UUID
+  → db:save-scenario với variable_profile_id từ ref
+  → setScenarioIdSafe(saved.id) — cập nhật ref + state ngay
+```
+
+**Luồng Record:**
+
+```
+User bấm Record (chưa có steps)
+  → persist() — đảm bảo có scenario id + template đã lưu
+  → setScenarioVariableProfile (nếu cần re-attach template sau save)
+  → scenario:start-recording
+  → RecorderService: reuse tab Chromium mặc định, goto URL đã resolve biến
+  → Stop Record → saveScenario giữ variable_profile_id + local_variables từ DB
+```
+
+**Tạo mới từ ScenariosPage:** draft `id: null` → lần Save đầu gán UUID; không tạo bản ghi thứ hai nếu bấm Save/Record liên tiếp. `ScenarioEditor` mount với `key={currentScenario.id || 'draft'}`.
+
+**Template + sample:** chọn template ở `DataProfileSelect`, áp sample trong `ScenarioVariablesBar` → `local_variables`. Chi tiết persistence xem [06_variable_templates.md](./06_variable_templates.md) §2.
 
 ---
 
@@ -135,12 +184,12 @@ Panel **List scenario steps** nằm ở cột phải của `StandardScenarioEdit
 | Navigate | `navigate` | URL change / manual add | Step Edit: URL + `{{var}}` | `page.goto()` |
 | Click | `click` | `click` event + anchor | Selector, skip-if-checked | `_executeClick()` |
 | Text input | `input` / `type` | `input` trên ô text | VariableInput text | `keyboard.type()` |
-| **File input** | `file` | `input` trên `input[type=file]` → promote | Biến `value_type=file`, accept, max MB | `uploadFile()` + validate |
+| Debounce keydown | `debounce_keydown` | Burst `keydown` trên contenteditable/ô text | Icon + nhãn riêng, VariableInput text | `keyboard.type()` |
+| **File input** | `file` | `input` trên `input[type=file]` → promote | Biến `value_type=file` + rule text Platform | `uploadFile()` |
 | Scroll | `scroll` | wheel / scroll burst | (chỉ xem) | `_executeScroll()` |
 | Wait | `wait` | manual / timing | duration ms | `_sleep()` |
-| **Global: Debounce keydown** | `scenario_meta.global_widgets` | `keydown` trên editable (luôn bật) | Inspector → debounce ms | đọc text thật sau debounce |
 
-**Global widgets** không phải step — lưu trong `scenario_meta.global_widgets`, áp dụng trong suốt session Record (scenario type `action` hoặc `prepare`).
+**Debounce keydown (Global capture khi Record):** bật/tắt bằng checkbox trong **Scenario info** (`action` / `prepare`). Mỗi lần người dùng gõ trên ô editable → sau `debounce_ms` ngừng gõ → chèn một step `debounce_keydown` có icon riêng vào LIST SCENARIO STEPS.
 
 ### 4.2 Luồng chung sau Stop Record
 
@@ -175,15 +224,21 @@ Mỗi biến có `value_type`:
 | `value_type` | Ý nghĩa | Gán giá trị |
 |--------------|---------|-------------|
 | `text` (mặc định) | Chuỗi cho URL / input text | Nhập text |
-| `file` | Đường dẫn tuyệt đối tại runtime | Panel **Variables** → type File → Chọn file |
+| `file` | Đường dẫn **thư mục** tuyệt đối (chọn folder) | Panel **Variables** → type File → Chọn thư mục |
 
 JSON lưu trong `scenarios.local_variables` / `scenario_meta.local_variables`:
 
 ```json
 [
-  { "key": "media_path", "value": "D:\\media\\photo.jpg", "value_type": "file" }
+  { "key": "images", "value": "D:\\media\\batch", "value_type": "file" }
 ]
 ```
+
+> **Thực thi:** biến `file` = path thư mục → `expandUploadPaths` lấy ảnh/video hợp lệ rồi `uploadFile(...paths)`. Chi tiết: [06_variable_templates.md](./06_variable_templates.md) §6.
+
+Skeleton schema và samples dùng lại cùng `value_type` — xem [06_variable_templates.md](./06_variable_templates.md).
+
+Trong panel **Variables**: selectbox Sample chỉ hiện sample của template đã chọn ở header; chọn sample sẽ áp values vào `local_variables`.
 
 #### Step config sau record
 
@@ -196,9 +251,7 @@ JSON lưu trong `scenarios.local_variables` / `scenario_meta.local_variables`:
     "accept": "image/*,video/*",
     "action_config": {
       "selector": "input.x1s85apg",
-      "variable_key": "media_path",
-      "accept": "image/*",
-      "max_size_mb": 10
+      "variable_key": "media_path"
     }
   }
 }
@@ -207,45 +260,42 @@ JSON lưu trong `scenarios.local_variables` / `scenario_meta.local_variables`:
 | Field | Mô tả |
 |-------|--------|
 | `variable_key` | Key biến `value_type=file` (không có `{{}}`) |
-| `accept` | Giới hạn MIME/extension (`image/*`, `.png`, …) — copy từ anchor khi record |
-| `max_size_mb` | Giới hạn dung lượng; `0` = không giới hạn |
 
-**Step Edit Panel:** dropdown biến file, accept, max MB — **không** có nút Chọn file (chọn file ở panel Variables).
+**Step Edit Panel:** dropdown biến file + **rule text theo Platform** (Facebook: chấp nhận gần hết ảnh/video). Không còn field Allowed file types / Max file size — Facebook tự validate trong picker.
 
-**LIST SCENARIO STEPS:** nhãn i18n `Upload file to input` · `selector → {{media_path}}` · accept · max MB.
+**LIST SCENARIO STEPS:** nhãn i18n `Upload file to input` · `selector → {{media_path}}`.
 
 #### Executor (`_executeFile`)
 
 1. Resolve `{{variable_key}}` qua `buildVariableMap`
 2. Từ chối `C:\fakepath\`
-3. Validate tồn tại file, `max_size_mb`, `accept`
+3. `expandUploadPaths`: folder → danh sách file hợp lệ (1 cấp); path file giữ nguyên; `;` = nhiều nguồn
 4. `ElementHandle.uploadFile(...paths)`
 
-### 4.4 Global widget: Debounce keydown
+### 4.4 Debounce keydown → step trong LIST SCENARIO STEPS
 
-**Luôn bật** từ lúc bắt đầu Record (scenario `action` / `prepare`). Không có checkbox bật/tắt, không inject text cố định.
+Checkbox **Debounce keydown** nằm trong **Scenario info** của scenario `action` / `prepare`. Config được lưu theo scenario và chỉ capture khi checkbox bật.
 
 **Vấn đề:** Facebook và nhiều SPA dùng `contenteditable` — sự kiện `input` không fire (listener `input` chỉ xử lý phần tử có `.value`).
 
 **Cách hoạt động:**
 
-1. Listener `keydown` (capture) trên toàn document
+1. Listener `keydown` (capture) trên toàn document trong suốt quá trình Record
 2. Tìm ô editable gần nhất: `contenteditable`, `textarea`, `input` text, `role=textbox`
 3. Mỗi phím reset timer debounce
-4. Sau `debounce_ms` không gõ thêm → đọc **nội dung thật** (`innerText` / `value`) → gửi step `input` với `source: 'debounce_keydown'`
+4. Sau `debounce_ms` không gõ thêm → đọc **nội dung thật** (`innerText` / `value`) → chèn step `debounce_keydown` vào LIST SCENARIO STEPS với icon/nhãn riêng
 5. `_mergeTypeEvents()` gộp burst input cùng target
 
-Config lưu tại `scenario_meta.global_widgets.debounce_keydown`:
+Config tại `scenario_meta.global_widgets.debounce_keydown`:
 
 ```json
 {
+  "enabled": true,
   "debounce_ms": 300
 }
 ```
 
-**UI:** Inspector → Global widgets — chỉ chỉnh debounce ms. Badge **Luôn bật khi Record**.
-
-Ví dụ Facebook *Tạo bài viết*: gõ *"Test kịch bản auto..."* → sau 300ms dừng gõ → LIST SCENARIO STEPS có step `input` với full text + anchor contenteditable.
+Ví dụ Facebook *Tạo bài viết*: gõ *"Test kịch bản auto..."* → sau 300ms dừng gõ → LIST SCENARIO STEPS có step `debounce_keydown` với full text + anchor contenteditable.
 
 ### 4.5 Widget text input (tham chiếu)
 
@@ -270,7 +320,7 @@ Khác file: dùng `VariableInput` text, không có accept/max size.
 | Tạo step | Tự động khi tương tác | Click element Design mode |
 | `action_type` | `click`, `input`, `file`, `scroll`, … | `crawl` |
 | Config | `target_anchor.action_config` | `widget_type`, `extract_mode`, `children` |
-| Panel | LIST STEPS + Step Edit + Global widgets | `CrawlWidgetPanel` |
+| Panel | LIST STEPS + Step Edit | `CrawlWidgetPanel` |
 
 ---
 
@@ -341,7 +391,26 @@ function randomRuntimeDelay(baseMs = 300, minMs = 120, maxMs = 1500) {
 
 ---
 
-## 8. File Nguồn Chính
+## 8. Execution Browser Lock
+
+Khi chạy Execute từ Studio/Executions, browser automation bị khóa input vật lý của người dùng. Record / Open Browser / Preview **không** bị ảnh hưởng.
+
+| Thành phần | Vai trò |
+|------------|---------|
+| `ExecutionBrowserLockService` | `lock` / `unlock` / `isLocked` + watchdog |
+| Strategy Win32 | `EnableWindow(FALSE)` trên HWND Chromium (Windows) |
+| Strategy Overlay | Electron transparent overlay (fallback) |
+| Setting `execution_browser_lock` | Mặc định `true` |
+
+```
+Execute → launch browser → lock → workflow → cleanup → finally unlock
+```
+
+Chi tiết đầy đủ: [07_execution_browser_lock.md](./07_execution_browser_lock.md).
+
+---
+
+## 9. File Nguồn Chính
 
 | File | Vai trò |
 |------|------|
@@ -350,14 +419,17 @@ function randomRuntimeDelay(baseMs = 300, minMs = 120, maxMs = 1500) {
 | `src/renderer/components/CrawlScenarioEditorContent.jsx` | Cấu hình step crawl |
 | `src/renderer/components/RequestCatchingScenarioEditorContent.jsx` | Trình chỉnh sửa scenario request-catching |
 | `src/renderer/components/StepEditor.jsx` | Trình chỉnh sửa thuộc tính từng step |
-| `src/renderer/components/ScenarioVariablesBar.jsx` | Quản lý biến cục bộ |
-| `src/main/rpa/RecorderService.js` | Ghi Puppeteer + CDP screencast |
-| `src/main/rpa/ExecutorService.js` | Thực thi step với độ trễ ngẫu nhiên |
-| `src/main/database/DatabaseService.js` | Lưu trữ scenario + steps |
+| `src/renderer/components/ScenarioVariablesBar.jsx` | Quản lý biến cục bộ + sample |
+| `src/renderer/components/DataProfileSelect.jsx` | Chọn variable template gắn scenario |
+| `src/main/database/DatabaseService.js` | `saveScenario`, `buildScenarioMetaForStorage`, orphan frame cleanup |
+| `src/main/rpa/RecorderService.js` | Ghi Puppeteer + screenshot frames |
+| `src/main/rpa/ExecutorService.js` | Thực thi step; gọi Browser Lock khi Execute |
+| `src/main/rpa/ExecutionBrowserLockService.js` | Khóa input user trên browser Execute |
+| `src/shared/platformFileAccept.js` | Rule text upload theo Platform (Facebook mẫu) |
 
 ---
 
-## 9. Kênh IPC
+## 10. Kênh IPC
 
 | Channel | Hướng | Mục đích |
 |---------|-----------|---------|

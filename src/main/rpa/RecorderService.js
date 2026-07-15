@@ -1,6 +1,11 @@
 import { getElementAnchorHelpersScript } from './ElementAnchorScript.js';
 import { ensureRememberMeChecked, isCheckboxAlreadyChecked, resolveGuestSessionDir } from '../browser/BrowserSessionPaths.js';
 import { resolveScenarioTargetUrl, resolveVariableTemplate } from './VariableResolver.js';
+import { expandUploadPaths } from './expandUploadPaths.js';
+import {
+  getBrowserZoomService,
+  resolveBrowserZoomPercent,
+} from './BrowserZoomService.js';
 import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -32,6 +37,7 @@ class RecorderService {
     this.page = null;
     this.cdpSession = null;
     this.isRecording = false;
+    this._recordingReady = false;
     this.recordedEvents = [];
     this.frames = [];
     this.startTime = 0;
@@ -41,6 +47,7 @@ class RecorderService {
     this.framesDir = '';
     this.scenario = null;
     this.mode = 'replace';
+    this._sessionMode = 'replace';
     this.importWarning = null;
     this.previewWarning = null;
     this.viewport = DEFAULT_VIEWPORT;
@@ -54,7 +61,7 @@ class RecorderService {
     this._stopping = false;
     this._stopPromise = null;
     this._recordingFrameHandler = null;
-    this._recordingWidgetConfig = { debounce_keydown: { debounce_ms: 300 } };
+    this._recordingWidgetConfig = { debounce_keydown: { enabled: true, debounce_ms: 300 } };
   }
 
   async startRecording({ scenario, scenarioId: payloadScenarioId, targetUrl, viewport = DEFAULT_VIEWPORT, mode = 'replace', importProfileId = null } = {}) {
@@ -80,6 +87,9 @@ class RecorderService {
       recorded_height: effectiveViewport.height,
       device_pixel_ratio: sourceScenario?.device_pixel_ratio || 1,
       browser_profile_id: sourceScenario?.browser_profile_id || existingScenario?.browser_profile_id || null,
+      variable_profile_id: sourceScenario?.variable_profile_id
+        || existingScenario?.variable_profile_id
+        || null,
       scenario_type: sourceScenario?.scenario_type || existingScenario?.scenario_type || 'action',
       parent_id: sourceScenario?.parent_id || existingScenario?.parent_id || null,
       dom_check_anchor: sourceScenario?.dom_check_anchor || existingScenario?.dom_check_anchor || null,
@@ -95,6 +105,7 @@ class RecorderService {
 
     this.scenario = safeScenario;
     this.mode = mode === 'append' ? 'append' : 'replace';
+    this._sessionMode = this.mode;
     this.lastImportProfileId = effectiveImportProfileId;
     this.viewport = {
       width: safeScenario.recorded_width,
@@ -111,8 +122,10 @@ class RecorderService {
     this.framesDir = path.join(this.cacheDir, 'frames');
     if (this.mode === 'replace') {
       await fs.rm(this.framesDir, { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(this.cacheDir, 'preview.json'), { force: true }).catch(() => {});
     }
     await fs.mkdir(this.framesDir, { recursive: true });
+    console.log(`[Recorder] startRecording mode=${this.mode} scenario=${scenarioId}`);
 
     // Lay settings tu DB (su dung root browser.userDataDir lam noi debug frame/profile)
     const configuredUserDataDir = settings?.['browser.userDataDir'];
@@ -128,12 +141,16 @@ class RecorderService {
     this.usedUserDataDir = userDataDir;
 
     this.isRecording = true;
+    this._recordingReady = false;
     this._stopping = false;
+    console.log('[Recorder] Record locked while target URL is loading.');
 
     try {
       if (this.browserProfileService) {
         await this.browserProfileService.waitForProfileUnlock(userDataDir);
       }
+
+      const zoomPrepare = await this._prepareBrowserZoom(userDataDir, settings);
 
       this.browser = await puppeteer.launch({
         headless: false,
@@ -153,7 +170,12 @@ class RecorderService {
       });
       await this._releaseBrowserTopMost();
 
-      this.page = await this.browser.newPage();
+      // Reuse Chromium's default about:blank tab instead of opening a second blank page.
+      const existingPages = await this.browser.pages();
+      this.page = existingPages[0] || await this.browser.newPage();
+      for (const extraPage of existingPages.slice(1)) {
+        await extraPage.close().catch(() => {});
+      }
       await this._releaseBrowserTopMost();
       this.page.setDefaultTimeout(30000);
       this.page.setDefaultNavigationTimeout(60000);
@@ -168,21 +190,19 @@ class RecorderService {
 
       // Chromium restores cookies natively from userDataDir — just navigate to the target.
       await this.page.goto(resolvedTargetUrl, {
-        waitUntil: 'domcontentloaded',
+        waitUntil: 'load',
         timeout: 60000,
       });
+      await this._waitForPageLoadComplete(this.page);
       await ensureRememberMeChecked(this.page);
 
-      // Reset timing anchors to post-load so step time_offset is relative to page-ready,
-      // not to browser launch. This prevents the first step from carrying a large load delay.
-      this.startTime = Date.now();
-      this.lastEventTime = this.startTime;
-
-      // Start capturing frames only after the page has loaded — avoids blank/loading frames
-      // polluting the manifest and keeps manifestDuration in sync with step time_offset values.
-      this._screenshotTimer = setInterval(() => {
-        this._lastScreenshotPromise = this._takeScreenshot();
-      }, 250);
+      // Real Chromium Menu Zoom (not CSS / setViewport) before recording starts.
+      await this._applyBrowserZoom(this.page, {
+        userDataDir,
+        settings,
+        browser: this.browser,
+        prepareResult: zoomPrepare,
+      });
 
       await this._releaseBrowserTopMost();
       // Chromium may re-assert topmost after first paint; release again after render settles
@@ -192,6 +212,16 @@ class RecorderService {
       this.devicePixelRatio = await this.page.evaluate(() => window.devicePixelRatio || 1).catch(() => 1);
       this.scenario.device_pixel_ratio = this.devicePixelRatio;
 
+      // Arm recording only after load, browser zoom and recorder injection all complete.
+      // Any page events emitted before this point are discarded by _handleClientAction.
+      this.startTime = Date.now();
+      this.lastEventTime = this.startTime;
+      this._recordingReady = true;
+      console.log('[Recorder] Target URL loaded. Recording started.');
+
+      this._screenshotTimer = setInterval(() => {
+        this._lastScreenshotPromise = this._takeScreenshot();
+      }, 250);
       await this._takeScreenshot();
 
       return {
@@ -203,6 +233,7 @@ class RecorderService {
         startedAt: this.startTime,
       };
     } catch (error) {
+      this._recordingReady = false;
       this.isRecording = false;
       await this._cleanupBrowser();
       throw error;
@@ -230,6 +261,7 @@ class RecorderService {
   async _finalizeRecordingSession() {
     const endTime = Date.now();
     const durationMs = Math.max(0, endTime - this.startTime);
+    this._recordingReady = false;
     this.isRecording = false;
 
     if (this._recordingFrameHandler && this.page) {
@@ -259,6 +291,7 @@ class RecorderService {
     // Disk frames may outlive in-memory list when browser crashed mid-session.
     await this._hydrateFramesFromDiskIfNeeded();
     const recordedSteps = this._buildSteps();
+    const sessionMode = this._sessionMode === 'append' || this.mode === 'append' ? 'append' : 'replace';
     const effectiveDurationMs = Math.max(
       durationMs,
       this.frames.length ? Math.max(...this.frames.map((frame) => Number(frame.timestamp) || 0)) : 0,
@@ -266,11 +299,20 @@ class RecorderService {
     const previewManifest = await this._writePreviewManifest(effectiveDurationMs);
     // Khong tu dong render video — chi xuat ban moi render
     const currentScenario = this.scenario?.id ? this.dbService.getScenarioById(this.scenario.id) : null;
-    const existingSteps = this.mode === 'append' ? currentScenario?.steps || [] : [];
+    const existingSteps = sessionMode === 'append' ? (currentScenario?.steps || []) : [];
     const steps = [...existingSteps, ...recordedSteps];
+    console.log(
+      `[Recorder] finalize mode=${sessionMode} existingSteps=${existingSteps.length} `
+      + `newSteps=${recordedSteps.length} total=${steps.length}`,
+    );
     const scenarioToSave = {
       ...(currentScenario || {}),
       ...this.scenario,
+      // Keep template + sample values across record finalize (do not let stale session meta wipe them).
+      variable_profile_id: currentScenario?.variable_profile_id
+        ?? this.scenario?.variable_profile_id
+        ?? null,
+      local_variables: currentScenario?.local_variables,
       recorded_width: this.viewport.width,
       recorded_height: this.viewport.height,
       device_pixel_ratio: this.devicePixelRatio,
@@ -300,7 +342,7 @@ class RecorderService {
         frames: this.frames,
         previewManifest,
         previewWarning: this.previewWarning,
-        mode: this.mode,
+        mode: sessionMode,
         importWarning: this.importWarning,
       },
     };
@@ -330,6 +372,8 @@ class RecorderService {
     const browserDataRoot = settings?.['browser.userDataDir'] || path.join(this.appDataPath, 'browser-data');
     const userDataDir = resolveGuestSessionDir(browserDataRoot, scenarioId || 'manual');
 
+    const zoomPrepare = await this._prepareBrowserZoom(userDataDir, settings);
+
     const browser = await puppeteer.launch({
       headless: false,
       defaultViewport: effectiveViewport,
@@ -350,10 +394,20 @@ class RecorderService {
 
     // Mo tab va dieu huong den targetUrl
     try {
-      const page = await browser.newPage();
+      const existingPages = await browser.pages();
+      const page = existingPages[0] || await browser.newPage();
+      for (const extraPage of existingPages.slice(1)) {
+        await extraPage.close().catch(() => {});
+      }
       if (targetUrl) {
         await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
       }
+      await this._applyBrowserZoom(page, {
+        userDataDir,
+        settings,
+        browser,
+        prepareResult: zoomPrepare,
+      });
     } catch { /* silent */ }
 
     // Khong close browser — nguoi dung tu dong
@@ -401,7 +455,11 @@ class RecorderService {
     }
 
     try {
-      const page = await browser.newPage();
+      const existingPages = await browser.pages();
+      const page = existingPages[0] || await browser.newPage();
+      for (const extraPage of existingPages.slice(1)) {
+        await extraPage.close().catch(() => {});
+      }
       page.setDefaultTimeout(30000);
       await this._releaseBrowserTopMost(browser);
 
@@ -443,6 +501,7 @@ class RecorderService {
         scenario_meta: scenario.scenario_meta || {},
       };
       this.mode = 'append';
+      this._sessionMode = 'append';
       this.lastImportProfileId = effectiveImportProfileId;
       this.viewport = { width: effectiveViewport.width, height: effectiveViewport.height };
       this.recordedEvents = [];
@@ -456,10 +515,19 @@ class RecorderService {
       this.usedUserDataDir = userDataDir;
 
       this.devicePixelRatio = await page.evaluate(() => window.devicePixelRatio || 1).catch(() => 1);
+      this._recordingReady = false;
       this.isRecording = true;
       this._stopping = false;
       this.browser = browser;
       this.page = page;
+
+      // Replay is complete and the current page is ready; arm only the append recording phase.
+      await this._waitForPageLoadComplete(page);
+      await this._injectRecordingScript(page);
+      this.startTime = Date.now();
+      this.lastEventTime = this.startTime;
+      this._recordingReady = true;
+      console.log('[Recorder] Replay complete. Append recording started.');
 
       // Screenshot capture ~4 FPS (same as startRecording)
       this._screenshotTimer = setInterval(() => {
@@ -480,6 +548,7 @@ class RecorderService {
         startedAt: this.startTime,
       };
     } catch (error) {
+      this._recordingReady = false;
       await browser.close().catch(() => {});
       return { success: false, error: error.message };
     }
@@ -549,7 +618,7 @@ class RecorderService {
         });
       } else if (action_type === 'click') {
         await this._replayClick(page, anchor, selector, viewport, config);
-      } else if (action_type === 'input' || action_type === 'type') {
+      } else if (action_type === 'input' || action_type === 'type' || action_type === 'debounce_keydown') {
         const text = resolveVariableTemplate(config.text || '', variableMap);
         await this._replayType(page, anchor, selector, text, viewport, config.delay || 50);
       } else if (action_type === 'file') {
@@ -653,34 +722,60 @@ class RecorderService {
   async _replayFile(page, anchor = {}, selector = '', filePath = '', viewport = DEFAULT_VIEWPORT) {
     if (!filePath || /^C:\\fakepath\\/i.test(filePath)) return;
 
-    const focused = await this._replayFocus(page, anchor, selector);
-    if (!focused) {
-      const coords = anchor.relative_coords;
-      if (coords?.x !== undefined && coords?.y !== undefined) {
-        const x = Math.round((coords.x / 100) * viewport.width);
-        const y = Math.round((coords.y / 100) * viewport.height);
-        await page.mouse.click(x, y).catch(() => {});
-      }
-    }
-
-    const handle = selector ? await page.$(selector).catch(() => null) : null;
-    if (handle) {
-      await handle.uploadFile(filePath).catch(() => {});
+    const config = anchor.action_config || {};
+    let filePaths = [];
+    try {
+      filePaths = expandUploadPaths(filePath, {
+        accept: config.accept || '',
+        maxSizeMb: Number(config.max_size_mb) || 0,
+      });
+    } catch (error) {
+      console.warn(`[Recorder] Replay file bỏ qua: ${error.message}`);
       return;
     }
+    if (!filePaths.length) return;
 
+    // Prefer direct uploadFile on hidden inputs — never open native OS dialog first.
     const selectors = [
       selector,
       anchor.selector_value,
+      'input[type="file"]',
       anchor.id ? `#${anchor.id}` : '',
       anchor.name ? `[name="${anchor.name}"]` : '',
     ].filter(Boolean);
 
     for (const item of selectors) {
-      const candidate = await page.$(item).catch(() => null);
-      if (!candidate) continue;
-      await candidate.uploadFile(filePath).catch(() => {});
-      return;
+      const handles = await page.$$(item).catch(() => []);
+      for (const candidate of handles) {
+        const isFile = await candidate.evaluate((el) => (
+          String(el?.tagName || '').toLowerCase() === 'input'
+          && String(el.getAttribute('type') || el.type || '').toLowerCase() === 'file'
+        )).catch(() => false);
+        if (!isFile) continue;
+        await candidate.uploadFile(...filePaths).catch(() => {});
+        await candidate.evaluate((el) => {
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+        }).catch(() => {});
+        return;
+      }
+    }
+
+    try {
+      const chooserPromise = page.waitForFileChooser({ timeout: 5000 });
+      const focused = await this._replayFocus(page, anchor, selector);
+      if (!focused) {
+        const coords = anchor.relative_coords;
+        if (coords?.x !== undefined && coords?.y !== undefined) {
+          const x = Math.round((coords.x / 100) * viewport.width);
+          const y = Math.round((coords.y / 100) * viewport.height);
+          if (x > 0 || y > 0) await page.mouse.click(x, y).catch(() => {});
+        }
+      }
+      const chooser = await chooserPromise;
+      await chooser.accept(filePaths);
+    } catch (error) {
+      console.warn(`[Recorder] Replay file FileChooser failed: ${error.message}`);
     }
   }
 
@@ -688,6 +783,7 @@ class RecorderService {
     const debounceKeydown = scenarioMeta?.global_widgets?.debounce_keydown || {};
     return {
       debounce_keydown: {
+        enabled: debounceKeydown.enabled !== false,
         debounce_ms: Math.max(50, Math.min(5000, Number(debounceKeydown.debounce_ms) || 300)),
       },
     };
@@ -732,9 +828,11 @@ class RecorderService {
   }
 
   getStatus() {
+    const recordingReady = this.isRecording && this._recordingReady;
     return {
-      isRecording: this.isRecording,
-      elapsedMs: this.isRecording ? Date.now() - this.startTime : 0,
+      isRecording: recordingReady,
+      isPreparing: this.isRecording && !this._recordingReady,
+      elapsedMs: recordingReady ? Date.now() - this.startTime : 0,
       eventsCount: this.recordedEvents.length,
       frameCount: this.frames.length,
       targetUrl: this.scenario?.target_url || '',
@@ -750,7 +848,7 @@ class RecorderService {
   }
 
   _handleClientAction(payload) {
-    if (!this.isRecording || !payload?.action_type) return;
+    if (!this.isRecording || !this._recordingReady || !payload?.action_type) return;
 
     const now = Date.now();
     const timeOffset = now - this.startTime;
@@ -768,7 +866,7 @@ class RecorderService {
   }
 
   async _takeScreenshot() {
-    if (!this.isRecording || !this.page || this.page.isClosed()) return;
+    if (!this.isRecording || !this._recordingReady || !this.page || this.page.isClosed()) return;
     if (this._screenshotInProgress) return;
 
     this._screenshotInProgress = true;
@@ -1127,7 +1225,7 @@ class RecorderService {
 
   _mergeTypeEvents(events) {
     const merged = [];
-    const inputLike = new Set(['input', 'type', 'file']);
+    const inputLike = new Set(['input', 'type', 'debounce_keydown', 'file']);
 
     for (const event of events) {
       if (!inputLike.has(event.action_type)) {
@@ -1176,7 +1274,7 @@ class RecorderService {
     if (event.action_type === 'navigate') {
       return { url: event.url || this.scenario?.target_url || '' };
     }
-    if (event.action_type === 'input' || event.action_type === 'type') {
+    if (event.action_type === 'input' || event.action_type === 'type' || event.action_type === 'debounce_keydown') {
       return { selector: selectorValue || '', text: event.text || '', delay: randomRuntimeDelay(50, 25, 120) };
     }
     if (event.action_type === 'file') {
@@ -1189,6 +1287,7 @@ class RecorderService {
   }
 
   _describeEvent(event, selectorValue) {
+    if (event.action_type === 'debounce_keydown') return `Debounce keydown: "${event.text || ''}"`;
     if (event.action_type === 'input' || event.action_type === 'type') return `Nhap: "${event.text || ''}"`;
     if (event.action_type === 'file') return `File: "${event.text || ''}"`;
     if (event.action_type === 'scroll') return `Scroll den ${event.scroll_y || 0}px`;
@@ -1294,6 +1393,17 @@ class RecorderService {
         force: true,
       }).catch(() => {});
     }
+  }
+
+  async _waitForPageLoadComplete(page, timeoutMs = 60000) {
+    if (!page || page.isClosed()) {
+      throw new Error('[Recorder] Browser page closed before URL finished loading.');
+    }
+
+    await page.waitForFunction(
+      () => document.readyState === 'complete',
+      { timeout: timeoutMs },
+    );
   }
 
   async _installRecordingBridge(page) {
@@ -1437,11 +1547,13 @@ class RecorderService {
       }
 
       const debounceKeydown = __rpaWidgetConfig.debounce_keydown || {};
+      const debounceKeydownEnabled = debounceKeydown.enabled !== false;
       const debounceMs = Math.max(50, Math.min(5000, Number(debounceKeydown.debounce_ms) || 300));
       let keydownTimer = null;
       let keydownTarget = null;
 
       document.addEventListener('keydown', (event) => {
+        if (!debounceKeydownEnabled) return;
         if (event.repeat) return;
         if (event.ctrlKey || event.metaKey || event.altKey) return;
         if (event.key === 'Tab' || event.key === 'Escape') return;
@@ -1462,11 +1574,10 @@ class RecorderService {
 
           const anchor = getAnchor(activeEditable);
           send({
-            action_type: 'input',
+            action_type: 'debounce_keydown',
             selector_value: pickSelector(anchor),
             target_anchor: anchor,
             text,
-            source: 'debounce_keydown',
           });
         }, debounceMs);
       }, true);
@@ -1535,6 +1646,34 @@ class RecorderService {
     };
   }
 
+  async _prepareBrowserZoom(userDataDir, settings = {}) {
+    const percent = resolveBrowserZoomPercent(settings);
+    try {
+      return await getBrowserZoomService().prepareUserDataDir(userDataDir, percent);
+    } catch (error) {
+      console.warn(`[BrowserZoom] prepareUserDataDir failed: ${error.message}`);
+      return { alreadyAtTarget: false, percent, prepared: false };
+    }
+  }
+
+  async _applyBrowserZoom(page, { userDataDir, settings = {}, browser = null, prepareResult = null } = {}) {
+    const percent = resolveBrowserZoomPercent(settings);
+    try {
+      // Let Chromium finish first paint / create HWND before Menu Zoom hotkeys.
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      return await getBrowserZoomService().applyDefaultZoom({
+        page,
+        browser: browser || this.browser,
+        userDataDir,
+        percent,
+        prepareResult,
+      });
+    } catch (error) {
+      console.warn(`[BrowserZoom] applyDefaultZoom failed: ${error.message}`);
+      return { ok: false, percent, error: error.message };
+    }
+  }
+
   async _releaseBrowserTopMost(browser = this.browser) {
     if (process.platform !== 'win32') return;
 
@@ -1592,6 +1731,7 @@ $flags = 0x0001 -bor 0x0002 -bor 0x0010
     }
     this._screenshotInProgress = false;
     this._lastScreenshotPromise = null;
+    this._recordingReady = false;
     this.recordedEvents = [];
     this.frames = [];
     this.startTime = 0;
@@ -1599,6 +1739,7 @@ $flags = 0x0001 -bor 0x0002 -bor 0x0010
     this.frameCounter = 0;
     this.scenario = null;
     this.mode = 'replace';
+    this._sessionMode = 'replace';
     this.previewWarning = null;
     this.usedUserDataDir = null;
     this.lastImportProfileId = null;

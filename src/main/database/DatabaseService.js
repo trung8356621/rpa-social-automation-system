@@ -493,7 +493,10 @@ class DatabaseService {
     for (const profile of profiles) {
       const entries = normalizeVariableEntries(profile.variables_json);
       const hasValues = entries.some((item) => item.value != null && item.value !== '');
-      const keysOnly = entries.map((item) => ({ key: item.key }));
+      const keysOnly = entries.map((item) => ({
+        key: item.key,
+        value_type: item.value_type === 'file' ? 'file' : 'text',
+      }));
 
       if (hasValues && !findSample.get(profile.id, 'Default')) {
         insertSample.run(
@@ -962,25 +965,47 @@ class DatabaseService {
     });
 
     saveTransaction();
-    this._deleteOrphanedScenarioFrames(previousFramePaths, nextFramePaths);
+
+    // Resolve the effective preview-frame list BEFORE orphan cleanup.
+    // Deleting a step must not delete screenshot files still used by preview playback.
+    const manifestPath = scenario.preview_manifest_path
+      || existingScenario?.preview_manifest_path
+      || null;
+    let effectivePreviewFrames = null;
 
     if (Array.isArray(scenario.preview_manifest_frames)) {
-      const manifestPath = scenario.preview_manifest_path || existingScenario?.preview_manifest_path;
       if (manifestPath) {
         // Refuse to clobber an existing non-empty preview with an empty frame list
-        // from metadata-only UI saves (e.g. persist-before-record).
+        // from metadata-only UI saves (e.g. persist-before-record) — unless caller
+        // explicitly requests a replace-record wipe via force_preview_wipe.
         const incomingEmpty = scenario.preview_manifest_frames.length === 0;
-        const existingFrames = incomingEmpty ? readPreviewFrames(manifestPath) : [];
-        if (!(incomingEmpty && existingFrames.length > 0)) {
+        const forceWipe = scenario.force_preview_wipe === true;
+        const existingFrames = incomingEmpty && !forceWipe ? readPreviewFrames(manifestPath) : [];
+        if (incomingEmpty && !forceWipe && existingFrames.length > 0) {
+          effectivePreviewFrames = existingFrames;
+        } else {
           const durationMs = scenario.preview_duration_ms != null
             ? Number(scenario.preview_duration_ms)
             : (scenario.preview_manifest_frames.length
               ? Math.max(...scenario.preview_manifest_frames.map((frame) => Number(frame.time) || 0))
               : 0);
           this.writePreviewManifest(manifestPath, scenario.preview_manifest_frames, durationMs);
+          effectivePreviewFrames = scenario.preview_manifest_frames;
         }
+      } else {
+        effectivePreviewFrames = scenario.preview_manifest_frames;
       }
+    } else if (manifestPath) {
+      effectivePreviewFrames = readPreviewFrames(manifestPath);
     }
+
+    const protectedFramePaths = new Set();
+    for (const frame of effectivePreviewFrames || []) {
+      const framePath = frame?.path || frame?.filePath || null;
+      if (framePath) protectedFramePaths.add(framePath);
+    }
+
+    this._deleteOrphanedScenarioFrames(previousFramePaths, nextFramePaths, protectedFramePaths);
 
     // Trả về dữ liệu đã lưu với steps đã được deserialize
     return this.getScenarioById(scenarioId);
@@ -1067,6 +1092,7 @@ class DatabaseService {
       recorded_width: Number(scenarioMeta.recorded_width ?? scenario.recorded_width) || null,
       recorded_height: Number(scenarioMeta.recorded_height ?? scenario.recorded_height) || null,
       variable_profile_id: scenarioMeta.variable_profile_id ?? scenario.variable_profile_id ?? null,
+      local_variables: scenarioMeta.local_variables ?? scenario.local_variables,
       scenario_meta: scenarioMeta,
       parent_id: scenario.parent_id || null,
       dom_check_anchor: parseDomCheckAnchor(scenarioMeta.dom_check_anchor ?? scenario.dom_check_anchor),
@@ -1143,21 +1169,19 @@ class DatabaseService {
       ? String(variable.id).split(':').slice(1, -1).join(':') || null
       : null;
     const index = current.findIndex((item) => item.key === (oldKeyFromId || key));
+    const valueType = variable.value_type === 'file' ? 'file' : 'text';
+    const entry = {
+      key,
+      value,
+      value_type: valueType,
+    };
     if (index >= 0) {
       if (oldKeyFromId && oldKeyFromId !== key) {
         this._renameVariableProfileKeys(oldKeyFromId, key);
       }
-      current[index] = {
-        key,
-        value,
-        value_type: variable.value_type === 'file' ? 'file' : 'text',
-      };
+      current[index] = entry;
     } else {
-      current.push({
-        key,
-        value,
-        value_type: variable.value_type === 'file' ? 'file' : 'text',
-      });
+      current.push(entry);
     }
 
     return this.saveScenarioLocalVariables(scenarioId, current)
@@ -1204,6 +1228,7 @@ class DatabaseService {
     const now = new Date().toISOString();
     for (const profile of profiles) {
       const keys = normalizeTemplateKeys(profile.variables_json).map((item) => ({
+        ...item,
         key: item.key === oldKey ? newKey : item.key,
       }));
       updateTemplate.run(serializeTemplateKeys(keys), now, profile.id);
@@ -1211,22 +1236,127 @@ class DatabaseService {
 
     for (const sample of samples) {
       const entries = normalizeVariableEntries(sample.values_json).map((item) => ({
+        ...item,
         key: item.key === oldKey ? newKey : item.key,
-        value: item.value,
       }));
       updateSample.run(serializeVariableEntries(entries), now, sample.id);
     }
   }
 
   _mergeTemplateKeysIntoLocalVariables(scenarioId, templateKeys = []) {
+    const rawList = Array.isArray(templateKeys)
+      ? templateKeys
+      : parseJsonArray(templateKeys);
+    const rawByKey = new Map();
+    for (const raw of rawList) {
+      const key = String(
+        typeof raw === 'string'
+          ? raw
+          : (raw?.key || raw?.variable_key || raw?.name || ''),
+      ).trim();
+      if (key && !rawByKey.has(key)) rawByKey.set(key, raw);
+    }
+
     const currentMap = new Map(
-      normalizeVariableEntries(this.getScenarioMeta(scenarioId).local_variables).map((item) => [item.key, item.value ?? '']),
+      normalizeVariableEntries(this.getScenarioMeta(scenarioId).local_variables)
+        .map((item) => [item.key, item]),
     );
 
-    return normalizeTemplateKeys(templateKeys).map((item) => ({
-      key: item.key,
-      value: currentMap.get(item.key) ?? '',
-    }));
+    return normalizeTemplateKeys(templateKeys).map((item) => {
+      const existing = currentMap.get(item.key);
+      const raw = rawByKey.get(item.key);
+      const templateHasExplicitType = templateKeyHasExplicitType(raw);
+
+      let valueType = item.value_type === 'file' ? 'file' : 'text';
+
+      // Legacy skeleton entries without value_type: keep existing local file type.
+      if (!templateHasExplicitType && existing?.value_type === 'file') {
+        valueType = 'file';
+      }
+
+      return {
+        key: item.key,
+        value: existing?.value ?? '',
+        value_type: valueType,
+      };
+    });
+  }
+
+  _stampSampleEntriesWithTemplateTypes(templateVariables = [], sampleEntries = []) {
+    const typeMap = new Map(
+      normalizeTemplateKeys(templateVariables).map((item) => [item.key, item]),
+    );
+
+    return normalizeVariableEntries(sampleEntries).map((entry) => {
+      const tmpl = typeMap.get(entry.key);
+      if (!tmpl) return entry;
+      return {
+        key: entry.key,
+        value: entry.value ?? '',
+        value_type: tmpl.value_type === 'file' ? 'file' : 'text',
+      };
+    });
+  }
+
+  _findScenarioIdsUsingVariableProfile(profileId) {
+    if (!profileId) return [];
+
+    const fromMeta = this.db
+      .prepare(`
+        SELECT scenario_id AS id
+        FROM scenarios_meta
+        WHERE meta_key = 'variable_profile_id' AND meta_value = ?
+      `)
+      .all(profileId)
+      .map((row) => row.id);
+
+    const scenarioColumns = this.db.prepare('PRAGMA table_info(scenarios)').all();
+    let fromColumn = [];
+    if (scenarioColumns.some((col) => col.name === 'variable_profile_id')) {
+      fromColumn = this.db
+        .prepare('SELECT id FROM scenarios WHERE variable_profile_id = ?')
+        .all(profileId)
+        .map((row) => row.id);
+    }
+
+    return [...new Set([...fromMeta, ...fromColumn])];
+  }
+
+  _syncLinkedScenariosLocalVariables(profileId) {
+    const row = this.db
+      .prepare('SELECT variables_json FROM variable_profiles WHERE id = ?')
+      .get(profileId);
+    if (!row) return;
+
+    const scenarioIds = this._findScenarioIdsUsingVariableProfile(profileId);
+    for (const scenarioId of scenarioIds) {
+      const merged = this._mergeTemplateKeysIntoLocalVariables(scenarioId, row.variables_json);
+      this.saveScenarioLocalVariables(scenarioId, merged);
+    }
+
+    this._restampSampleTypesForProfile(profileId, row.variables_json);
+  }
+
+  _restampSampleTypesForProfile(profileId, templateVariables = []) {
+    const samples = this.db
+      .prepare('SELECT id, values_json FROM variable_profile_samples WHERE profile_id = ?')
+      .all(profileId);
+    if (!samples.length) return;
+
+    const updateSample = this.db.prepare(`
+      UPDATE variable_profile_samples
+      SET values_json = ?, is_dirty = 1, updated_at = ?
+      WHERE id = ?
+    `);
+    const now = new Date().toISOString();
+
+    for (const sample of samples) {
+      const stamped = this._stampSampleEntriesWithTemplateTypes(
+        templateVariables,
+        sample.values_json,
+      );
+      updateSample.run(serializeVariableEntries(stamped), now, sample.id);
+    }
   }
 
   getVariableProfiles() {
@@ -1306,6 +1436,10 @@ class DatabaseService {
         WHERE id = ?
       `).run(name, variablesJson, now, profile.id);
 
+      if (variablesJson != null) {
+        this._syncLinkedScenariosLocalVariables(profile.id);
+      }
+
       return this.getVariableProfileById(profile.id);
     }
 
@@ -1322,10 +1456,11 @@ class DatabaseService {
   }
 
   saveVariableProfileQuick({ name, keys = [] }) {
-    const normalizedKeys = (Array.isArray(keys) ? keys : [])
-      .map((item) => (typeof item === 'string' ? item : item?.key || item?.variable_key || ''))
-      .map((key) => String(key).trim())
-      .filter(Boolean);
+    const normalizedKeys = normalizeTemplateKeys(
+      Array.isArray(keys)
+        ? keys.map((item) => (typeof item === 'string' ? { key: item } : item))
+        : [],
+    );
 
     if (!normalizedKeys.length) {
       throw new Error('Can it nhat mot key de luu template.');
@@ -1333,7 +1468,7 @@ class DatabaseService {
 
     return this.saveVariableProfile({
       name,
-      keys: normalizedKeys.map((key) => ({ key })),
+      keys: normalizedKeys,
     });
   }
 
@@ -1405,7 +1540,6 @@ class DatabaseService {
     const profileId = sample.profile_id;
     const name = String(sample.name || '').trim();
     const now = new Date().toISOString();
-    const valuesJson = serializeVariableEntries(sample.variables || sample.values || []);
 
     if (!profileId) {
       throw new Error('profile_id is required.');
@@ -1419,7 +1553,13 @@ class DatabaseService {
       throw new Error('Khong tim thay template.');
     }
 
-    this._validateSampleKeys(profile.keys, normalizeVariableEntries(valuesJson));
+    const stamped = this._stampSampleEntriesWithTemplateTypes(
+      profile.variables,
+      sample.variables || sample.values || [],
+    );
+    const valuesJson = serializeVariableEntries(stamped);
+
+    this._validateSampleKeys(profile.keys, stamped);
 
     const existingByName = this.db
       .prepare('SELECT id FROM variable_profile_samples WHERE profile_id = ? AND name = ?')
@@ -1488,11 +1628,16 @@ class DatabaseService {
 
     const apply = this.db.transaction(() => {
       if (normalizedProfileId) {
-        const profile = this.getVariableProfileById(normalizedProfileId);
-        if (!profile) {
+        const profileRow = this.db
+          .prepare('SELECT id, variables_json FROM variable_profiles WHERE id = ?')
+          .get(normalizedProfileId);
+        if (!profileRow) {
           throw new Error('Khong tim thay ho so bien.');
         }
-        const merged = this._mergeTemplateKeysIntoLocalVariables(scenarioId, profile.variables);
+        const merged = this._mergeTemplateKeysIntoLocalVariables(
+          scenarioId,
+          profileRow.variables_json,
+        );
         this.saveScenarioLocalVariables(scenarioId, merged);
       }
 
@@ -1600,7 +1745,11 @@ class DatabaseService {
         scenario_meta: scenario.scenario_meta || {},
         parent_id: scenario.parent_id || null,
         dom_check_anchor: parseDomCheckAnchor(scenario.dom_check_anchor),
-        local_variables: variables.map(({ key, value }) => ({ key, value: value ?? '' })),
+        local_variables: variables.map((item) => ({
+          key: item.key,
+          value: item.value ?? '',
+          value_type: item.value_type === 'file' ? 'file' : 'text',
+        })),
       },
       steps,
       preview: {
@@ -2189,9 +2338,21 @@ class DatabaseService {
     return this.getSettings();
   }
 
-  _deleteOrphanedScenarioFrames(previousFramePaths, nextFramePaths) {
+  /**
+   * Xóa file frame không còn gắn step, nhưng giữ lại mọi frame vẫn nằm trong preview manifest.
+   * Xóa step trong LIST SCENARIO STEPS không được gỡ screenshot của timeline preview (tránh chớp hình).
+   */
+  _deleteOrphanedScenarioFrames(previousFramePaths, nextFramePaths, protectedFramePaths = new Set()) {
+    const protectedNames = new Set(
+      [...protectedFramePaths]
+        .filter(Boolean)
+        .map((framePath) => path.basename(String(framePath))),
+    );
+
     for (const framePath of previousFramePaths) {
       if (!framePath || nextFramePaths.has(framePath)) continue;
+      if (protectedFramePaths.has(framePath)) continue;
+      if (protectedNames.has(path.basename(String(framePath)))) continue;
 
       const stillUsed = this.db
         .prepare('SELECT COUNT(*) AS count FROM scenario_step_frames WHERE frame_path = ?')
@@ -2506,10 +2667,21 @@ function parseMetaValue(value) {
 }
 
 function buildScenarioMetaForStorage(scenario = {}, existingScenario = null, existingMeta = {}) {
-  const meta = {
-    ...(existingMeta || {}),
+  const incomingMeta = {
     ...(scenario.meta || {}),
     ...(scenario.scenario_meta || {}),
+  };
+  // variable_profile_id + local_variables are owned by dedicated APIs / top-level
+  // fields. Stale scenario_meta from the editor draft must not wipe them on Save/Record.
+  const {
+    variable_profile_id: _ignoredProfileId,
+    local_variables: _ignoredLocalVariables,
+    ...safeIncomingMeta
+  } = incomingMeta;
+
+  const meta = {
+    ...(existingMeta || {}),
+    ...safeIncomingMeta,
   };
 
   const readMovedValue = (key, fallback) => (
@@ -2519,17 +2691,44 @@ function buildScenarioMetaForStorage(scenario = {}, existingScenario = null, exi
   );
 
   meta.result_type = normalizeScenarioResultType(
-    readMovedValue('result_type', existingScenario?.result_type || 'simple'),
+    readMovedValue('result_type', existingScenario?.result_type || existingMeta?.result_type || 'simple'),
   );
-  meta.recorded_width = readMovedValue('recorded_width', existingScenario?.recorded_width ?? null);
-  meta.recorded_height = readMovedValue('recorded_height', existingScenario?.recorded_height ?? null);
+  meta.recorded_width = readMovedValue(
+    'recorded_width',
+    existingScenario?.recorded_width ?? existingMeta?.recorded_width ?? null,
+  );
+  meta.recorded_height = readMovedValue(
+    'recorded_height',
+    existingScenario?.recorded_height ?? existingMeta?.recorded_height ?? null,
+  );
   meta.dom_check_anchor = parseDomCheckAnchor(
-    readMovedValue('dom_check_anchor', existingScenario?.dom_check_anchor ?? null),
+    readMovedValue(
+      'dom_check_anchor',
+      existingScenario?.dom_check_anchor ?? existingMeta?.dom_check_anchor ?? null,
+    ),
   );
-  meta.local_variables = serializeVariableEntries(
-    normalizeVariableEntries(readMovedValue('local_variables', existingScenario?.local_variables || '[]')),
-  );
-  meta.variable_profile_id = readMovedValue('variable_profile_id', existingScenario?.variable_profile_id ?? null) || null;
+
+  if (scenario.local_variables !== undefined) {
+    meta.local_variables = serializeVariableEntries(
+      normalizeVariableEntries(scenario.local_variables),
+    );
+  } else {
+    meta.local_variables = serializeVariableEntries(
+      normalizeVariableEntries(
+        existingMeta?.local_variables
+          ?? existingScenario?.local_variables
+          ?? '[]',
+      ),
+    );
+  }
+
+  if (scenario.variable_profile_id !== undefined) {
+    meta.variable_profile_id = scenario.variable_profile_id || null;
+  } else {
+    meta.variable_profile_id = existingMeta?.variable_profile_id
+      ?? existingScenario?.variable_profile_id
+      ?? null;
+  }
 
   return meta;
 }
@@ -2590,15 +2789,28 @@ function readPreviewFrames(manifestPath) {
   }
 }
 
+function templateKeyHasExplicitType(raw) {
+  if (raw == null || typeof raw !== 'object') return false;
+  return Object.prototype.hasOwnProperty.call(raw, 'value_type');
+}
+
 function normalizeTemplateKeys(raw) {
   const list = parseJsonArray(raw);
   const seen = new Set();
   const keys = [];
   for (const item of list) {
-    const key = String(item?.key || item?.variable_key || item?.name || '').trim();
+    const key = String(
+      typeof item === 'string'
+        ? item
+        : (item?.key || item?.variable_key || item?.name || ''),
+    ).trim();
     if (!key || seen.has(key)) continue;
     seen.add(key);
-    keys.push({ key });
+    const valueType = item?.value_type === 'file' ? 'file' : 'text';
+    keys.push({
+      key,
+      value_type: valueType,
+    });
   }
   return keys;
 }
@@ -2611,27 +2823,36 @@ function serializeTemplateKeys(keysOrEntries = []) {
       ))
       : [],
   );
-  return JSON.stringify(normalized);
+  return JSON.stringify(normalized.map((item) => ({
+    key: item.key,
+    value_type: item.value_type === 'file' ? 'file' : 'text',
+  })));
 }
 
 function normalizeVariableEntries(raw) {
   const list = parseJsonArray(raw);
   return list
-    .map((item) => ({
-      key: String(item?.key || item?.variable_key || item?.name || '').trim(),
-      value: item?.value ?? '',
-      value_type: item?.value_type === 'file' ? 'file' : 'text',
-    }))
+    .map((item) => {
+      const valueType = item?.value_type === 'file' ? 'file' : 'text';
+      return {
+        key: String(item?.key || item?.variable_key || item?.name || '').trim(),
+        value: item?.value ?? '',
+        value_type: valueType,
+      };
+    })
     .filter((item) => item.key);
 }
 
 function serializeVariableEntries(entries = []) {
   const normalized = (Array.isArray(entries) ? entries : [])
-    .map((item) => ({
-      key: String(item?.key || item?.variable_key || item?.name || '').trim(),
-      value: item?.value ?? '',
-      value_type: item?.value_type === 'file' ? 'file' : 'text',
-    }))
+    .map((item) => {
+      const valueType = item?.value_type === 'file' ? 'file' : 'text';
+      return {
+        key: String(item?.key || item?.variable_key || item?.name || '').trim(),
+        value: item?.value ?? '',
+        value_type: valueType,
+      };
+    })
     .filter((item) => item.key);
   return JSON.stringify(normalized);
 }

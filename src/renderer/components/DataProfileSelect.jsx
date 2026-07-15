@@ -24,12 +24,7 @@ export default function DataProfileSelect({
     window.electronAPI.getVariableProfiles()
       .then((items) => {
         if (cancelled) return;
-        const next = Array.isArray(items) ? items : [];
-        setProfiles(next);
-
-        if (value && !next.some((item) => item.id === value)) {
-          onChange?.('');
-        }
+        setProfiles(Array.isArray(items) ? items : []);
       })
       .catch(() => {
         if (!cancelled) setProfiles([]);
@@ -60,6 +55,10 @@ export default function DataProfileSelect({
           {profile.name}
         </option>
       ))}
+      {/* Keep current selection visible even if the profile list briefly omits it. */}
+      {value && !profiles.some((profile) => profile.id === value) ? (
+        <option value={value}>{value}</option>
+      ) : null}
     </select>
   );
 }
